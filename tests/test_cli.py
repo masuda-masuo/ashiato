@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from ashiato.build import connect
 from ashiato.cli import main
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -187,4 +188,104 @@ def test_a_subcommand_is_required():
 def test_unknown_format_is_rejected():
     with pytest.raises(SystemExit) as excinfo:
         main(["sql", "SELECT 1", "--format", "yaml"])
+    assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------- denials
+
+
+def test_denials_prints_the_view(db: Path, capsys: pytest.CaptureFixture[str]):
+    assert main(["denials", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    header = out.splitlines()[0].split()
+    assert header[:5] == ["session_id", "seq", "ts", "tool_name", "input_summary"]
+    assert "followup_kind" in header
+    # Both fixture denials, newest first.
+    assert "mcp__sunaba__publish" in out
+    assert "/etc/hosts" in out
+    assert "(2 rows)" in out
+
+
+def test_denials_json_format(db: Path, capsys: pytest.CaptureFixture[str]):
+    assert main(["denials", "--db", str(db), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["tool_name"] for row in payload] == ["mcp__sunaba__publish", "Write"]
+    assert payload[1] == {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "seq": 6,
+        "ts": "2026-08-10 09:00:07",
+        "tool_name": "Write",
+        "input_summary": "/etc/hosts",
+        "permission_mode": "default",
+        "cwd": "/home/dev/proj",
+        "next_tool_name": "mcp__sunaba__publish",
+        "next_input_summary": '{"create_pr":true,"files":["src/ashiato/parser.py"]}',
+        "next_outcome": "denied",
+        "next_ts": "2026-08-10 09:00:09",
+        "gap_seconds": 2.0,
+        "followup_kind": "other-tool",
+    }
+
+
+def test_denials_csv_format(db: Path, capsys: pytest.CaptureFixture[str]):
+    assert main(["denials", "--db", str(db), "--format", "csv"]) == 0
+    rows = list(csv.reader(io.StringIO(capsys.readouterr().out)))
+    assert rows[0][0] == "session_id"
+    assert len(rows) == 3  # header plus both denials
+
+
+def test_denials_honours_limit(db: Path, capsys: pytest.CaptureFixture[str]):
+    assert main(["denials", "--db", str(db), "--format", "json", "--limit", "1"]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 1
+    # 0 is "no limit", not "no rows".
+    assert main(["denials", "--db", str(db), "--format", "json", "--limit", "0"]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 2
+
+
+def test_denials_honours_session(db: Path, capsys: pytest.CaptureFixture[str]):
+    session = "11111111-1111-4111-8111-111111111111"
+    assert main(["denials", "--db", str(db), "--format", "json", "--session", session]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 2
+    assert main(["denials", "--db", str(db), "--format", "json", "--session", "nobody"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_denials_output_is_identical_across_rebuilds(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Determinism, at the surface the user actually reads."""
+    outputs = []
+    for name in ("first", "second"):
+        path = tmp_path / f"{name}.duckdb"
+        assert main(["build", "--source", str(FIXTURES), "--db", str(path)]) == 0
+        capsys.readouterr()
+        assert main(["denials", "--db", str(path), "--format", "json"]) == 0
+        outputs.append(capsys.readouterr().out)
+    assert outputs[0] == outputs[1]
+    assert json.loads(outputs[0])  # not vacuously equal
+
+
+def test_denials_on_a_missing_database_fails_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert main(["denials", "--db", str(tmp_path / "nope.duckdb")]) == 1
+    assert "no database at" in capsys.readouterr().err
+
+
+def test_denials_on_a_database_without_the_view_fails_cleanly(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """An older database has no view; that is an error message, not a traceback."""
+    connection = connect(db)
+    try:
+        connection.execute("DROP VIEW denial_followups")
+    finally:
+        connection.close()
+    assert main(["denials", "--db", str(db)]) == 1
+    assert capsys.readouterr().err.startswith("error:")
+
+
+def test_a_negative_limit_is_rejected():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["denials", "--limit", "-1"])
     assert excinfo.value.code == 2

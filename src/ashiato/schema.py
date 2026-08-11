@@ -72,6 +72,7 @@ TOOL_CALL_TABLE: tuple[Column, ...] = (
     ("tool_kind", "VARCHAR"),
     ("mcp_server", "VARCHAR"),
     ("input", "JSON"),
+    ("input_summary", "VARCHAR"),
     ("outcome", "VARCHAR"),
     ("is_error", "BOOLEAN"),
     ("result_text", "VARCHAR"),
@@ -116,6 +117,77 @@ def create_table_sql(table: str) -> str:
 
 
 SCHEMA_SQL = "\n".join(create_table_sql(table) for table in TABLES)
+
+#: One row per denied tool call, joined to whatever the session did next.
+DENIAL_FOLLOWUPS_VIEW = "denial_followups"
+
+#: A view rather than a table.  It is derived entirely from ``tool_calls``, so
+#: computing it on read means it cannot disagree with the rows it summarises and
+#: the incremental build has nothing extra to maintain.
+#:
+#: "Next" is the next tool call by ``seq`` within the same ``session_id``, and
+#: nothing else -- not the parentUuid tree, not sidechain structure.  ``seq`` is
+#: the transcript line number, so several ``tool_use`` blocks emitted on one
+#: assistant line share it; ``tool_use_id`` breaks that tie.  Block order within
+#: a line is not recorded anywhere, so that tiebreak is a *stable* choice rather
+#: than a faithful one -- it exists so two builds of the same bytes agree.
+#:
+#: ``followup_kind`` is mechanical, never a judgement about whether the retry
+#: was legitimate: same tool and byte-identical input is ``verbatim-retry``,
+#: same tool alone is ``same-tool``, a different tool is ``other-tool``, and a
+#: denial that was the session's last call is ``none`` with NULL ``next_*``.
+DENIAL_FOLLOWUPS_SQL = f'''
+CREATE OR REPLACE VIEW "{DENIAL_FOLLOWUPS_VIEW}" AS
+WITH neighbours AS (
+    SELECT
+        session_id,
+        seq,
+        ts,
+        tool_name,
+        input,
+        input_summary,
+        outcome,
+        permission_mode,
+        cwd,
+        lead(seq) OVER following AS next_seq,
+        lead(tool_name) OVER following AS next_tool_name,
+        lead(input) OVER following AS next_input,
+        lead(input_summary) OVER following AS next_input_summary,
+        lead(outcome) OVER following AS next_outcome,
+        lead(ts) OVER following AS next_ts
+    FROM "tool_calls"
+    WINDOW following AS (PARTITION BY session_id ORDER BY seq, tool_use_id)
+)
+SELECT
+    session_id,
+    seq,
+    ts,
+    tool_name,
+    input_summary,
+    permission_mode,
+    cwd,
+    next_tool_name,
+    next_input_summary,
+    next_outcome,
+    next_ts,
+    date_diff('millisecond', ts, next_ts) / 1000.0 AS gap_seconds,
+    CASE
+        -- next_seq, not next_tool_name: a tool_use block can carry no name at
+        -- all, and "there was no next call" must not be confused with "the next
+        -- call was anonymous".
+        WHEN next_seq IS NULL THEN 'none'
+        WHEN tool_name IS NOT DISTINCT FROM next_tool_name
+            AND CAST(input AS VARCHAR) IS NOT DISTINCT FROM CAST(next_input AS VARCHAR)
+            THEN 'verbatim-retry'
+        WHEN tool_name IS NOT DISTINCT FROM next_tool_name THEN 'same-tool'
+        ELSE 'other-tool'
+    END AS followup_kind
+FROM neighbours
+WHERE outcome = 'denied';
+'''
+
+#: Every ``followup_kind`` the view can produce.
+FOLLOWUP_KINDS: tuple[str, ...] = ("verbatim-retry", "same-tool", "other-tool", "none")
 
 
 def insert_sql(table: str) -> str:

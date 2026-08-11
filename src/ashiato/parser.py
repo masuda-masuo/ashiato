@@ -31,12 +31,38 @@ DENIAL_PATTERNS: tuple[str, ...] = (
 #: Tool results can be megabytes; keep a readable prefix by default.
 DEFAULT_RESULT_TEXT_LIMIT = 4000
 
+#: The input field that says most about what a call asked for, per tool.  A
+#: tool that is not named here -- every MCP tool, and anything Claude Code
+#: grows after this table was written -- falls back to the whole input, so an
+#: unfamiliar tool still gets a usable summary instead of NULL.
+INPUT_SUMMARY_FIELDS: dict[str, str] = {
+    "Bash": "command",
+    "PowerShell": "command",
+    "Read": "file_path",
+    "Write": "file_path",
+    "Edit": "file_path",
+    "NotebookEdit": "file_path",
+    "Glob": "pattern",
+    "Grep": "pattern",
+    "Skill": "skill",
+    "Agent": "description",
+    "Task": "description",
+    "WebFetch": "url",
+    "WebSearch": "query",
+}
+
+#: A summary is meant to fit on one line of output; a command can be a page.
+INPUT_SUMMARY_LIMIT = 200
+
 _TOOL_KIND_MCP = "mcp"
 _TOOL_KIND_BUILTIN = "builtin"
 _MCP_PREFIX = "mcp__"
 
 # datetime.fromisoformat accepts at most 6 fractional digits.
 _LONG_FRACTION = re.compile(r"\.(\d{7,})")
+
+# A summary is one line, so every run of whitespace becomes a single space.
+_WHITESPACE_RUN = re.compile(r"\s+")
 
 
 @dataclass(slots=True)
@@ -80,6 +106,7 @@ class ToolCall:
     tool_kind: str
     mcp_server: str | None
     input: str | None
+    input_summary: str | None
     outcome: str
     is_error: bool
     result_text: str | None
@@ -248,6 +275,40 @@ def split_tool_name(tool_name: str | None) -> tuple[str, str | None]:
         server = segments[1] if len(segments) > 2 and segments[1] else None
         return _TOOL_KIND_MCP, server
     return _TOOL_KIND_BUILTIN, None
+
+
+def _compact_json(value: object) -> str:
+    """The smallest faithful rendering of a value; keys sorted so it is stable."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _one_line(text: str) -> str:
+    return _WHITESPACE_RUN.sub(" ", text).strip()[:INPUT_SUMMARY_LIMIT]
+
+
+def summarize_input(tool_name: str | None, tool_input: object) -> str | None:
+    """One short line describing what a tool call asked for.
+
+    Which field matters depends on the tool, so the well-known ones are read by
+    name from :data:`INPUT_SUMMARY_FIELDS` and everything else falls back to the
+    compact JSON of the whole input.  A named field that is absent, is not a
+    string, or is blank falls back the same way: the thing that made the call is
+    not always the thing this table expects, and showing the raw input beats
+    showing nothing.
+
+    Whitespace runs collapse to single spaces so a multi-line command stays one
+    line, and the result is cut to :data:`INPUT_SUMMARY_LIMIT` characters --
+    without a marker, the way ``result_text`` is cut.  ``None`` is returned only
+    when there was no input at all.
+    """
+    if tool_input is None:
+        return None
+    if isinstance(tool_input, dict):
+        field = INPUT_SUMMARY_FIELDS.get(tool_name or "")
+        value = tool_input.get(field) if field is not None else None
+        if isinstance(value, str) and value.strip():
+            return _one_line(value)
+    return _one_line(_compact_json(tool_input))
 
 
 def classify_outcome(
@@ -436,6 +497,7 @@ def _build_tool_calls(
                         if tool_input is None
                         else json.dumps(tool_input, ensure_ascii=False, default=str)
                     ),
+                    input_summary=summarize_input(tool_name, tool_input),
                     outcome=classify_outcome(
                         has_result=match is not None,
                         result_text=full_text,
