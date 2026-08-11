@@ -125,65 +125,78 @@ DENIAL_FOLLOWUPS_VIEW = "denial_followups"
 #: computing it on read means it cannot disagree with the rows it summarises and
 #: the incremental build has nothing extra to maintain.
 #:
-#: "Next" is the next tool call by ``seq`` within the same ``session_id``, and
-#: nothing else -- not the parentUuid tree, not sidechain structure.  ``seq`` is
-#: the transcript line number, so several ``tool_use`` blocks emitted on one
-#: assistant line share it; ``tool_use_id`` breaks that tie.  Block order within
-#: a line is not recorded anywhere, so that tiebreak is a *stable* choice rather
-#: than a faithful one -- it exists so two builds of the same bytes agree.
+#: "Next" is the first tool call of the same ``session_id`` on a *strictly
+#: later* transcript line, and nothing else -- not the parentUuid tree, not
+#: sidechain structure.  ``seq`` is the transcript line number, so several
+#: ``tool_use`` blocks emitted on one assistant line share it, and those
+#: siblings were all issued before the model saw any of their results: a
+#: sibling cannot be a reaction to the denial, so requiring a greater ``seq``
+#: excludes it by construction.  Among the calls of that later line
+#: ``tool_use_id`` picks one; block order within a line is not recorded
+#: anywhere, so that tiebreak is a *stable* choice rather than a faithful one --
+#: it exists so two builds of the same bytes agree, and it now only ever chooses
+#: between calls the model issued at the same moment.
 #:
 #: ``followup_kind`` is mechanical, never a judgement about whether the retry
 #: was legitimate: same tool and byte-identical input is ``verbatim-retry``,
 #: same tool alone is ``same-tool``, a different tool is ``other-tool``, and a
-#: denial that was the session's last call is ``none`` with NULL ``next_*``.
+#: denial with no later line that called a tool is ``none`` with NULL ``next_*``.
 DENIAL_FOLLOWUPS_SQL = f'''
 CREATE OR REPLACE VIEW "{DENIAL_FOLLOWUPS_VIEW}" AS
-WITH neighbours AS (
+WITH line_heads AS (
+    -- One row per transcript line that issued tool calls: the call that a
+    -- denial on an earlier line is paired with, chosen by tool_use_id.
+    SELECT session_id, seq, ts, tool_name, input, input_summary, outcome
+    FROM "tool_calls"
+    QUALIFY row_number() OVER (PARTITION BY session_id, seq ORDER BY tool_use_id) = 1
+),
+following AS (
+    -- lead() over one row per line, so the follow-up is always a later line;
+    -- the siblings of a parallel tool_use block never enter this window.
     SELECT
         session_id,
         seq,
-        ts,
-        tool_name,
-        input,
-        input_summary,
-        outcome,
-        permission_mode,
-        cwd,
-        lead(seq) OVER following AS next_seq,
-        lead(tool_name) OVER following AS next_tool_name,
-        lead(input) OVER following AS next_input,
-        lead(input_summary) OVER following AS next_input_summary,
-        lead(outcome) OVER following AS next_outcome,
-        lead(ts) OVER following AS next_ts
-    FROM "tool_calls"
-    WINDOW following AS (PARTITION BY session_id ORDER BY seq, tool_use_id)
+        lead(seq) OVER later AS next_seq,
+        lead(tool_name) OVER later AS next_tool_name,
+        lead(input) OVER later AS next_input,
+        lead(input_summary) OVER later AS next_input_summary,
+        lead(outcome) OVER later AS next_outcome,
+        lead(ts) OVER later AS next_ts
+    FROM line_heads
+    WINDOW later AS (PARTITION BY session_id ORDER BY seq)
 )
 SELECT
-    session_id,
-    seq,
-    ts,
-    tool_name,
-    input_summary,
-    permission_mode,
-    cwd,
-    next_tool_name,
-    next_input_summary,
-    next_outcome,
-    next_ts,
-    date_diff('millisecond', ts, next_ts) / 1000.0 AS gap_seconds,
+    denied.session_id,
+    denied.seq,
+    denied.ts,
+    denied.tool_name,
+    denied.input_summary,
+    denied.permission_mode,
+    denied.cwd,
+    following.next_tool_name,
+    following.next_input_summary,
+    following.next_outcome,
+    following.next_ts,
+    date_diff('millisecond', denied.ts, following.next_ts) / 1000.0 AS gap_seconds,
     CASE
         -- next_seq, not next_tool_name: a tool_use block can carry no name at
         -- all, and "there was no next call" must not be confused with "the next
         -- call was anonymous".
-        WHEN next_seq IS NULL THEN 'none'
-        WHEN tool_name IS NOT DISTINCT FROM next_tool_name
-            AND CAST(input AS VARCHAR) IS NOT DISTINCT FROM CAST(next_input AS VARCHAR)
+        WHEN following.next_seq IS NULL THEN 'none'
+        WHEN denied.tool_name IS NOT DISTINCT FROM following.next_tool_name
+            AND CAST(denied.input AS VARCHAR)
+                IS NOT DISTINCT FROM CAST(following.next_input AS VARCHAR)
             THEN 'verbatim-retry'
-        WHEN tool_name IS NOT DISTINCT FROM next_tool_name THEN 'same-tool'
+        WHEN denied.tool_name IS NOT DISTINCT FROM following.next_tool_name THEN 'same-tool'
         ELSE 'other-tool'
     END AS followup_kind
-FROM neighbours
-WHERE outcome = 'denied';
+FROM "tool_calls" AS denied
+JOIN following
+    -- Every call's own line is in `following`, so this join keeps every denial;
+    -- IS NOT DISTINCT FROM so one with no session id still finds it.
+    ON following.session_id IS NOT DISTINCT FROM denied.session_id
+    AND following.seq = denied.seq
+WHERE denied.outcome = 'denied';
 '''
 
 #: Every ``followup_kind`` the view can produce.

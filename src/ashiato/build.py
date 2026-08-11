@@ -37,6 +37,7 @@ from ashiato.parser import (
 )
 from ashiato.schema import (
     DENIAL_FOLLOWUPS_SQL,
+    DENIAL_FOLLOWUPS_VIEW,
     SCHEMA_SQL,
     TABLES,
     column_names,
@@ -132,6 +133,27 @@ def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 f"table '{table}' {detail}: this database was built by a different version "
                 "of ashiato -- delete the database file and build again"
             )
+
+
+def assert_readable(connection: duckdb.DuckDBPyConnection) -> None:
+    """Refuse to query a database whose schema this version cannot bind against.
+
+    ``build`` already says what to do about an out-of-date database; the read
+    path has to say the same thing, or ``ashiato denials`` against a database
+    built before the view existed reports DuckDB's bare "Table with name
+    denial_followups does not exist!" and no way out of it.  Deciding this on
+    open rather than by inspecting a failed query is what keeps a plain SQL typo
+    the user's own error: only ashiato's own tables and view are checked here.
+    """
+    _assert_current_schema(connection)
+    row = connection.execute(
+        "SELECT count(*) FROM duckdb_views() WHERE view_name = ?", [DENIAL_FOLLOWUPS_VIEW]
+    ).fetchone()
+    if not row or not row[0]:
+        raise SchemaOutOfDate(
+            f"view '{DENIAL_FOLLOWUPS_VIEW}' is missing: this database was built by a "
+            "different version of ashiato -- delete the database file and build again"
+        )
 
 
 def create_schema(connection: duckdb.DuckDBPyConnection) -> None:

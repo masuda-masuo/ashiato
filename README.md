@@ -128,11 +128,15 @@ same session: `session_id`, `seq`, `ts`, `tool_name`, `input_summary`, `permissi
 A view, not a table: it is derived entirely from `tool_calls`, so it cannot fall out of step
 with the rows it summarises and the incremental build has nothing extra to maintain.
 
-"Next" is the next tool call by `seq` within the same `session_id` — not the `parentUuid`
-tree, not sidechain structure. `seq` is the transcript line number, so several `tool_use`
-blocks emitted on one assistant line share it; `tool_use_id` breaks that tie. Block order
-within a line is not recorded anywhere, so that tiebreak is a *stable* choice rather than a
-faithful one — it is there so two builds of the same bytes agree.
+"Next" is the first tool call of the same `session_id` on a *strictly later* transcript line
+— not the `parentUuid` tree, not sidechain structure. `seq` is the transcript line number, so
+several `tool_use` blocks emitted on one assistant line share it. Those siblings were all
+issued before the model saw any of their results, so a sibling is never a reaction to the
+denial; requiring a later line excludes it by construction, and a denial whose line is the
+session's last is `none` even when siblings sit beside it. `tool_use_id` then picks between
+the calls of that later line: block order within a line is not recorded anywhere, so that
+tiebreak is a *stable* choice rather than a faithful one — it is there so two builds of the
+same bytes agree, and it now only ever chooses between calls issued at the same moment.
 
 `followup_kind` is mechanical, never a judgement about whether the retry was legitimate:
 
@@ -141,7 +145,7 @@ faithful one — it is there so two builds of the same bytes agree.
 | `verbatim-retry` | same `tool_name`, byte-identical `input` |
 | `same-tool` | same `tool_name`, different `input` (a narrowed or corrected retry) |
 | `other-tool` | a different tool |
-| `none` | the denial was the session's last call; every `next_*` column is `NULL` |
+| `none` | no later line of the session called a tool; every `next_*` column is `NULL` |
 
 ```
 $ ashiato denials --limit 5
@@ -150,6 +154,9 @@ $ ashiato sql "SELECT followup_kind, count(*) FROM denial_followups GROUP BY 1 O
 
 Adding `input_summary` changed the `tool_calls` schema, so a database built by an earlier
 version is refused with a message rather than half-upgraded: delete it and `build` again.
+`sql` and `denials` check the same thing when they open a database, so reading an old one
+says how to fix it instead of reporting a bare catalog error. A query of your own that
+names something that does not exist still gets DuckDB's error, untouched.
 
 ## Robustness
 
