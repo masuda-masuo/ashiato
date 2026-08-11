@@ -38,6 +38,10 @@ from ashiato.parser import (
 from ashiato.schema import (
     DENIAL_FOLLOWUPS_SQL,
     DENIAL_FOLLOWUPS_VIEW,
+    FORMAT_VERSION,
+    META_FORMAT_KEY,
+    META_SCHEMA_SQL,
+    META_TABLE,
     SCHEMA_SQL,
     TABLES,
     column_names,
@@ -108,8 +112,43 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> duckdb.DuckDBPyC
     return connection
 
 
+def _meta_format_version(connection: duckdb.DuckDBPyConnection) -> str | None:
+    """The stored :data:`FORMAT_VERSION`, or ``None`` when the marker is absent.
+
+    A pre-marker database simply has no ``ashiato_meta`` table, so a missing
+    table must read as "no version", not as a catalog error.
+    """
+    tables = {
+        row[0]
+        for row in connection.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    }
+    if META_TABLE not in tables:
+        return None
+    row = connection.execute(
+        f'SELECT value FROM "{META_TABLE}" WHERE key = ?', [META_FORMAT_KEY]
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _assert_format_version(connection: duckdb.DuckDBPyConnection) -> None:
+    """Refuse a database whose stored rows were derived under older rules.
+
+    ``outcome`` is a stored column, so a semantic change in how it is decided --
+    the denial patterns moving from substring to anchored-prefix matching -- is
+    invisible to a column comparison.  The incremental build would skip every
+    unchanged file and leave the old rows mixed with the new.  The format marker
+    makes that detectable: no marker, or a different one, means rebuild.
+    """
+    if _meta_format_version(connection) != str(FORMAT_VERSION):
+        raise SchemaOutOfDate(
+            "the stored tool_calls rows were derived under older outcome rules: "
+            "this database was built by a different version of ashiato -- "
+            "delete the database file and build again"
+        )
+
+
 def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
-    """Refuse a database whose tables predate the columns this version expects.
+    """Refuse a database that predates the columns or rules this version expects.
 
     ``CREATE TABLE IF NOT EXISTS`` leaves an older table exactly as it found it,
     so a column added since that database was built is simply absent -- and the
@@ -117,6 +156,10 @@ def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
     message about a column nobody asked for.  Say what actually happened
     instead.  Rebuilding is the fix: the missing values are derived from the
     transcripts, and the incremental build would skip every unchanged file.
+
+    Columns are not the whole story: rows carry derived values (``outcome``)
+    whose rules can change without any column changing, so the format marker is
+    checked here too.
     """
     for table in TABLES:
         rows = connection.execute(f"PRAGMA table_info('{table}')").fetchall()
@@ -133,6 +176,7 @@ def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 f"table '{table}' {detail}: this database was built by a different version "
                 "of ashiato -- delete the database file and build again"
             )
+    _assert_format_version(connection)
 
 
 def assert_readable(connection: duckdb.DuckDBPyConnection) -> None:
@@ -157,9 +201,45 @@ def assert_readable(connection: duckdb.DuckDBPyConnection) -> None:
 
 
 def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
-    connection.execute(SCHEMA_SQL)
-    _assert_current_schema(connection)
-    connection.execute(DENIAL_FOLLOWUPS_SQL)
+    """Create the tables, format marker and view on a fresh database.
+
+    An existing database that already has ashiato's tables must be current in
+    columns and format marker before anything is created: ``CREATE TABLE IF
+    NOT EXISTS`` would otherwise leave its old rows untouched and stamp them
+    as current.  A database with no ashiato tables at all is a fresh one and
+    is initialised with the marker.
+
+    The DDL and the marker stamp run as one transaction, and so does the view
+    on top of them: DuckDB DDL is transactional, so a crash at any point in
+    here rolls the whole lot back and the file stays empty -- exactly what a
+    fresh ``build`` expects.  Without the transaction, a crash between the
+    ``CREATE TABLE`` statements and the marker insert would leave ashiato
+    tables with no marker, and the next build would refuse an empty, perfectly
+    rebuildable file.
+    """
+    existing = {
+        row[0]
+        for row in connection.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    }
+    if existing & set(TABLES):
+        # Full check, not just the marker: a database with current columns but
+        # an old marker is refused before anything is written, and so is one
+        # whose columns predate this version -- the view below would otherwise
+        # fail to bind and blame a column nobody asked for.
+        _assert_current_schema(connection)
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        connection.execute(SCHEMA_SQL)
+        connection.execute(META_SCHEMA_SQL)
+        connection.execute(
+            f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
+            [META_FORMAT_KEY, str(FORMAT_VERSION)],
+        )
+        connection.execute(DENIAL_FOLLOWUPS_SQL)
+        connection.execute("COMMIT")
+    except duckdb.Error:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
@@ -391,10 +471,16 @@ def build(
 
 
 def database_info(db_path: str | Path) -> DatabaseInfo:
-    """Row counts per table and the time window the transcripts cover."""
+    """Row counts per table and the time window the transcripts cover.
+
+    The same read gate as ``sql`` and ``denials``: a database whose schema or
+    format marker this version cannot vouch for is refused, so ``info`` does
+    not report a stale database as if it were current.
+    """
     path = Path(db_path).expanduser()
     connection = connect(path, read_only=True)
     try:
+        assert_readable(connection)
         counts: dict[str, int] = {}
         for table in TABLES:
             row = connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()

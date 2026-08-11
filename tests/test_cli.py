@@ -12,6 +12,7 @@ import pytest
 
 from ashiato.build import connect
 from ashiato.cli import main
+from ashiato.schema import META_FORMAT_KEY, META_TABLE
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -335,6 +336,48 @@ def test_a_missing_view_alone_also_names_the_fix(db: Path, capsys: pytest.Captur
     err = capsys.readouterr().err
     assert "denial_followups" in err
     assert "delete the database file and build again" in err
+
+
+def remove_format_marker(db: Path) -> None:
+    """Strip the marker, leaving the database exactly as the pre-fix code built it:
+    same tables, same columns, rows classified under the old substring rule."""
+    connection = connect(db)
+    try:
+        connection.execute(f'DELETE FROM "{META_TABLE}" WHERE key = ?', [META_FORMAT_KEY])
+    finally:
+        connection.close()
+
+
+def test_build_refuses_a_database_built_under_the_old_outcome_rule(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    path = tmp_path / "oldrule.duckdb"
+    assert main(["build", "--source", str(FIXTURES), "--db", str(path)]) == 0
+    remove_format_marker(path)
+    capsys.readouterr()
+    # Incremental build would skip every unchanged file and keep the old rows.
+    assert main(["build", "--source", str(FIXTURES), "--db", str(path)]) == 1
+    assert "delete the database file and build again" in capsys.readouterr().err
+
+
+def test_sql_and_denials_refuse_a_database_built_under_the_old_outcome_rule(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """A database whose rows predate the anchored denial rule is refused, not read."""
+    remove_format_marker(db)
+    assert main(["sql", "SELECT count(*) FROM tool_calls", "--db", str(db)]) == 1
+    assert "delete the database file and build again" in capsys.readouterr().err
+    assert main(["denials", "--db", str(db)]) == 1
+    assert "delete the database file and build again" in capsys.readouterr().err
+
+
+def test_info_refuses_a_database_built_under_the_old_outcome_rule(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """`info` must refuse the same database, not report it as if it were current."""
+    remove_format_marker(db)
+    assert main(["info", "--db", str(db)]) == 1
+    assert "delete the database file and build again" in capsys.readouterr().err
 
 
 def test_a_query_the_user_got_wrong_keeps_duckdbs_own_error(

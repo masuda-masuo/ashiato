@@ -19,10 +19,13 @@ from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 
-#: Substrings that identify a tool result as a permission denial rather than a
-#: real failure.  These are Claude Code strings and they drift between versions,
-#: so they live here as one overridable constant instead of being sprinkled
-#: through the code.  Callers pass their own tuple to ``parse_file``.
+#: Prefixes that identify a tool result as a permission denial rather than a
+#: real failure: a result is a denial only when its text, after stripping
+#: leading whitespace, *starts* with one of these -- a successful result that
+#: merely quotes one of the strings is not a denial.  These are Claude Code
+#: strings and they drift between versions, so they live here as one overridable
+#: constant instead of being sprinkled through the code.  Callers pass their own
+#: tuple to ``parse_file``; each entry is matched as a prefix the same way.
 DENIAL_PATTERNS: tuple[str, ...] = (
     "The user doesn't want to proceed with this tool use",
     "Permission for this action was denied by the Claude Code auto mode classifier",
@@ -318,10 +321,17 @@ def classify_outcome(
     is_error: bool,
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
 ) -> str:
-    """Rules in order: pending, denied, error, ok."""
+    """Rules in order: pending, denied, error, ok.
+
+    ``denial_patterns`` are matched as *prefixes*: after stripping leading
+    whitespace, the result text must start with one of them to be a denial.  A
+    successful result that merely contains the strings (a read or diff that
+    quotes them) is not a denial.
+    """
     if not has_result:
         return "pending"
-    if any(pattern in result_text for pattern in denial_patterns):
+    text = result_text.lstrip()
+    if any(text.startswith(pattern) for pattern in denial_patterns):
         return "denied"
     if is_error:
         return "error"
@@ -585,6 +595,11 @@ def parse_file(
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
 ) -> ParsedFile:
     """Parse one transcript file into session / event / tool-call rows.
+
+    ``denial_patterns`` replaces the built-in strings.  Each entry is matched as
+    a *prefix* of the result text (leading whitespace ignored): a result that
+    starts with one of them is ``denied``, a result that merely contains one
+    somewhere is not.
 
     A file with no parseable lines yields ``session=None`` and empty lists; that
     is a normal outcome, not an error.

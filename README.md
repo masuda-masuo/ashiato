@@ -102,14 +102,18 @@ to 200 characters; `NULL` means the call carried no input at all.
 `outcome` is decided in this order:
 
 1. `pending` — no matching `tool_result` exists (the session ended mid-call)
-2. `denied` — the result text matches a denial pattern
+2. `denied` — the result text starts with a denial pattern (leading whitespace ignored)
 3. `error` — `is_error` is true
 4. `ok` — otherwise
 
-Denial patterns live in one constant, `ashiato.parser.DENIAL_PATTERNS`. They are Claude Code
-strings and will drift between versions, so `parse_file(..., denial_patterns=(...))` takes a
-replacement. `result_text` is truncated to `result_text_limit` (default 4,000 chars) with
-`result_truncated` recording whether that happened.
+Denial patterns live in one constant, `ashiato.parser.DENIAL_PATTERNS`. They are matched as
+*prefixes* of the result text, not substrings: a successful result that merely contains one
+of the strings somewhere (a read or diff of sources that quote them, a grep whose output
+matched them) is a success, not a denial. They are Claude Code strings and will drift between
+versions, so `parse_file(..., denial_patterns=(...))` takes a replacement, matched the same
+way. `result_text` is truncated to `result_text_limit` (default 4,000 chars) with
+`result_truncated` recording whether that happened; the denial verdict is made on the whole
+text, before truncation.
 
 ### `source_files` — build bookkeeping
 
@@ -157,6 +161,13 @@ version is refused with a message rather than half-upgraded: delete it and `buil
 `sql` and `denials` check the same thing when they open a database, so reading an old one
 says how to fix it instead of reporting a bare catalog error. A query of your own that
 names something that does not exist still gets DuckDB's error, untouched.
+
+The check is not only about columns: `outcome` is a stored column, so a change to the rules
+that derive it (such as the denial patterns becoming anchored prefixes) also makes a database
+out of date. Every build stamps the row-rule version it used into a small `ashiato_meta`
+table, and a database stamped by a version with different rules — or not stamped at all — is
+refused with the same delete-and-rebuild message: the incremental build would otherwise skip
+every unchanged file and keep rows derived under the old rules.
 
 ## Robustness
 

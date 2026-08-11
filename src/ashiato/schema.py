@@ -95,6 +95,26 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
     ("built_at", "TIMESTAMP"),
 )
 
+#: Version of the *rows*, as opposed to the column layout.  Bumped whenever a
+#: rebuild must re-derive existing rows even though no column changed -- the
+#: denial rule moving from substring to anchored-prefix matching (issue #8)
+#: changed what ``outcome`` means, and ``CREATE TABLE IF NOT EXISTS`` cannot see
+#: that.  Stored in :data:`META_TABLE`; a database without the marker, or with a
+#: different value, predates this version's rules and is refused.
+FORMAT_VERSION = 2
+
+#: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
+#: has no ``file_path`` column, so it must not join the per-file incremental
+#: bookkeeping or the row counts that ``database_info`` reports.
+META_TABLE = "ashiato_meta"
+
+#: The key under :data:`META_TABLE` that carries :data:`FORMAT_VERSION`.
+META_FORMAT_KEY = "format_version"
+
+META_SCHEMA_SQL = (
+    f'CREATE TABLE IF NOT EXISTS "{META_TABLE}" (key VARCHAR PRIMARY KEY, value VARCHAR)'
+)
+
 TABLE_COLUMNS: dict[str, tuple[Column, ...]] = {
     "sessions": SESSION_TABLE,
     "events": EVENT_TABLE,

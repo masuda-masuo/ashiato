@@ -12,6 +12,7 @@ from ashiato.parser import (
     DENIAL_PATTERNS,
     INPUT_SUMMARY_LIMIT,
     ParsedFile,
+    ToolCall,
     compute_depths,
     flatten_result_text,
     parse_file,
@@ -320,6 +321,104 @@ def test_denial_patterns_are_overridable():
     # ...and the built-in strings no longer apply, so is_error decides.
     assert calls["toolu_denied_1"].outcome == "error"
     assert calls["toolu_denied_2"].outcome == "ok"
+
+
+# ---------------------------------------------------------------- denial anchoring
+
+
+def call_with_result(content: object, tmp_path: Path, **kwargs) -> ToolCall:
+    """One Bash call whose tool_result carries *content* -- and nothing else."""
+    path = tmp_path / "one_call.jsonl"
+    records = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "sessionId": "s1",
+            "timestamp": "2026-08-10T09:00:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "run it"}]},
+        },
+        {
+            "type": "assistant",
+            "uuid": "u2",
+            "parentUuid": "u1",
+            "sessionId": "s1",
+            "timestamp": "2026-08-10T09:00:01.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Bash",
+                        "input": {"command": "grep denied"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "u3",
+            "parentUuid": "u2",
+            "sessionId": "s1",
+            "timestamp": "2026-08-10T09:00:02.000Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": content}],
+            },
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    (call,) = parse_file(path, **kwargs).tool_calls
+    return call
+
+
+@pytest.mark.parametrize("pattern", DENIAL_PATTERNS)
+def test_a_result_that_only_contains_a_denial_pattern_is_not_denied(pattern, tmp_path: Path):
+    """Quoting the strings is not a denial: only a result that *starts* with one is.
+
+    The measured false positives were a Bash chain whose output quoted the
+    patterns and MCP results embedding them in a JSON payload.
+    """
+    # A command chain that ended in a grep for the strings: the denial text
+    # appears mid-output, after the command's own echo.
+    output = f"usage: ashiato build ...\n$ grep -n denied src/ashiato/*.py\n{pattern}\n1 match"
+    assert call_with_result(output, tmp_path).outcome == "ok"
+    # An MCP result that returns the strings as data, not as its own verdict.
+    payload = '{"result": "{\\"content\\": [{\\"type\\": \\"text\\", \\"text\\": \\"' + pattern + '\\"}]}"}'
+    assert call_with_result(payload, tmp_path).outcome == "ok"
+
+
+def test_a_pattern_in_a_later_block_is_not_denied(tmp_path: Path):
+    """A denial in the second text block starts after the first block's text."""
+    content = [
+        {"type": "text", "text": "here is the diff"},
+        {"type": "text", "text": DENIAL_PATTERNS[0]},
+    ]
+    assert call_with_result(content, tmp_path).outcome == "ok"
+
+
+@pytest.mark.parametrize("pattern", DENIAL_PATTERNS)
+def test_a_result_that_starts_with_a_denial_pattern_is_denied(pattern, tmp_path: Path):
+    call = call_with_result(f"{pattern}. The tool call was rejected.", tmp_path)
+    assert call.outcome == "denied"
+
+
+@pytest.mark.parametrize("pattern", DENIAL_PATTERNS)
+def test_leading_whitespace_does_not_hide_a_denial(pattern, tmp_path: Path):
+    call = call_with_result(f" \n\t {pattern} rejected", tmp_path)
+    assert call.outcome == "denied"
+
+
+def test_a_denial_is_decided_on_the_full_text_not_the_truncated_copy(tmp_path: Path):
+    """The stored ``result_text`` is cut, but the verdict is made on the whole text."""
+    call = call_with_result(
+        DENIAL_PATTERNS[0] + " x", tmp_path, result_text_limit=10
+    )
+    assert call.outcome == "denied"
+    assert call.result_text == DENIAL_PATTERNS[0][:10]
+    assert call.result_truncated is True
 
 
 # ---------------------------------------------------------------- session
