@@ -732,3 +732,201 @@ def test_a_database_built_by_an_older_schema_is_refused(tmp_path: Path):
 
     with pytest.raises(SchemaOutOfDate, match="input_summary"):
         build([FIXTURES], db_path)
+
+
+# ------------------------------------------------- parallel tool_use blocks
+
+
+def write_parallel_session(path: Path, session_id: str, lines) -> None:
+    """A transcript whose assistant lines can carry several ``tool_use`` blocks.
+
+    *lines* is one list of ``(tool_use_id, tool_name, input, denied)`` per
+    assistant line.  Every call on a line shares that line's ``seq``, exactly as
+    parallel tool calls do in a real transcript, and each result arrives on a
+    later user line -- after the whole batch was already issued.
+    """
+    records: list[str] = []
+    clock = 0
+    previous = None
+    for index, calls in enumerate(lines):
+        assistant_id = f"a{index}"
+        records.append(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": assistant_id,
+                    "parentUuid": previous,
+                    "sessionId": session_id,
+                    "timestamp": f"2026-08-10T12:00:{clock:02d}.000Z",
+                    "cwd": "/home/dev/proj",
+                    "permissionMode": "default",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": use_id,
+                                "name": tool_name,
+                                "input": tool_input,
+                            }
+                            for use_id, tool_name, tool_input, _ in calls
+                        ],
+                    },
+                }
+            )
+        )
+        clock += 1
+        for use_id, _, _, denied in calls:
+            result_id = f"r{index}_{use_id}"
+            records.append(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": result_id,
+                        "parentUuid": assistant_id,
+                        "sessionId": session_id,
+                        "timestamp": f"2026-08-10T12:00:{clock:02d}.000Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": use_id,
+                                    "content": DENIAL_TEXT if denied else "fine",
+                                    "is_error": denied,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
+            clock += 1
+            previous = result_id
+    path.write_text("\n".join(records) + "\n", encoding="utf-8")
+
+
+#: Denials that share their transcript line with a sibling call.  The sibling's
+#: id sorts *after* the denial's, so pairing by (seq, tool_use_id) alone would
+#: pick it -- and it was issued before the model could have seen the denial.
+PARALLEL_SESSIONS = {
+    # The sibling is a Read; the later line is a Bash, so the two candidates
+    # even disagree about followup_kind.
+    "pll1": [
+        [
+            ("toolu_pll1_a", "Bash", {"command": "rm -rf /"}, True),
+            ("toolu_pll1_b", "Read", {"file_path": "/etc/hosts"}, False),
+        ],
+        [("toolu_pll1_c", "Bash", {"command": "ls -1"}, False)],
+    ],
+    # Same shape, but the denial's line is the session's last.
+    "pll2": [
+        [
+            ("toolu_pll2_a", "Bash", {"command": "curl evil.example"}, True),
+            ("toolu_pll2_b", "Read", {"file_path": "/tmp/notes"}, False),
+        ],
+    ],
+    # The *later* line is the parallel one: tool_use_id still picks between its
+    # blocks, which is the only tie the view has left to break.
+    "pll3": [
+        [("toolu_pll3_a", "Write", {"file_path": "/etc/hosts", "content": "no"}, True)],
+        [
+            ("toolu_pll3_z", "Glob", {"pattern": "**/*.py"}, False),
+            ("toolu_pll3_b", "Grep", {"pattern": "TODO"}, False),
+        ],
+    ],
+}
+
+
+@pytest.fixture
+def parallel_source(tmp_path: Path) -> Path:
+    source = tmp_path / "parallel"
+    source.mkdir()
+    for session_id, lines in PARALLEL_SESSIONS.items():
+        write_parallel_session(source / f"{session_id}.jsonl", session_id, lines)
+    return source
+
+
+@pytest.fixture
+def parallels(parallel_source: Path, tmp_path: Path):
+    build([parallel_source], tmp_path / "parallel.duckdb")
+    connection = connect(tmp_path / "parallel.duckdb", read_only=True)
+    yield connection
+    connection.close()
+
+
+def test_parallel_blocks_really_do_share_a_seq(parallels):
+    """Otherwise the tests below would prove nothing about same-line siblings."""
+    rows = parallels.execute(
+        "SELECT seq, count(*) FROM tool_calls WHERE session_id = 'pll1' GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    assert [count for _, count in rows] == [2, 1]
+
+
+def test_a_same_line_sibling_is_not_the_followup(parallels):
+    """The sibling was issued before the model saw the denial, so it cannot be a reaction."""
+    row = parallels.execute(
+        "SELECT next_tool_name, next_input_summary, followup_kind "
+        "FROM denial_followups WHERE session_id = 'pll1'"
+    ).fetchone()
+    assert row == ("Bash", "ls -1", "same-tool")
+
+
+def test_a_denial_on_the_last_line_is_none_even_with_a_sibling(parallels):
+    row = parallels.execute(
+        "SELECT next_tool_name, next_input_summary, next_outcome, next_ts, gap_seconds, "
+        "followup_kind FROM denial_followups WHERE session_id = 'pll2'"
+    ).fetchone()
+    assert row == (None, None, None, None, None, "none")
+
+
+def test_tool_use_id_still_breaks_the_tie_within_the_later_line(parallels):
+    row = parallels.execute(
+        "SELECT next_tool_name, followup_kind FROM denial_followups WHERE session_id = 'pll3'"
+    ).fetchone()
+    assert row == ("Grep", "other-tool")
+
+
+def expected_followups(connection: duckdb.DuckDBPyConnection) -> dict[tuple, tuple | None]:
+    """What the view should say, worked out in Python rather than in SQL.
+
+    For every denied call: the first call of the same session on a strictly
+    later line, ties within that line broken by ``tool_use_id``; ``None`` when
+    the session has no later line that called a tool.
+    """
+    calls = connection.execute(
+        "SELECT session_id, seq, tool_use_id, tool_name, input_summary, outcome FROM tool_calls"
+    ).fetchall()
+    expected: dict[tuple, tuple | None] = {}
+    for session_id, seq, _, _, _, outcome in calls:
+        if outcome != "denied":
+            continue
+        later = [row for row in calls if row[0] == session_id and row[1] > seq]
+        first = min(later, key=lambda row: (row[1], row[2]), default=None)
+        expected[(session_id, seq)] = None if first is None else first[3:]
+    return expected
+
+
+def view_followups(connection: duckdb.DuckDBPyConnection) -> dict[tuple, tuple | None]:
+    rows = connection.execute(
+        "SELECT session_id, seq, next_tool_name, next_input_summary, next_outcome, followup_kind "
+        "FROM denial_followups"
+    ).fetchall()
+    seen: dict[tuple, tuple | None] = {}
+    for session_id, seq, next_tool_name, next_input_summary, next_outcome, kind in rows:
+        assert kind in FOLLOWUP_KINDS
+        if kind == "none":
+            assert (next_tool_name, next_input_summary, next_outcome) == (None, None, None)
+        seen[(session_id, seq)] = (
+            None if kind == "none" else (next_tool_name, next_input_summary, next_outcome)
+        )
+    return seen
+
+
+@pytest.mark.parametrize("corpus", ["built", "parallels", "followups"])
+def test_the_followup_is_always_the_first_strictly_later_call(corpus, request):
+    """The property itself, over every corpus the suite builds."""
+    fixture = request.getfixturevalue(corpus)
+    connection = fixture[1] if corpus == "built" else fixture
+    expected = expected_followups(connection)
+    assert expected  # the corpus contains denials at all
+    assert view_followups(connection) == expected

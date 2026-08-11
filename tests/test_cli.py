@@ -289,3 +289,59 @@ def test_a_negative_limit_is_rejected():
     with pytest.raises(SystemExit) as excinfo:
         main(["denials", "--limit", "-1"])
     assert excinfo.value.code == 2
+
+
+# ------------------------------------------------- reading an old database
+
+
+def make_outdated(db: Path) -> Path:
+    """The database as a version before ``input_summary`` left it."""
+    connection = connect(db)
+    try:
+        connection.execute("DROP VIEW denial_followups")
+        connection.execute("ALTER TABLE tool_calls DROP COLUMN input_summary")
+    finally:
+        connection.close()
+    return db
+
+
+def test_denials_on_a_pre_upgrade_database_names_the_fix(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """`build` already says to rebuild; reading has to say the same thing."""
+    assert main(["denials", "--db", str(make_outdated(db))]) == 1
+    err = capsys.readouterr().err
+    assert "input_summary" in err
+    assert "delete the database file and build again" in err
+    assert "Catalog Error" not in err
+
+
+def test_sql_on_a_pre_upgrade_database_names_the_fix(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    query = "SELECT * FROM denial_followups"
+    assert main(["sql", query, "--db", str(make_outdated(db))]) == 1
+    assert "delete the database file and build again" in capsys.readouterr().err
+
+
+def test_a_missing_view_alone_also_names_the_fix(db: Path, capsys: pytest.CaptureFixture[str]):
+    """The tables can be current and the view still absent -- same fix, same message."""
+    connection = connect(db)
+    try:
+        connection.execute("DROP VIEW denial_followups")
+    finally:
+        connection.close()
+    assert main(["denials", "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    assert "denial_followups" in err
+    assert "delete the database file and build again" in err
+
+
+def test_a_query_the_user_got_wrong_keeps_duckdbs_own_error(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Only the schema mismatch earns the rebuild hint; a typo is still a typo."""
+    assert main(["sql", "SELECT * FROM nonexistent", "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    assert "nonexistent" in err
+    assert "build again" not in err

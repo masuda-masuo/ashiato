@@ -17,6 +17,7 @@ from ashiato import __version__
 from ashiato.build import (
     DEFAULT_SOURCE,
     SchemaOutOfDate,
+    assert_readable,
     build,
     connect,
     database_info,
@@ -137,9 +138,15 @@ def _run_query(
         return 1
     connection = connect(db_path, read_only=True)
     try:
+        # Before the query, not after it fails: an out-of-date database gets the
+        # rebuild hint, and a query the user got wrong keeps DuckDB's own words.
+        assert_readable(connection)
         cursor = connection.execute(query, list(params))
         columns = [description[0] for description in cursor.description or []]
         rows = cursor.fetchall() if columns else []
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
     except duckdb.Error as error:
         print(f"error: {error}", file=err)
         return 1
