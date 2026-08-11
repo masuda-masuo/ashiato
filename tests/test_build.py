@@ -15,9 +15,16 @@ from ashiato import build as build_module
 from ashiato.build import (
     BULK_INSERT_MIN_ROWS as BULK_MIN,
 )
-from ashiato.build import build, connect, database_info, default_db_path, iter_transcripts
+from ashiato.build import (
+    SchemaOutOfDate,
+    build,
+    connect,
+    database_info,
+    default_db_path,
+    iter_transcripts,
+)
 from ashiato.parser import EVENT_COLUMNS, SESSION_COLUMNS, TOOL_CALL_COLUMNS
-from ashiato.schema import SOURCE_FILE_COLUMNS
+from ashiato.schema import FOLLOWUP_KINDS, SOURCE_FILE_COLUMNS
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MAIN_SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -437,3 +444,291 @@ def test_lone_surrogates_do_not_crash_the_build(tmp_path: Path):
     result = build([source], tmp_path / "surrogate.duckdb")
     assert result.n_events == BULK_MIN + 5
     assert result.failed_files == []
+
+
+# ---------------------------------------------------------------- denial followups
+
+#: The first of DENIAL_PATTERNS, as Claude Code writes it into a tool result.
+DENIAL_TEXT = "The user doesn't want to proceed with this tool use. The tool call was rejected."
+
+
+def write_session(path: Path, session_id: str, calls) -> None:
+    """A transcript of back-to-back tool calls, each of them denied or not.
+
+    Two lines per call -- the assistant's ``tool_use`` and the user's
+    ``tool_result`` -- so ``seq`` advances the way it does in a real transcript
+    and one call's result sits between it and the next call.
+    """
+    lines = []
+    clock = 0
+    for index, (tool_name, tool_input, denied) in enumerate(calls):
+        use_id = f"toolu_{index}"
+        lines.append(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"a{index}",
+                    "parentUuid": None if index == 0 else f"r{index - 1}",
+                    "sessionId": session_id,
+                    "timestamp": f"2026-08-10T12:00:{clock:02d}.000Z",
+                    "cwd": "/home/dev/proj",
+                    "permissionMode": "default",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": use_id,
+                                "name": tool_name,
+                                "input": tool_input,
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        clock += 1
+        lines.append(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": f"r{index}",
+                    "parentUuid": f"a{index}",
+                    "sessionId": session_id,
+                    "timestamp": f"2026-08-10T12:00:{clock:02d}.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": use_id,
+                                "content": DENIAL_TEXT if denied else "fine",
+                                "is_error": denied,
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        clock += 1
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+#: One session per followup_kind.  Real corpora show all of these: a verbatim
+#: retry of the rejected command, the same command narrowed down, and a switch
+#: to a different tool entirely.
+FOLLOWUP_SESSIONS = {
+    "aaaa": [
+        ("Bash", {"command": "gh pr merge 18 --squash"}, True),
+        ("Bash", {"command": "gh pr merge 18 --squash"}, False),
+    ],
+    "bbbb": [
+        ("Bash", {"command": "gh pr merge 18 --squash && git pull"}, True),
+        ("Bash", {"command": "gh pr merge 18 --squash"}, False),
+    ],
+    "cccc": [
+        ("Write", {"file_path": "/etc/hosts", "content": "127.0.0.1 nope"}, True),
+        ("Read", {"file_path": "/etc/hosts"}, False),
+    ],
+    "dddd": [
+        ("Bash", {"command": "rm -rf /"}, True),
+    ],
+}
+
+
+@pytest.fixture
+def followup_source(tmp_path: Path) -> Path:
+    source = tmp_path / "followups"
+    source.mkdir()
+    for session_id, calls in FOLLOWUP_SESSIONS.items():
+        write_session(source / f"{session_id}.jsonl", session_id, calls)
+    return source
+
+
+@pytest.fixture
+def followups(followup_source: Path, tmp_path: Path):
+    build([followup_source], tmp_path / "followups.duckdb")
+    connection = connect(tmp_path / "followups.duckdb", read_only=True)
+    yield connection
+    connection.close()
+
+
+def test_followup_kind_covers_every_case(followups):
+    rows = followups.execute(
+        "SELECT session_id, tool_name, input_summary, next_tool_name, next_input_summary, "
+        "next_outcome, next_ts, gap_seconds, followup_kind "
+        "FROM denial_followups ORDER BY session_id"
+    ).fetchall()
+    assert rows == [
+        (
+            "aaaa",
+            "Bash",
+            "gh pr merge 18 --squash",
+            "Bash",
+            "gh pr merge 18 --squash",
+            "ok",
+            datetime(2026, 8, 10, 12, 0, 2),
+            2.0,
+            "verbatim-retry",
+        ),
+        (
+            "bbbb",
+            "Bash",
+            "gh pr merge 18 --squash && git pull",
+            "Bash",
+            "gh pr merge 18 --squash",
+            "ok",
+            datetime(2026, 8, 10, 12, 0, 2),
+            2.0,
+            "same-tool",
+        ),
+        (
+            "cccc",
+            "Write",
+            "/etc/hosts",
+            "Read",
+            "/etc/hosts",
+            "ok",
+            datetime(2026, 8, 10, 12, 0, 2),
+            2.0,
+            "other-tool",
+        ),
+        # The denial was the last thing the session did: nothing followed it.
+        ("dddd", "Bash", "rm -rf /", None, None, None, None, None, "none"),
+    ]
+
+
+def test_followup_kind_takes_only_the_four_documented_values(followups):
+    kinds = {
+        row[0]
+        for row in followups.execute(
+            "SELECT DISTINCT followup_kind FROM denial_followups"
+        ).fetchall()
+    }
+    assert kinds == set(FOLLOWUP_KINDS)
+
+
+def test_a_narrowed_retry_is_not_a_verbatim_one(followups):
+    """The distinction is the whole point: 'bbbb' retried a *shorter* command."""
+    kind = scalar(followups, "SELECT followup_kind FROM denial_followups WHERE session_id = 'bbbb'")
+    assert kind == "same-tool"
+
+
+def test_every_denied_call_appears_exactly_once(built):
+    _, connection = built
+    denied = connection.execute(
+        "SELECT session_id, seq FROM tool_calls WHERE outcome = 'denied' ORDER BY 1, 2"
+    ).fetchall()
+    assert len(denied) == 2
+    assert (
+        connection.execute("SELECT session_id, seq FROM denial_followups ORDER BY 1, 2").fetchall()
+        == denied
+    )
+
+
+def test_denial_followups_on_the_fixture_corpus(built):
+    _, connection = built
+    rows = connection.execute(
+        "SELECT seq, tool_name, input_summary, permission_mode, cwd, next_tool_name, "
+        "next_outcome, followup_kind FROM denial_followups ORDER BY seq"
+    ).fetchall()
+    assert rows == [
+        (
+            6,
+            "Write",
+            "/etc/hosts",
+            "default",
+            "/home/dev/proj",
+            "mcp__sunaba__publish",
+            "denied",
+            "other-tool",
+        ),
+        (
+            8,
+            "mcp__sunaba__publish",
+            '{"create_pr":true,"files":["src/ashiato/parser.py"]}',
+            "default",
+            "/home/dev/proj",
+            "Bash",
+            "pending",
+            "other-tool",
+        ),
+    ]
+
+
+def test_the_next_call_is_the_next_one_in_the_same_session(followup_source: Path, db: Path):
+    """A neighbouring session's calls must not be picked up as a followup."""
+    write_session(followup_source / "eeee.jsonl", "eeee", [("Glob", {"pattern": "**/*.py"}, False)])
+    build([followup_source], db)
+    connection = connect(db, read_only=True)
+    try:
+        # 'dddd' still ends with its denial even though 'eeee' has a later call.
+        kind = scalar(
+            connection, "SELECT followup_kind FROM denial_followups WHERE session_id = 'dddd'"
+        )
+        assert kind == "none"
+        assert scalar(connection, "SELECT count(*) FROM denial_followups") == 4
+    finally:
+        connection.close()
+
+
+def test_input_summary_is_populated_for_bash_calls(built):
+    _, connection = built
+    rows = connection.execute(
+        "SELECT tool_use_id, input_summary FROM tool_calls WHERE tool_name = 'Bash' ORDER BY 1"
+    ).fetchall()
+    assert rows == [("toolu_ok_1", "ls -1"), ("toolu_pending_1", "sleep 600")]
+    # Nothing in the corpus has an input but no summary of it.
+    assert (
+        scalar(
+            connection,
+            "SELECT count(*) FROM tool_calls WHERE input IS NOT NULL AND input_summary IS NULL",
+        )
+        == 0
+    )
+
+
+def test_the_view_is_rebuilt_with_the_rows_it_summarises(source_copy: Path, db: Path):
+    """The view is derived on read, so an incremental rebuild cannot leave it stale."""
+    build([source_copy], db)
+    write_session(
+        source_copy / "late.jsonl",
+        "ffff",
+        [("Bash", {"command": "curl example.com"}, True), ("Bash", {"command": "echo no"}, False)],
+    )
+    build([source_copy], db)
+
+    connection = connect(db, read_only=True)
+    try:
+        kind = scalar(
+            connection, "SELECT followup_kind FROM denial_followups WHERE session_id = 'ffff'"
+        )
+        assert kind == "same-tool"
+        assert scalar(connection, "SELECT count(*) FROM denial_followups") == 3
+    finally:
+        connection.close()
+
+
+def test_two_builds_of_the_same_bytes_give_the_same_view(tmp_path: Path, followup_source: Path):
+    """Determinism: the frozen source must produce the same rows every time."""
+    first, second = tmp_path / "first.duckdb", tmp_path / "second.duckdb"
+    build([followup_source], first)
+    build([followup_source], second)
+    order = "session_id, seq"
+    assert dump(first, "denial_followups", order) == dump(second, "denial_followups", order)
+    assert len(dump(first, "denial_followups", order)) == len(FOLLOWUP_SESSIONS)
+
+
+def test_a_database_built_by_an_older_schema_is_refused(tmp_path: Path):
+    """The incremental build would skip every file, so the missing column must not pass."""
+    db_path = tmp_path / "old.duckdb"
+    build([FIXTURES], db_path)
+    connection = connect(db_path)
+    try:
+        connection.execute("DROP VIEW denial_followups")
+        connection.execute("ALTER TABLE tool_calls DROP COLUMN input_summary")
+    finally:
+        connection.close()
+
+    with pytest.raises(SchemaOutOfDate, match="input_summary"):
+        build([FIXTURES], db_path)

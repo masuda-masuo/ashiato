@@ -10,12 +10,14 @@ import pytest
 
 from ashiato.parser import (
     DENIAL_PATTERNS,
+    INPUT_SUMMARY_LIMIT,
     ParsedFile,
     compute_depths,
     flatten_result_text,
     parse_file,
     parse_timestamp,
     split_tool_name,
+    summarize_input,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -446,3 +448,109 @@ def test_a_utf8_bom_does_not_swallow_the_first_record(tmp_path: Path):
     assert parsed.events[0].text == "first"
     assert parsed.session is not None
     assert parsed.session.n_events == 2
+
+
+# ---------------------------------------------------------------- input summary
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input", "expected"),
+    [
+        ("Bash", {"command": "ls -1", "description": "list files"}, "ls -1"),
+        ("PowerShell", {"command": "Get-ChildItem"}, "Get-ChildItem"),
+        ("Read", {"file_path": "/tmp/a.txt", "limit": 5}, "/tmp/a.txt"),
+        # The content of a Write is the whole point of not showing the input.
+        ("Write", {"file_path": "/etc/hosts", "content": "127.0.0.1 nope"}, "/etc/hosts"),
+        ("Edit", {"file_path": "/src/x.py", "old_str": "a", "new_str": "b"}, "/src/x.py"),
+        ("NotebookEdit", {"file_path": "/nb.ipynb", "cell_id": "c1"}, "/nb.ipynb"),
+        ("Glob", {"pattern": "**/*.py"}, "**/*.py"),
+        ("Grep", {"pattern": "TODO", "glob": "*.py"}, "TODO"),
+        ("Skill", {"skill": "code-review", "args": "--fix"}, "code-review"),
+        ("Agent", {"description": "find the bug", "prompt": "a long prompt"}, "find the bug"),
+        ("Task", {"description": "find the bug"}, "find the bug"),
+        ("WebFetch", {"url": "https://example.com", "prompt": "read it"}, "https://example.com"),
+        ("WebSearch", {"query": "duckdb window functions"}, "duckdb window functions"),
+    ],
+)
+def test_summarize_input_reads_the_field_that_matters_per_tool(tool_name, tool_input, expected):
+    assert summarize_input(tool_name, tool_input) == expected
+
+
+def test_summarize_input_falls_back_to_the_whole_input():
+    # MCP tools have no field this table knows about, so the input shows whole.
+    assert summarize_input("mcp__sunaba__publish", {"files": ["a.py"], "create_pr": True}) == (
+        '{"create_pr":true,"files":["a.py"]}'
+    )
+    # A tool nobody has taught this table about, and a call with no name at all.
+    assert summarize_input("BrandNewTool", {"thing": "value"}) == '{"thing":"value"}'
+    assert summarize_input(None, {"thing": "value"}) == '{"thing":"value"}'
+
+
+def test_the_fallback_does_not_depend_on_key_order():
+    """Two transcripts of the same call must summarise identically."""
+    assert summarize_input("mcp__x__y", {"b": 1, "a": 2}) == '{"a":2,"b":1}'
+    assert summarize_input("mcp__x__y", {"a": 2, "b": 1}) == '{"a":2,"b":1}'
+
+
+def test_summarize_input_falls_back_when_the_named_field_is_unusable():
+    # Present but not the field we hoped for...
+    assert summarize_input("Bash", {"description": "no command here"}) == (
+        '{"description":"no command here"}'
+    )
+    # ...present but not a string...
+    assert summarize_input("Read", {"file_path": 17}) == '{"file_path":17}'
+    # ...present but blank, which would summarise to nothing at all.  The
+    # fallback is collapsed to one line like any other summary, which is why
+    # the three spaces come back as one.
+    assert summarize_input("Bash", {"command": "   "}) == '{"command":" "}'
+
+
+def test_summarize_input_is_null_only_when_there_was_no_input():
+    assert summarize_input("Bash", None) is None
+    # An input that is present but empty is not the same as no input.
+    assert summarize_input("Bash", {}) == "{}"
+
+
+def test_summarize_input_survives_an_input_that_is_not_an_object():
+    assert summarize_input("Bash", ["a", "b"]) == '["a","b"]'
+    assert summarize_input("Bash", "just a string") == '"just a string"'
+
+
+def test_a_summary_is_one_line():
+    assert summarize_input("Bash", {"command": "set -e\n\n  git status\t-s"}) == (
+        "set -e git status -s"
+    )
+
+
+def test_a_summary_is_cut_to_the_limit():
+    command = "echo " + "x" * 500
+    summary = summarize_input("Bash", {"command": command})
+    assert len(summary) == INPUT_SUMMARY_LIMIT == 200
+    assert summary == command[:INPUT_SUMMARY_LIMIT]
+
+    # The fallback is cut too -- an MCP call can carry a whole file as an argument.
+    assert len(summarize_input("mcp__server__tool", {"blob": "y" * 500})) == INPUT_SUMMARY_LIMIT
+
+
+def test_input_summary_lands_on_the_parsed_calls(main: ParsedFile):
+    calls = by_id(main)
+    assert calls["toolu_ok_1"].input_summary == "ls -1"
+    assert calls["toolu_pending_1"].input_summary == "sleep 600"
+    assert calls["toolu_err_1"].input_summary == "/missing.txt"
+    assert calls["toolu_denied_1"].input_summary == "/etc/hosts"
+    assert calls["toolu_sub_1"].input_summary == "TODO"
+    assert calls["toolu_denied_2"].input_summary == (
+        '{"create_pr":true,"files":["src/ashiato/parser.py"]}'
+    )
+
+
+def test_a_tool_use_with_no_input_summarises_to_nothing(tmp_path: Path):
+    path = tmp_path / "no_input.jsonl"
+    path.write_text(
+        '{"type":"assistant","message":{"role":"assistant",'
+        '"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}\n',
+        encoding="utf-8",
+    )
+    (call,) = parse_file(path).tool_calls
+    assert call.input is None
+    assert call.input_summary is None

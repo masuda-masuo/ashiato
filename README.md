@@ -29,6 +29,7 @@ Python 3.11+. The only runtime dependency is `duckdb`.
 ```
 ashiato build [--source DIR]... [--db PATH]
 ashiato sql "SELECT ..." [--db PATH] [--format table|json|csv]
+ashiato denials [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato info [--db PATH]
 ```
 
@@ -39,6 +40,8 @@ ashiato info [--db PATH]
 - `build` is incremental: a file whose path, size and mtime are unchanged since the last
   build is skipped. A changed file has its old rows deleted and is re-inserted whole, so
   rebuilding never duplicates.
+- `denials` prints the `denial_followups` view — every denied tool call and what the
+  session did next — newest first, 50 rows by default (`--limit 0` for all).
 
 ```
 $ ashiato build
@@ -79,14 +82,22 @@ reach chains ~2,400 deep, so the walk is both memoized and iterative.
 ### `tool_calls` — one row per tool invocation and its outcome
 
 `tool_use_id`, `session_id`, `file_path`, `seq`, `ts`, `call_event_id`, `result_event_id`,
-`tool_name`, `tool_kind`, `mcp_server`, `input`, `outcome`, `is_error`, `result_text`,
-`result_truncated`, `duration_ms`, `permission_mode`, `cwd`, `is_sidechain`,
+`tool_name`, `tool_kind`, `mcp_server`, `input`, `input_summary`, `outcome`, `is_error`,
+`result_text`, `result_truncated`, `duration_ms`, `permission_mode`, `cwd`, `is_sidechain`,
 `parent_tool_use_id`.
 
 Built by joining each `tool_use` block to its `tool_result` on `tool_use_id`; the call is on
 an assistant line and the result on a later user line. `seq`, `ts`, `permission_mode`, `cwd`
 and `is_sidechain` come from the calling event. `input` is a DuckDB `JSON` column, so
 `input->>'$.command'` works.
+
+`input_summary` is one short line saying what the call asked for, so you can read a list of
+calls without knowing each tool's argument shape: the `command` of a `Bash`, the `file_path`
+of a `Read`/`Write`/`Edit`, the `pattern` of a `Grep`, and so on
+(`ashiato.parser.INPUT_SUMMARY_FIELDS` is the whole table). Any other tool — every MCP tool,
+anything Claude Code adds later — falls back to the compact JSON of the input, as does a call
+whose named field is missing or is not a string. Summaries are collapsed to one line and cut
+to 200 characters; `NULL` means the call carried no input at all.
 
 `outcome` is decided in this order:
 
@@ -104,6 +115,41 @@ replacement. `result_text` is truncated to `result_text_limit` (default 4,000 ch
 
 `file_path`, `size_bytes`, `mtime`, `content_hash`, `n_events`, `n_tool_calls`,
 `n_parse_errors`, `built_at`. This is what makes `build` incremental.
+
+## Views
+
+### `denial_followups` — what happened after a tool call was denied
+
+One row per `outcome = 'denied'` call in `tool_calls`, joined to the next tool call in the
+same session: `session_id`, `seq`, `ts`, `tool_name`, `input_summary`, `permission_mode`,
+`cwd`, `next_tool_name`, `next_input_summary`, `next_outcome`, `next_ts`, `gap_seconds`,
+`followup_kind`.
+
+A view, not a table: it is derived entirely from `tool_calls`, so it cannot fall out of step
+with the rows it summarises and the incremental build has nothing extra to maintain.
+
+"Next" is the next tool call by `seq` within the same `session_id` — not the `parentUuid`
+tree, not sidechain structure. `seq` is the transcript line number, so several `tool_use`
+blocks emitted on one assistant line share it; `tool_use_id` breaks that tie. Block order
+within a line is not recorded anywhere, so that tiebreak is a *stable* choice rather than a
+faithful one — it is there so two builds of the same bytes agree.
+
+`followup_kind` is mechanical, never a judgement about whether the retry was legitimate:
+
+| value | meaning |
+| --- | --- |
+| `verbatim-retry` | same `tool_name`, byte-identical `input` |
+| `same-tool` | same `tool_name`, different `input` (a narrowed or corrected retry) |
+| `other-tool` | a different tool |
+| `none` | the denial was the session's last call; every `next_*` column is `NULL` |
+
+```
+$ ashiato denials --limit 5
+$ ashiato sql "SELECT followup_kind, count(*) FROM denial_followups GROUP BY 1 ORDER BY 2 DESC"
+```
+
+Adding `input_summary` changed the `tool_calls` schema, so a database built by an earlier
+version is refused with a message rather than half-upgraded: delete it and `build` again.
 
 ## Robustness
 

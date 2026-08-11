@@ -35,7 +35,14 @@ from ashiato.parser import (
     ParsedFile,
     parse_file,
 )
-from ashiato.schema import SCHEMA_SQL, TABLES, column_names, insert_sql, read_json_types
+from ashiato.schema import (
+    DENIAL_FOLLOWUPS_SQL,
+    SCHEMA_SQL,
+    TABLES,
+    column_names,
+    insert_sql,
+    read_json_types,
+)
 
 #: Where Claude Code keeps its transcripts.
 DEFAULT_SOURCE = Path("~/.claude/projects")
@@ -49,6 +56,10 @@ _HASH_CHUNK = 1 << 20
 _event_row = attrgetter(*EVENT_COLUMNS)
 _tool_call_row = attrgetter(*TOOL_CALL_COLUMNS)
 _session_row = attrgetter(*SESSION_COLUMNS)
+
+
+class SchemaOutOfDate(RuntimeError):
+    """The database on disk was built by a version with a different schema."""
 
 
 @dataclass
@@ -96,8 +107,37 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> duckdb.DuckDBPyC
     return connection
 
 
+def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
+    """Refuse a database whose tables predate the columns this version expects.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an older table exactly as it found it,
+    so a column added since that database was built is simply absent -- and the
+    first thing to notice would be the view below failing to bind, with a
+    message about a column nobody asked for.  Say what actually happened
+    instead.  Rebuilding is the fix: the missing values are derived from the
+    transcripts, and the incremental build would skip every unchanged file.
+    """
+    for table in TABLES:
+        rows = connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+        actual = tuple(row[1] for row in rows)
+        expected = column_names(table)
+        if actual != expected:
+            missing = [name for name in expected if name not in actual]
+            detail = (
+                f"is missing {missing}"
+                if missing
+                else f"has {list(actual)} where {list(expected)} was expected"
+            )
+            raise SchemaOutOfDate(
+                f"table '{table}' {detail}: this database was built by a different version "
+                "of ashiato -- delete the database file and build again"
+            )
+
+
 def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(SCHEMA_SQL)
+    _assert_current_schema(connection)
+    connection.execute(DENIAL_FOLLOWUPS_SQL)
 
 
 def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
