@@ -214,6 +214,9 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
         return 1
     try:
         info = database_info(db_path)
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
     except duckdb.Error as error:
         print(f"error: {error}", file=err)
         return 1

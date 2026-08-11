@@ -17,14 +17,23 @@ from ashiato.build import (
 )
 from ashiato.build import (
     SchemaOutOfDate,
+    assert_readable,
     build,
     connect,
+    create_schema,
     database_info,
     default_db_path,
     iter_transcripts,
 )
 from ashiato.parser import EVENT_COLUMNS, SESSION_COLUMNS, TOOL_CALL_COLUMNS
-from ashiato.schema import FOLLOWUP_KINDS, SOURCE_FILE_COLUMNS
+from ashiato.schema import (
+    FOLLOWUP_KINDS,
+    FORMAT_VERSION,
+    META_FORMAT_KEY,
+    META_TABLE,
+    SOURCE_FILE_COLUMNS,
+    TABLES,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MAIN_SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -732,6 +741,92 @@ def test_a_database_built_by_an_older_schema_is_refused(tmp_path: Path):
 
     with pytest.raises(SchemaOutOfDate, match="input_summary"):
         build([FIXTURES], db_path)
+
+
+def test_the_format_marker_is_written_on_build(db: Path):
+    """A fresh build stamps the current row-rule version into the meta table."""
+    build([FIXTURES], db)
+    connection = connect(db, read_only=True)
+    try:
+        (value,) = connection.execute(
+            f'SELECT value FROM "{META_TABLE}" WHERE key = ?', [META_FORMAT_KEY]
+        ).fetchone()
+        assert value == str(FORMAT_VERSION)
+    finally:
+        connection.close()
+
+
+def test_a_crash_inside_create_schema_leaves_no_refuse_only_database(tmp_path: Path):
+    """The DDL and the marker stamp are one transaction: a crash between them
+    must not leave ashiato tables with no marker, which the next build would
+    refuse even though the file is empty and perfectly rebuildable.
+    """
+    db_path = tmp_path / "atomic.duckdb"
+    # Make the marker stamp fail mid-create_schema -- the crash point that used
+    # to strand the database.  A pre-created meta table whose CHECK rejects the
+    # marker value lets every DDL statement succeed and the marker INSERT fail.
+    connection = connect(db_path)
+    try:
+        connection.execute(
+            f'CREATE TABLE "{META_TABLE}" ('
+            "key VARCHAR PRIMARY KEY, value VARCHAR CHECK (length(value) > 1000))"
+        )
+    finally:
+        connection.close()
+
+    connection = connect(db_path)
+    try:
+        with pytest.raises(duckdb.Error):
+            create_schema(connection)
+    finally:
+        connection.close()
+
+    # The transaction rolled back: no half-created ashiato table is left behind.
+    connection = connect(db_path, read_only=True)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+        }
+    finally:
+        connection.close()
+    assert not (set(TABLES) & tables)
+
+    # With the scaffolding gone the file is exactly what a crash leaves: empty.
+    # The next build starts fresh instead of refusing.
+    connection = connect(db_path)
+    try:
+        connection.execute(f'DROP TABLE "{META_TABLE}"')
+    finally:
+        connection.close()
+    result = build([FIXTURES], db_path)
+    assert result.n_processed == 4
+
+
+def test_a_database_built_under_the_old_outcome_rule_is_refused(tmp_path: Path):
+    """`outcome` is a stored column: a DB whose rows were classified by the old
+    substring rule must be refused with the rebuild message, not silently mixed
+    or half-upgraded.  The marker is the only thing that can see the difference.
+    """
+    db_path = tmp_path / "oldrule.duckdb"
+    build([FIXTURES], db_path)
+    connection = connect(db_path)
+    try:
+        connection.execute(f'DELETE FROM "{META_TABLE}" WHERE key = ?', [META_FORMAT_KEY])
+    finally:
+        connection.close()
+
+    with pytest.raises(SchemaOutOfDate, match="delete the database file and build again"):
+        build([FIXTURES], db_path)
+
+    # Reading refuses the same way: sql and denials both open through
+    # assert_readable, and a stale marker must not be half-upgraded either.
+    connection = connect(db_path, read_only=True)
+    try:
+        with pytest.raises(SchemaOutOfDate, match="delete the database file and build again"):
+            assert_readable(connection)
+    finally:
+        connection.close()
 
 
 # ------------------------------------------------- parallel tool_use blocks
