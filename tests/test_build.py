@@ -23,14 +23,19 @@ from ashiato.build import (
     create_schema,
     database_info,
     default_db_path,
+    iter_opencode_sources,
     iter_transcripts,
 )
+from ashiato.opencode import OpenCodeToolCall, ParsedOpenCodeFile
 from ashiato.parser import EVENT_COLUMNS, SESSION_COLUMNS, TOOL_CALL_COLUMNS
+from ashiato.recall import RECALL_CALL_COLUMNS, extract_from_opencode
 from ashiato.schema import (
     FOLLOWUP_KINDS,
     FORMAT_VERSION,
+    INFO_TABLES,
     META_FORMAT_KEY,
     META_TABLE,
+    RECALL_FOLLOWUPS_VIEW,
     SOURCE_FILE_COLUMNS,
     TABLES,
 )
@@ -1025,3 +1030,406 @@ def test_the_followup_is_always_the_first_strictly_later_call(corpus, request):
     expected = expected_followups(connection)
     assert expected  # the corpus contains denials at all
     assert view_followups(connection) == expected
+
+
+# ---------------------------------------------------------------- recall_calls (Claude Code)
+
+
+def write_recall_transcript(path: Path, session_id: str, turns) -> None:
+    """A transcript alternating plain assistant text and tool calls with a custom result.
+
+    *turns* is a list of ``("text", content)`` or
+    ``("tool", tool_name, input, output_text)`` entries.  A tool turn becomes
+    two lines -- the assistant's ``tool_use`` and the user's ``tool_result``
+    -- so ``seq`` advances the way it does in a real transcript.
+    """
+    lines: list[str] = []
+    clock = 0
+    previous = None
+    for index, turn in enumerate(turns):
+        node_id = f"n{index}"
+        if turn[0] == "text":
+            _, content = turn
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": node_id,
+                        "parentUuid": previous,
+                        "sessionId": session_id,
+                        "timestamp": f"2026-08-11T00:00:{clock:02d}.000Z",
+                        "message": {"role": "assistant", "content": content},
+                    }
+                )
+            )
+            clock += 1
+            previous = node_id
+        else:
+            _, tool_name, tool_input, output_text = turn
+            use_id = f"toolu_{index}"
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": node_id,
+                        "parentUuid": previous,
+                        "sessionId": session_id,
+                        "timestamp": f"2026-08-11T00:00:{clock:02d}.000Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": use_id,
+                                    "name": tool_name,
+                                    "input": tool_input,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
+            clock += 1
+            result_id = f"r{index}"
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": result_id,
+                        "parentUuid": node_id,
+                        "sessionId": session_id,
+                        "timestamp": f"2026-08-11T00:00:{clock:02d}.000Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": use_id,
+                                    "content": output_text,
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
+            clock += 1
+            previous = result_id
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+#: One session whose recall was clearly acted on, one whose recall was
+#: clearly not -- the tokens are chosen distinctive so the assertions below
+#: are unambiguous by construction.
+RECALL_TURNS = {
+    "recall-used": [
+        ("text", "Let's check prior notes before editing."),
+        (
+            "tool",
+            "mcp__kaiba__recall",
+            {"query": "flaky retry"},
+            "Retries must use anchored_backoff_v7 not naive sleep.",
+        ),
+        ("text", "Applying anchored_backoff_v7 as recalled."),
+    ],
+    "recall-unused": [
+        (
+            "tool",
+            "mcp__kaiba__recall",
+            {"query": "unrelated"},
+            "Consider quarantine_flag_q2 for edge cases.",
+        ),
+        ("text", "Proceeding with the standard approach instead."),
+    ],
+}
+
+
+@pytest.fixture
+def recall_source(tmp_path: Path) -> Path:
+    source = tmp_path / "recalls"
+    source.mkdir()
+    for session_id, turns in RECALL_TURNS.items():
+        write_recall_transcript(source / f"{session_id}.jsonl", session_id, turns)
+    return source
+
+
+def test_recall_call_columns_match_the_dataclass(tmp_path: Path):
+    build([FIXTURES], tmp_path / "cols.duckdb")
+    connection = connect(tmp_path / "cols.duckdb", read_only=True)
+    try:
+        actual = [
+            row[1] for row in connection.execute("PRAGMA table_info('recall_calls')").fetchall()
+        ]
+        assert actual == list(RECALL_CALL_COLUMNS)
+    finally:
+        connection.close()
+
+
+def test_claude_recall_calls_are_extracted_with_followup_and_overlap(
+    recall_source: Path, tmp_path: Path
+):
+    db_path = tmp_path / "recalls.duckdb"
+    result = build([recall_source], db_path)
+    assert result.n_recall_calls == 2
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT session_id, source, query, output, overlap_count, overlap_tokens, "
+            "followup_text FROM recall_calls ORDER BY session_id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(rows) == 2
+    used = next(r for r in rows if r[0] == "recall-used")
+    unused = next(r for r in rows if r[0] == "recall-unused")
+
+    assert used[1] == "claude_code"
+    assert used[2] == "flaky retry"
+    assert used[3] == "Retries must use anchored_backoff_v7 not naive sleep."
+    assert used[4] == 1
+    assert json.loads(used[5]) == ["anchored_backoff_v7"]
+    assert "anchored_backoff_v7" in used[6]
+
+    assert unused[4] == 0
+    assert json.loads(unused[5]) == []
+
+
+def test_recall_followups_view_matches_the_table(recall_source: Path, tmp_path: Path):
+    db_path = tmp_path / "view.duckdb"
+    build([recall_source], db_path)
+    connection = connect(db_path, read_only=True)
+    try:
+        table_rows = connection.execute(
+            "SELECT recall_id, session_id, query FROM recall_calls ORDER BY recall_id"
+        ).fetchall()
+        view_rows = connection.execute(
+            f'SELECT recall_id, session_id, query FROM "{RECALL_FOLLOWUPS_VIEW}" '
+            "ORDER BY recall_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert table_rows == view_rows
+    assert table_rows  # not vacuously equal
+
+
+def test_a_pending_recall_call_produces_no_row(tmp_path: Path):
+    source = tmp_path / "pending"
+    source.mkdir()
+    write_recall_transcript(
+        source / "pending.jsonl",
+        "pending-session",
+        [("tool", "mcp__kaiba__recall", {"query": "in flight"}, "irrelevant")],
+    )
+    # write_recall_transcript always writes a matching result; simulate "no
+    # result yet" by truncating the file to just its first (tool_use) line.
+    lines = (source / "pending.jsonl").read_text(encoding="utf-8").splitlines()
+    (source / "pending.jsonl").write_text(lines[0] + "\n", encoding="utf-8")
+
+    db_path = tmp_path / "pending.duckdb"
+    result = build([source], db_path)
+    assert result.n_recall_calls == 0
+
+
+# ---------------------------------------------------------------- recall_calls (opencode)
+
+OPENCODE_FIXTURE = FIXTURES / "opencode_events.ndjson"
+
+
+def test_iter_opencode_sources_finds_ndjson_recursively(tmp_path: Path):
+    nested = tmp_path / "jobs" / "job1"
+    nested.mkdir(parents=True)
+    (nested / "events.ndjson").write_text("", encoding="utf-8")
+    (tmp_path / "ignore.jsonl").write_text("", encoding="utf-8")
+    files, missing = iter_opencode_sources([tmp_path])
+    assert [f.name for f in files] == ["events.ndjson"]
+    assert missing == []
+
+
+def test_a_directory_source_never_picks_up_ndjson_for_the_jsonl_path(tmp_path: Path):
+    """The two source lists are independent: --source never sees *.ndjson.
+
+    This is what keeps the shared ``tests/fixtures/`` directory -- which now
+    also holds ``opencode_events.ndjson`` -- safe for every pre-existing test
+    that builds from the whole ``FIXTURES`` directory: those calls never pass
+    ``opencode_sources``, and this proves the plain ``*.jsonl`` scan cannot
+    see the new file even if they did pass the same directory twice over.
+    """
+    (tmp_path / "events.ndjson").write_text("", encoding="utf-8")
+    files, _ = iter_transcripts([tmp_path])
+    assert files == []
+
+
+def test_the_shared_fixtures_directory_build_is_unaffected_by_the_opencode_fixture(
+    tmp_path: Path,
+):
+    """Sanity check for the design above: `built`'s pinned counts still hold."""
+    result = build([FIXTURES], tmp_path / "unaffected.duckdb")
+    assert result.n_files == 4
+    assert result.n_recall_calls == 0
+
+
+def test_opencode_recall_calls_are_extracted_with_followup_and_overlap(tmp_path: Path):
+    db_path = tmp_path / "opencode.duckdb"
+    result = build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    assert result.n_processed == 1
+    assert result.n_recall_calls == 2
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT session_id, source, query, output, overlap_count, overlap_tokens, "
+            "followup_text FROM recall_calls ORDER BY session_id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(rows) == 2
+    used = next(r for r in rows if r[0] == "ses_aaa")
+    unused = next(r for r in rows if r[0] == "ses_bbb")
+
+    assert used[1] == "opencode"
+    assert used[2] == "denial pattern anchoring"
+    assert used[3] == "Use anchored prefix matching for denial_pattern_x9 tokens."
+    assert used[4] == 1
+    assert json.loads(used[5]) == ["denial_pattern_x9"]
+    assert "denial_pattern_x9" in used[6]
+
+    assert unused[4] == 0
+    assert json.loads(unused[5]) == []
+
+
+def test_opencode_activity_text_is_bounded_at_assembly():
+    """An oversized tool output is truncated in the per-activity component.
+
+    Fix 2: each activity component is bounded at ``result_text_limit`` at assembly,
+    so followup_text (built from those components) never carries a megabyte-sized
+    raw output.  The recall call's own ``output`` is truncated separately and is
+    not part of the followup text.
+    """
+    huge = "Z" * 10000
+    recall = OpenCodeToolCall(
+        call_id="recall_1",
+        session_id="ses_x",
+        file_path="/tmp/x",
+        seq=1,
+        ts=None,
+        tool="kaiba_recall",
+        input={"query": "q"},
+        output="recall result",
+    )
+    big = OpenCodeToolCall(
+        call_id="big_1",
+        session_id="ses_x",
+        file_path="/tmp/x",
+        seq=2,
+        ts=None,
+        tool="bash",
+        input={"command": "cat"},
+        output=huge,
+    )
+    parsed = ParsedOpenCodeFile(
+        file_path="/tmp/x",
+        tool_calls=[recall, big],
+        text_chunks=[],
+        n_parse_errors=0,
+    )
+    rows = extract_from_opencode(parsed, result_text_limit=4000)
+    assert len(rows) == 1
+    followup = rows[0].followup_text
+    assert followup is not None
+    # The per-component bound keeps each activity string at result_text_limit.
+    assert len(followup) <= 4000
+    # The raw oversized output never reaches followup_text.
+    assert huge not in followup
+
+
+def test_opencode_build_is_incremental(tmp_path: Path):
+    db_path = tmp_path / "opencode.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    again = build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    assert again.n_processed == 0
+    assert again.n_skipped == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM recall_calls") == 2
+    finally:
+        connection.close()
+
+
+def test_a_mixed_build_ingests_both_formats_without_disturbing_the_other(tmp_path: Path):
+    """Acceptance criterion 1: a jsonl source and an ndjson source in one build()."""
+    db_path = tmp_path / "mixed.duckdb"
+    result = build([FIXTURES], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    assert result.n_files == 5  # the 4 existing fixtures + the opencode one
+    assert result.n_sessions == TOTAL_SESSIONS  # unaffected: opencode never touches `sessions`
+    assert result.n_events == TOTAL_EVENTS
+    assert result.n_tool_calls == TOTAL_TOOL_CALLS
+    assert result.n_recall_calls == 2  # only from the opencode fixture
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM recall_calls") == 2
+        assert scalar(connection, "SELECT count(*) FROM source_files") == 5
+    finally:
+        connection.close()
+
+
+def test_the_default_ashiato_info_report_does_not_include_recall_calls(tmp_path: Path):
+    """`recall_calls` participates in schema/incremental machinery but not this report."""
+    db_path = tmp_path / "info.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    info = database_info(db_path)
+    assert "recall_calls" not in info.table_counts
+    assert set(info.table_counts) == set(INFO_TABLES)
+
+
+def test_two_builds_of_the_same_opencode_bytes_give_the_same_rows(tmp_path: Path):
+    first, second = tmp_path / "first.duckdb", tmp_path / "second.duckdb"
+    build([], first, opencode_sources=[OPENCODE_FIXTURE])
+    build([], second, opencode_sources=[OPENCODE_FIXTURE])
+    order = "recall_id"
+    assert dump(first, "recall_calls", order) == dump(second, "recall_calls", order)
+
+
+def test_a_database_missing_the_recall_calls_table_entirely_is_refused_gracefully(
+    tmp_path: Path,
+):
+    """A pre-issue-10 database has no ``recall_calls`` table at all, not just a missing column."""
+    db_path = tmp_path / "pre10.duckdb"
+    build([FIXTURES], db_path)
+    connection = connect(db_path)
+    try:
+        connection.execute('DROP VIEW "recall_followups"')
+        connection.execute('DROP TABLE "recall_calls"')
+        connection.execute(f'DELETE FROM "{META_TABLE}" WHERE key = ?', [META_FORMAT_KEY])
+    finally:
+        connection.close()
+
+    with pytest.raises(SchemaOutOfDate, match="recall_calls"):
+        build([FIXTURES], db_path)
+
+    connection = connect(db_path, read_only=True)
+    try:
+        with pytest.raises(SchemaOutOfDate, match="delete the database file and build again"):
+            assert_readable(connection)
+    finally:
+        connection.close()
+
+
+def test_recalls_view_missing_alone_also_names_the_fix(tmp_path: Path):
+    db_path = tmp_path / "noview.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    connection = connect(db_path)
+    try:
+        connection.execute(f'DROP VIEW "{RECALL_FOLLOWUPS_VIEW}"')
+    finally:
+        connection.close()
+    connection = connect(db_path, read_only=True)
+    try:
+        with pytest.raises(SchemaOutOfDate, match="recall_followups"):
+            assert_readable(connection)
+    finally:
+        connection.close()

@@ -388,3 +388,117 @@ def test_a_query_the_user_got_wrong_keeps_duckdbs_own_error(
     err = capsys.readouterr().err
     assert "nonexistent" in err
     assert "build again" not in err
+
+
+# ---------------------------------------------------------------- recalls
+
+OPENCODE_FIXTURE = FIXTURES / "opencode_events.ndjson"
+
+
+@pytest.fixture
+def recall_db(tmp_path: Path) -> Path:
+    path = tmp_path / "recalls.duckdb"
+    assert (
+        main(
+            [
+                "build",
+                "--source",
+                str(FIXTURES),
+                "--opencode-source",
+                str(OPENCODE_FIXTURE),
+                "--db",
+                str(path),
+            ]
+        )
+        == 0
+    )
+    return path
+
+
+def test_build_reports_recall_calls_from_an_opencode_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    path = tmp_path / "out.duckdb"
+    assert (
+        main(
+            [
+                "build",
+                "--source",
+                str(FIXTURES),
+                "--opencode-source",
+                str(OPENCODE_FIXTURE),
+                "--db",
+                str(path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "2 recall calls" in out
+    # The pre-existing counts are untouched by the opencode source.
+    assert "3 sessions, 70 events, 7 tool calls" in out
+
+
+def test_recalls_prints_the_view(recall_db: Path, capsys: pytest.CaptureFixture[str]):
+    assert main(["recalls", "--db", str(recall_db)]) == 0
+    out = capsys.readouterr().out
+    header = out.splitlines()[0].split()
+    assert header[:4] == ["recall_id", "session_id", "file_path", "source"]
+    assert "overlap_count" in header
+    assert "(2 rows)" in out
+
+
+def test_recalls_json_format_carries_the_overlap_signal(
+    recall_db: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert main(["recalls", "--db", str(recall_db), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload) == 2
+    used = next(row for row in payload if row["session_id"] == "ses_aaa")
+    assert used["overlap_count"] == 1
+    assert json.loads(used["overlap_tokens"]) == ["denial_pattern_x9"]
+
+
+def test_recalls_honours_session(recall_db: Path, capsys: pytest.CaptureFixture[str]):
+    assert (
+        main(["recalls", "--db", str(recall_db), "--format", "json", "--session", "ses_aaa"]) == 0
+    )
+    assert len(json.loads(capsys.readouterr().out)) == 1
+    assert (
+        main(["recalls", "--db", str(recall_db), "--format", "json", "--session", "nobody"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_recalls_honours_limit(recall_db: Path, capsys: pytest.CaptureFixture[str]):
+    assert main(["recalls", "--db", str(recall_db), "--format", "json", "--limit", "1"]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 1
+
+
+def test_recalls_on_a_missing_database_fails_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert main(["recalls", "--db", str(tmp_path / "nope.duckdb")]) == 1
+    assert "no database at" in capsys.readouterr().err
+
+
+def test_recalls_on_a_pre_upgrade_database_names_the_fix(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """`db` predates any opencode ingestion but still has a current schema;
+    dropping the view alone simulates a database built before recall_followups existed."""
+    connection = connect(db)
+    try:
+        connection.execute("DROP VIEW recall_followups")
+    finally:
+        connection.close()
+    assert main(["recalls", "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    assert "recall_followups" in err
+    assert "delete the database file and build again" in err
+
+
+def test_recalls_help_exits_zero():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["recalls", "--help"])
+    assert excinfo.value.code == 0

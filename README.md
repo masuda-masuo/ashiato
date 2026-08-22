@@ -27,21 +27,31 @@ Python 3.11+. The only runtime dependency is `duckdb`.
 ## Use
 
 ```
-ashiato build [--source DIR]... [--db PATH]
+ashiato build [--source DIR]... [--opencode-source DIR]... [--db PATH]
 ashiato sql "SELECT ..." [--db PATH] [--format table|json|csv]
 ashiato denials [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
+ashiato recalls [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato info [--db PATH]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
-  for `*.jsonl`.
+  for `*.jsonl` Claude Code transcripts.
+- `--opencode-source` is repeatable and is searched recursively for `*.ndjson` opencode
+  job event streams (`~/.kusabi/*/jobs/*/events.ndjson` on a machine that has them). It is
+  a separate list on purpose: the two formats live in unrelated directory trees, and a
+  second explicit list means ashiato never has to sniff a file's format to know which
+  parser to run. Nothing is scanned for `*.ndjson` by default -- pass `--opencode-source`
+  to opt in.
 - `--db` defaults to `$XDG_DATA_HOME/ashiato/ashiato.duckdb`, falling back to
   `~/.local/share/ashiato/ashiato.duckdb`. Parent directories are created as needed.
 - `build` is incremental: a file whose path, size and mtime are unchanged since the last
   build is skipped. A changed file has its old rows deleted and is re-inserted whole, so
-  rebuilding never duplicates.
+  rebuilding never duplicates. This applies uniformly to both source formats.
 - `denials` prints the `denial_followups` view — every denied tool call and what the
   session did next — newest first, 50 rows by default (`--limit 0` for all).
+- `recalls` prints the `recall_followups` view — every completed kaiba `recall` call, from
+  either source format, and the evidence of what the session did afterwards — same output
+  conventions as `denials`.
 
 ```
 $ ashiato build
@@ -115,6 +125,27 @@ way. `result_text` is truncated to `result_text_limit` (default 4,000 chars) wit
 `result_truncated` recording whether that happened; the denial verdict is made on the whole
 text, before truncation.
 
+### `recall_calls` — one row per completed kaiba `recall` call
+
+`recall_id`, `session_id`, `file_path`, `source`, `seq`, `ts`, `call_id`, `query`, `output`,
+`output_truncated`, `followup_text`, `followup_truncated`, `overlap_tokens`, `overlap_count`.
+
+Filled at build time by `ashiato.recall`, from either source format: `mcp__kaiba__recall`
+tool_use/tool_result pairs in a Claude Code transcript, or completed `kaiba_recall`
+`message.part.updated` records in an opencode events.ndjson file (`source` records which).
+`query` and `output` are the call's input and returned text; `followup_text` is a bounded
+(30 items or 8,000 characters, whichever comes first) concatenation of the same session's
+activity on strictly later lines -- assistant text and other completed tool calls -- the
+same "strictly later line" rule `denial_followups` uses, so a call issued in parallel with
+the recall is never mistaken for a reaction to it.
+
+`overlap_tokens` / `overlap_count` are one deterministic, mechanical "was this used" signal:
+tokens matching `[A-Za-z0-9_#./-]{4,}` present in `output` *and* in the post-recall suffix
+*and* absent from the session's pre-recall activity -- "introduced by the recall" is what
+makes a token distinctive. `overlap_tokens` is a JSON array capped at 20 tokens for
+readability; `overlap_count` is the true, uncapped total. This is a nomination, not a
+verdict -- a human reads the evidence and decides.
+
 ### `source_files` — build bookkeeping
 
 `file_path`, `size_bytes`, `mtime`, `content_hash`, `n_events`, `n_tool_calls`,
@@ -156,18 +187,33 @@ $ ashiato denials --limit 5
 $ ashiato sql "SELECT followup_kind, count(*) FROM denial_followups GROUP BY 1 ORDER BY 2 DESC"
 ```
 
+### `recall_followups` — a thin view over `recall_calls`
+
+Unlike `denial_followups`, this is not derived on read: the followup pairing crosses source
+formats (Claude Code's tool_use/tool_result pairs vs. opencode's message parts), so there is
+no single raw table to define a read-time view over. `ashiato.recall` computes the pairing
+once, at build time, into `recall_calls`; `recall_followups` just selects from it with a
+stable column order, the same shape `denial_followups` presents.
+
+```
+$ ashiato recalls --limit 5
+$ ashiato sql "SELECT session_id, overlap_count FROM recall_followups ORDER BY overlap_count DESC"
+```
+
 Adding `input_summary` changed the `tool_calls` schema, so a database built by an earlier
 version is refused with a message rather than half-upgraded: delete it and `build` again.
-`sql` and `denials` check the same thing when they open a database, so reading an old one
-says how to fix it instead of reporting a bare catalog error. A query of your own that
-names something that does not exist still gets DuckDB's error, untouched.
+`sql`, `denials` and `recalls` check the same thing when they open a database, so reading an
+old one says how to fix it instead of reporting a bare catalog error. A query of your own
+that names something that does not exist still gets DuckDB's error, untouched.
 
 The check is not only about columns: `outcome` is a stored column, so a change to the rules
 that derive it (such as the denial patterns becoming anchored prefixes) also makes a database
-out of date. Every build stamps the row-rule version it used into a small `ashiato_meta`
+out of date, and so does an entire table being new (`recall_calls`, added alongside this
+view). Every build stamps the row-rule version it used into a small `ashiato_meta`
 table, and a database stamped by a version with different rules — or not stamped at all — is
 refused with the same delete-and-rebuild message: the incremental build would otherwise skip
-every unchanged file and keep rows derived under the old rules.
+every unchanged file and keep rows derived under the old rules, or simply be missing a table
+this version expects.
 
 ## Robustness
 

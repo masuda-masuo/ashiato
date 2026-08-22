@@ -1,4 +1,4 @@
-"""The ``ashiato`` command line: build, sql, denials, info."""
+"""The ``ashiato`` command line: build, sql, denials, recalls, info."""
 
 from __future__ import annotations
 
@@ -23,12 +23,15 @@ from ashiato.build import (
     database_info,
     default_db_path,
 )
-from ashiato.schema import DENIAL_FOLLOWUPS_VIEW
+from ashiato.schema import DENIAL_FOLLOWUPS_VIEW, RECALL_FOLLOWUPS_VIEW
 
 FORMATS = ("table", "json", "csv")
 
 #: Enough denials to read in one screen; ``--limit 0`` asks for all of them.
 DEFAULT_DENIAL_LIMIT = 50
+
+#: Same convention as denials.
+DEFAULT_RECALL_LIMIT = 50
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -45,6 +48,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="DIR",
         help=f"directory searched recursively for *.jsonl (repeatable; default {DEFAULT_SOURCE})",
+    )
+    build_parser.add_argument(
+        "--opencode-source",
+        action="append",
+        dest="opencode_source",
+        metavar="DIR",
+        help="directory searched recursively for opencode *.ndjson job event streams (repeatable)",
     )
     build_parser.add_argument("--db", metavar="PATH", help="database path")
 
@@ -66,6 +76,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"maximum rows, 0 for all (default {DEFAULT_DENIAL_LIMIT})",
     )
     denials_parser.add_argument("--session", metavar="ID", help="restrict to one session")
+
+    recalls_parser = subparsers.add_parser(
+        "recalls", help="kaiba recall calls and what the session did next"
+    )
+    recalls_parser.add_argument("--db", metavar="PATH", help="database path")
+    recalls_parser.add_argument("--format", choices=FORMATS, default="table", help="output format")
+    recalls_parser.add_argument(
+        "--limit",
+        type=_row_limit,
+        default=DEFAULT_RECALL_LIMIT,
+        metavar="N",
+        help=f"maximum rows, 0 for all (default {DEFAULT_RECALL_LIMIT})",
+    )
+    recalls_parser.add_argument("--session", metavar="ID", help="restrict to one session")
 
     info_parser = subparsers.add_parser("info", help="describe the database")
     info_parser.add_argument("--db", metavar="PATH", help="database path")
@@ -159,9 +183,10 @@ def _run_query(
 
 def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     sources = args.source or [str(DEFAULT_SOURCE)]
+    opencode_sources = args.opencode_source or []
     db_path = _resolve_db(args.db)
     try:
-        result = build(sources, db_path)
+        result = build(sources, db_path, opencode_sources=opencode_sources)
     except SchemaOutOfDate as error:
         print(f"error: {error}", file=err)
         return 1
@@ -181,7 +206,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
     print(
         f"rows: {result.n_sessions} sessions, {result.n_events} events, "
-        f"{result.n_tool_calls} tool calls",
+        f"{result.n_tool_calls} tool calls, {result.n_recall_calls} recall calls",
         file=out,
     )
     print(f"unparseable lines skipped: {result.n_parse_errors}", file=out)
@@ -200,6 +225,20 @@ def _run_denials(args: argparse.Namespace, out: Any, err: Any) -> int:
         params.append(args.session)
     # Newest first, as asked for -- but timestamps tie (and can be NULL), so the
     # session and the line number settle the rest and two runs agree.
+    query += " ORDER BY ts DESC NULLS LAST, session_id, seq DESC"
+    if args.limit:
+        query += " LIMIT ?"
+        params.append(args.limit)
+    return _run_query(_resolve_db(args.db), query, params, args.format, out, err)
+
+
+def _run_recalls(args: argparse.Namespace, out: Any, err: Any) -> int:
+    query = f'SELECT * FROM "{RECALL_FOLLOWUPS_VIEW}"'
+    params: list[Any] = []
+    if args.session:
+        query += " WHERE session_id = ?"
+        params.append(args.session)
+    # Same convention as denials: newest first, ties settled by session/seq.
     query += " ORDER BY ts DESC NULLS LAST, session_id, seq DESC"
     if args.limit:
         query += " LIMIT ?"
@@ -242,6 +281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_sql(args, out, err)
     if args.command == "denials":
         return _run_denials(args, out, err)
+    if args.command == "recalls":
+        return _run_recalls(args, out, err)
     return _run_info(args, out, err)
 
 
