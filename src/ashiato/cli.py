@@ -7,7 +7,7 @@ import csv
 import json
 import sys
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,8 @@ from ashiato.build import (
     database_info,
     default_db_path,
 )
+from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
+from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import DENIAL_FOLLOWUPS_VIEW, RECALL_FOLLOWUPS_VIEW
 
 FORMATS = ("table", "json", "csv")
@@ -94,6 +96,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     info_parser = subparsers.add_parser("info", help="describe the database")
     info_parser.add_argument("--db", metavar="PATH", help="database path")
 
+    salvage_parser = subparsers.add_parser(
+        "salvage", help="nominate work-state changes with no bookkeeping trail"
+    )
+    salvage_parser.add_argument("--db", metavar="PATH", help="database path")
+    salvage_parser.add_argument(
+        "--kaiba-db",
+        metavar="PATH",
+        help="kaiba actions ledger path (default ~/.kaiba/kaiba.db)",
+    )
+    salvage_parser.add_argument(
+        "--window-minutes",
+        type=_row_limit,
+        default=DEFAULT_WINDOW_MINUTES,
+        metavar="N",
+        help=f"kaiba coverage window in minutes (default {DEFAULT_WINDOW_MINUTES})",
+    )
+    salvage_parser.add_argument(
+        "--limit",
+        type=_row_limit,
+        default=DEFAULT_SALVAGE_LIMIT,
+        metavar="N",
+        help=f"maximum nominations, 0 for all (default {DEFAULT_SALVAGE_LIMIT})",
+    )
+    salvage_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only consider evidence at or after this ISO-8601 timestamp",
+    )
+
     return parser
 
 
@@ -106,6 +138,17 @@ def _row_limit(value: str) -> int:
 
 def _resolve_db(value: str | None) -> Path:
     return Path(value).expanduser() if value else default_db_path()
+
+
+def _parse_since(value: str) -> datetime:
+    """An ISO-8601 timestamp, normalised to naive UTC like DuckDB's ``ts`` column."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid timestamp: {value}") from error
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed
 
 
 def _cell(value: Any) -> str:
@@ -272,6 +315,52 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
     return 0
 
 
+def _run_salvage(args: argparse.Namespace, out: Any, err: Any) -> int:
+    db_path = _resolve_db(args.db)
+    if not db_path.exists():
+        print(f"error: no database at {db_path} (run 'ashiato build' first)", file=err)
+        return 1
+
+    kaiba_path = Path(args.kaiba_db).expanduser() if args.kaiba_db else default_kaiba_db_path()
+    kaiba_connection = open_kaiba(kaiba_path)
+    if kaiba_connection is None:
+        print(f"notice: no kaiba db at {kaiba_path} -- coverage is transcript-only", file=err)
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert_readable(connection)
+        nominations = nominate(
+            connection,
+            kaiba_connection,
+            window_minutes=args.window_minutes,
+            since=args.since,
+            limit=args.limit,
+        )
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
+    except duckdb.Error as error:
+        print(f"error: {error}", file=err)
+        return 1
+    finally:
+        connection.close()
+        if kaiba_connection is not None:
+            kaiba_connection.close()
+
+    for nomination in nominations:
+        checks = ",".join(nomination.failed_checks)
+        print(
+            f"{nomination.ts.isoformat()}  session={nomination.session_id}  "
+            f"kind={nomination.kind}  failed={checks}  {nomination.snippet}",
+            file=out,
+        )
+    print(
+        f"({len(nominations)} nomination{'' if len(nominations) == 1 else 's'})",
+        file=out,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     out, err = sys.stdout, sys.stderr
@@ -283,6 +372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_denials(args, out, err)
     if args.command == "recalls":
         return _run_recalls(args, out, err)
+    if args.command == "salvage":
+        return _run_salvage(args, out, err)
     return _run_info(args, out, err)
 
 
