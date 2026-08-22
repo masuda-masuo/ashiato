@@ -12,10 +12,15 @@ parts (whichever tool -- the recall filter is applied downstream, by
 :mod:`ashiato.recall`) and assistant text, both needed to build the
 post-recall "what did the session do next" evidence.  A *pending* tool part
 carries no output yet and is not modelled at all; only the record on its
-``completed`` state produces anything.  General-purpose ingestion of every
-opencode event type is deliberately out of scope -- job lifecycle events and
-tool parts for tools other than what callers care about are simply not
-recognised and are skipped like any other unmodelled type.
+``completed`` state produces anything.  Assistant text streams as many
+``message.part.delta`` events per part (roughly one per LLM token) and/or as
+``message.part.updated`` snapshots of the same part; both are coalesced here
+into one :class:`OpenCodeTextChunk` per part -- see :func:`parse_file` for
+the exact rules -- so a single sentence never becomes dozens of one-token
+evidence rows downstream.  General-purpose ingestion of every opencode event
+type is deliberately out of scope -- job lifecycle events and tool parts for
+tools other than what callers care about are simply not recognised and are
+skipped like any other unmodelled type.
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ class OpenCodeToolCall:
 
 @dataclass(slots=True)
 class OpenCodeTextChunk:
-    """One piece of assistant text: a full ``text`` part, or one delta of one."""
+    """One assistant text part's coalesced text -- see :func:`parse_file`."""
 
     session_id: str | None
     file_path: str
@@ -64,6 +69,22 @@ class ParsedOpenCodeFile:
     tool_calls: list[OpenCodeToolCall]
     text_chunks: list[OpenCodeTextChunk]
     n_parse_errors: int
+
+
+@dataclass(slots=True)
+class _TextPart:
+    """Running state for one (sessionID, partID) text part while parsing."""
+
+    session_id: str | None
+    seq: int
+    delta_text: str = ""
+    snapshot_text: str | None = None
+
+    def resolve(self) -> str | None:
+        """The part's final text: a snapshot supersedes accumulated deltas."""
+        if self.snapshot_text is not None:
+            return self.snapshot_text
+        return self.delta_text or None
 
 
 def _as_str(value: object) -> str | None:
@@ -134,34 +155,6 @@ def _tool_call(
     )
 
 
-def _text_chunk(
-    *, file_path: str, seq: int, properties: dict, part: dict
-) -> OpenCodeTextChunk | None:
-    text = _as_str(part.get("text"))
-    if not text:
-        return None
-    return OpenCodeTextChunk(
-        session_id=_as_str(properties.get("sessionID")) or _as_str(part.get("sessionID")),
-        file_path=file_path,
-        seq=seq,
-        text=text,
-    )
-
-
-def _delta_chunk(*, file_path: str, seq: int, properties: dict) -> OpenCodeTextChunk | None:
-    if properties.get("field") != "text":
-        return None
-    delta = _as_str(properties.get("delta"))
-    if not delta:
-        return None
-    return OpenCodeTextChunk(
-        session_id=_as_str(properties.get("sessionID")),
-        file_path=file_path,
-        seq=seq,
-        text=delta,
-    )
-
-
 def parse_file(path: str | Path) -> ParsedOpenCodeFile:
     """Parse one events.ndjson file into completed tool calls and text chunks.
 
@@ -172,6 +165,34 @@ def parse_file(path: str | Path) -> ParsedOpenCodeFile:
     a stream carries the same part's completed state more than once, the last
     occurrence wins.  On streams without such duplicates the output is identical
     to a simple append.
+
+    Assistant text is coalesced per (sessionID, partID) into one
+    :class:`OpenCodeTextChunk`, rather than one chunk per raw event:
+
+    - Every ``message.part.delta`` event with ``field == "text"`` appends its
+      ``delta`` to that part's running text, in arrival order and with no
+      separator inserted -- deltas are exact substrings of the eventual whole
+      (a word split across two deltas, e.g. "Em" + "it", coalesces to "Emit").
+    - A ``message.part.updated`` text event with a non-empty ``text`` is the
+      accumulated snapshot for that part and *replaces* whatever deltas were
+      collected so far, so the text is never counted twice.
+    - An ``updated`` event with an *empty* ``text`` -- the placeholder
+      opencode emits before a part starts streaming -- is a no-op: it never
+      erases deltas already accumulated for the part.
+    - A part id missing from an event (malformed data; real opencode streams
+      always carry one) never coalesces with anything else: it is keyed by
+      its own seq, so it becomes its own chunk exactly as if there were no
+      coalescing.
+
+    The emitted chunk's ``seq`` is the seq of the FIRST event seen for that
+    (sessionID, partID) -- the placeholder ``updated`` event or the first
+    delta, whichever comes first in the file, i.e. when the part began
+    streaming.  Consequence for ``recall._split``, which classifies activity
+    strictly by seq relative to a recall call: a part that starts streaming
+    before the recall call but keeps streaming past it is classified as
+    *prefix* activity even though most of its text arrived afterwards -- the
+    same trade-off ``_split`` already makes for any other single multi-line
+    unit of activity.
     """
     path = Path(path)
     file_path = str(path.resolve())
@@ -182,7 +203,23 @@ def parse_file(path: str | Path) -> ParsedOpenCodeFile:
     # state supersedes earlier) so the same call never becomes two rows.
     seen_calls: dict[tuple[str | None, str], OpenCodeToolCall] = {}
     call_order: list[tuple[str | None, str]] = []
-    text_chunks: list[OpenCodeTextChunk] = []
+
+    # Assistant text is keyed by (sessionID, partID); see the coalescing
+    # rules documented above.
+    text_parts: dict[tuple[str | None, str], _TextPart] = {}
+    text_order: list[tuple[str | None, str]] = []
+
+    def _text_key(session_id: str | None, part_id: str | None, seq: int) -> tuple[str | None, str]:
+        return (session_id, part_id) if part_id is not None else (session_id, f"__seq{seq}")
+
+    def _touch(session_id: str | None, part_id: str | None, seq: int) -> _TextPart:
+        key = _text_key(session_id, part_id, seq)
+        text_part = text_parts.get(key)
+        if text_part is None:
+            text_part = _TextPart(session_id=session_id, seq=seq)
+            text_parts[key] = text_part
+            text_order.append(key)
+        return text_part
 
     for seq, record in records:
         event_type = record.get("type")
@@ -198,20 +235,36 @@ def parse_file(path: str | Path) -> ParsedOpenCodeFile:
                         call_order.append(key)
                     seen_calls[key] = call
             elif part_type == _PART_TYPE_TEXT:
-                chunk = _text_chunk(
-                    file_path=file_path, seq=seq, properties=properties, part=part
-                )
-                if chunk is not None:
-                    text_chunks.append(chunk)
+                session_id = _as_str(properties.get("sessionID")) or _as_str(part.get("sessionID"))
+                text_part = _touch(session_id, _as_str(part.get("id")), seq)
+                text = _as_str(part.get("text"))
+                if text:
+                    text_part.snapshot_text = text
             # Any other part type is not modelled; skipped, not an error.
         elif event_type == _EVENT_PART_DELTA:
-            chunk = _delta_chunk(file_path=file_path, seq=seq, properties=properties)
-            if chunk is not None:
-                text_chunks.append(chunk)
+            if properties.get("field") == "text":
+                session_id = _as_str(properties.get("sessionID"))
+                text_part = _touch(session_id, _as_str(properties.get("partID")), seq)
+                delta = _as_str(properties.get("delta"))
+                if delta:
+                    text_part.delta_text += delta
         # Any other event type -- job lifecycle events and the like -- is
         # not modelled; skipped, not an error.
 
     tool_calls = [seen_calls[key] for key in call_order]
+    text_chunks: list[OpenCodeTextChunk] = []
+    for key in text_order:
+        text_part = text_parts[key]
+        text = text_part.resolve()
+        if text:
+            text_chunks.append(
+                OpenCodeTextChunk(
+                    session_id=text_part.session_id,
+                    file_path=file_path,
+                    seq=text_part.seq,
+                    text=text,
+                )
+            )
     return ParsedOpenCodeFile(
         file_path=file_path,
         tool_calls=tool_calls,
