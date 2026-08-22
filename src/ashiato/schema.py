@@ -126,7 +126,11 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: ``CREATE TABLE IF NOT EXISTS`` cannot see either kind of change.  Stored
 #: in :data:`META_TABLE`; a database without the marker, or with a different
 #: value, predates this version's rules and is refused.
-FORMAT_VERSION = 4
+#: Version 5 = recall overlap now counts only *distinctive* tokens
+#: (issue #20): ordinary English words and bare dates are excluded, so
+#: ``overlap_count`` / ``overlap_tokens`` reflect identifiers, paths, issue
+#: refs and hashes rather than chance matches.
+FORMAT_VERSION = 5
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental

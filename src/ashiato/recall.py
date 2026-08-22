@@ -50,6 +50,32 @@ FOLLOWUP_CHAR_LIMIT = 8000
 #: same shape suggested in the brief: file paths, identifiers, flags.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_#./-]{4,}")
 
+#: Bare ISO date or date-hour prefix -- a token of this shape matches by
+#: chance all over a corpus (it is just a calendar reference, not an
+#: identifier), so it is never distinctive.  ``Z`` is tolerated at the end
+#: to also catch UTC-stamped variants.
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}(:\d{2}(:\d{2})?)?)?Z?$")
+
+#: A token is *distinctive* (worth counting as recall-use evidence) only if
+#: its shape makes a chance match unlikely.  Plain English words and bare
+#: dates match by chance across sessions, so they are excluded; identifiers,
+#: paths, issue numbers and hashes do not.
+def _is_distinctive(token: str) -> bool:
+    # Rule 3: bare ISO date / date-hour prefix never counts.  The tokenizer
+    # glues a trailing sentence period onto a date (``2026-08-16.``), so strip
+    # one before the match -- a real date is still a date with punctuation.
+    if _DATE_RE.match(token.rstrip(".")):
+        return False
+    # Rule 2: all-digit tokens (e.g. ``2101``) are not distinctive.
+    if token.isdigit():
+        return False
+    # Rule 1: must contain a shape character (0-9 # _ / . -) or an inner
+    # capital (camelCase / PascalCase, e.g. ``deriveDisposition`` / ``FastMCP``).
+    return bool(
+        re.search(r"[0-9#_/.-]", token) or re.search(r"[a-z][A-Z]", token)
+    )
+
+
 #: Matched tokens are stored as a readable sample, not the full set;
 #: ``overlap_count`` is the true, uncapped total.
 TOKEN_SAMPLE_LIMIT = 20
@@ -107,8 +133,11 @@ def _overlap(
     for item in suffix:
         suffix_tokens |= _tokens(item.text)
     matched = (_tokens(output) & suffix_tokens) - prefix_tokens
-    ordered = sorted(matched)
-    return ordered[:TOKEN_SAMPLE_LIMIT], len(matched)
+    # Only *distinctive* tokens may count as evidence of use -- ordinary
+    # English words and bare dates match by chance, so they are excluded.
+    distinctive = {t for t in matched if _is_distinctive(t)}
+    ordered = sorted(distinctive)
+    return ordered[:TOKEN_SAMPLE_LIMIT], len(distinctive)
 
 
 def _bounded_suffix(items: Sequence[_Activity]) -> tuple[str, bool]:

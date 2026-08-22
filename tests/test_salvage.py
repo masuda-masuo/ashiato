@@ -290,7 +290,9 @@ def test_since_excludes_earlier_evidence(db: Path):
 
 
 def test_format_version_is_unchanged():
-    assert FORMAT_VERSION == 4
+    # Bumped to 5 by issue #20: recall overlap now counts only distinctive
+    # tokens, so the same source bytes yield different overlap_* rows.
+    assert FORMAT_VERSION == 5
 
 
 # ---------------------------------------------------------------- read-only discipline

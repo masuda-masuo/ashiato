@@ -186,9 +186,15 @@ the recall is never mistaken for a reaction to it.
 `overlap_tokens` / `overlap_count` are one deterministic, mechanical "was this used" signal:
 tokens matching `[A-Za-z0-9_#./-]{4,}` present in `output` *and* in the post-recall suffix
 *and* absent from the session's pre-recall activity -- "introduced by the recall" is what
-makes a token distinctive. `overlap_tokens` is a JSON array capped at 20 tokens for
-readability; `overlap_count` is the true, uncapped total. This is a nomination, not a
-verdict -- a human reads the evidence and decides.
+makes a token distinctive. To keep the signal meaningful, only *distinctive-shape* tokens
+count: a token must contain a shape character (`0-9 # _ / . -`) or a camelCase/PascalCase
+inner capital, must not be all digits, and must not be a bare ISO date or date-hour prefix.
+Ordinary English words (`different`, `green`) and shared calendar references match by chance
+across sessions, so they are excluded; identifiers (`deriveDisposition`), paths
+(`src/ashiato/recall.py`), issue refs (`kusabi#274`), flags (`--container`) and hashes
+(`741d50b`) do not. `overlap_tokens` is a JSON array capped at 20 tokens for readability;
+`overlap_count` is the true, uncapped total. This is a nomination, not a verdict -- a human
+reads the evidence and decides.
 
 ### `source_files` — build bookkeeping
 
