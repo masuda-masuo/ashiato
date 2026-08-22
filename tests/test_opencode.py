@@ -170,3 +170,188 @@ def test_call_id_falls_back_to_part_id_then_to_a_synthesized_one(tmp_path: Path)
     parsed = parse_file(path)
     assert len(parsed.tool_calls) == 1
     assert parsed.tool_calls[0].call_id == "prt_only"
+
+
+# ---------------------------------------------------------------- delta coalescing (issue 13)
+
+
+def _ndjson(records: list[dict]) -> str:
+    import json
+
+    return "\n".join(json.dumps(r) for r in records) + "\n"
+
+
+def _delta_event(*, session_id: str, part_id: str, delta: str, message_id: str = "msg_1") -> dict:
+    return {
+        "id": f"evt_{part_id}_{delta[:3]}",
+        "type": "message.part.delta",
+        "properties": {
+            "sessionID": session_id,
+            "messageID": message_id,
+            "partID": part_id,
+            "field": "text",
+            "delta": delta,
+        },
+    }
+
+
+def _updated_text_event(*, session_id: str, part_id: str, text: str, message_id: str = "msg_1") -> dict:
+    return {
+        "id": f"evt_{part_id}_updated",
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": session_id,
+            "part": {
+                "id": part_id,
+                "messageID": message_id,
+                "sessionID": session_id,
+                "type": "text",
+                "text": text,
+            },
+        },
+    }
+
+
+def test_a_word_split_across_two_deltas_coalesces_with_no_separator(tmp_path: Path):
+    path = tmp_path / "split_word.ndjson"
+    records = [
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="Em"),
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="it"),
+        _delta_event(session_id="ses_a", part_id="prt_1", delta=" me start"),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    assert len(parsed.text_chunks) == 1
+    chunk = parsed.text_chunks[0]
+    assert chunk.text == "Emit me start"
+    assert chunk.session_id == "ses_a"
+    assert chunk.seq == 1  # the first delta's line
+
+
+def test_a_non_empty_snapshot_supersedes_accumulated_deltas(tmp_path: Path):
+    path = tmp_path / "snapshot_wins.ndjson"
+    records = [
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="partial "),
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="text"),
+        _updated_text_event(
+            session_id="ses_a", part_id="prt_1", text="The full accumulated sentence."
+        ),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    assert len(parsed.text_chunks) == 1
+    chunk = parsed.text_chunks[0]
+    assert chunk.text == "The full accumulated sentence."
+
+
+def test_an_empty_text_updated_event_does_not_erase_accumulated_deltas(tmp_path: Path):
+    path = tmp_path / "empty_snapshot.ndjson"
+    records = [
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="Hello "),
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="world"),
+        _updated_text_event(session_id="ses_a", part_id="prt_1", text=""),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    assert len(parsed.text_chunks) == 1
+    assert parsed.text_chunks[0].text == "Hello world"
+
+
+def test_an_empty_placeholder_before_deltas_does_not_prevent_coalescing(tmp_path: Path):
+    """The typical opencode lifecycle: an empty updated placeholder, then deltas."""
+    path = tmp_path / "placeholder_first.ndjson"
+    records = [
+        _updated_text_event(session_id="ses_a", part_id="prt_1", text=""),
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="Hello "),
+        _delta_event(session_id="ses_a", part_id="prt_1", delta="world"),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    assert len(parsed.text_chunks) == 1
+    chunk = parsed.text_chunks[0]
+    assert chunk.text == "Hello world"
+    assert chunk.seq == 1  # the placeholder is the first event for this part
+
+
+def test_two_interleaved_parts_produce_two_separate_chunks(tmp_path: Path):
+    path = tmp_path / "interleaved.ndjson"
+    records = [
+        _delta_event(session_id="ses_a", part_id="prt_A", delta="Al"),
+        _delta_event(session_id="ses_a", part_id="prt_B", delta="Be"),
+        _delta_event(session_id="ses_a", part_id="prt_A", delta="pha"),
+        _delta_event(session_id="ses_a", part_id="prt_B", delta="ta"),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    assert len(parsed.text_chunks) == 2
+    first, second = parsed.text_chunks
+    assert first.text == "Alpha"
+    assert first.seq == 1
+    assert second.text == "Beta"
+    assert second.seq == 2
+
+
+def test_a_single_full_text_part_with_no_deltas_still_parses_as_one_chunk(tmp_path: Path):
+    path = tmp_path / "single_snapshot.ndjson"
+    records = [
+        _updated_text_event(
+            session_id="ses_a", part_id="prt_1", text="A single complete message, no deltas."
+        ),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    assert len(parsed.text_chunks) == 1
+    chunk = parsed.text_chunks[0]
+    assert chunk.text == "A single complete message, no deltas."
+    assert chunk.seq == 1
+
+
+def test_token_sized_deltas_yield_a_followup_text_with_contiguous_sentences(tmp_path: Path):
+    """Acceptance criterion: the recall.extract_from_opencode consumer sees whole
+    sentences per activity item, not one token per line, once deltas coalesce."""
+    from ashiato.recall import extract_from_opencode
+
+    path = tmp_path / "recall_session.ndjson"
+    words = ["No", " prior", " findings", " stored", ".", " Emit", " ka", "iba", " next", "."]
+    records = [
+        {
+            "id": "evt_recall",
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_a",
+                "part": {
+                    "id": "prt_recall",
+                    "messageID": "msg_recall",
+                    "sessionID": "ses_a",
+                    "type": "tool",
+                    "tool": "kaiba_recall",
+                    "callID": "call_recall",
+                    "state": {
+                        "status": "completed",
+                        "input": {"query": "denial_pattern_x9"},
+                        "output": "See denial_pattern_x9 for details.",
+                        "time": {"start": 1000, "end": 1000},
+                    },
+                },
+            },
+        },
+    ]
+    records += [
+        _delta_event(session_id="ses_a", part_id="prt_followup", delta=word) for word in words
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+
+    parsed = parse_file(path)
+    rows = extract_from_opencode(parsed)
+    assert len(rows) == 1
+    followup_text = rows[0].followup_text
+    assert followup_text is not None
+    assert followup_text == "No prior findings stored. Emit kaiba next."
+    # not one token per line: no embedded newlines from delta-per-line evidence
+    assert "\n" not in followup_text
