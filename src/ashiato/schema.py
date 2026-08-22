@@ -120,11 +120,13 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: denial rule moving from substring to anchored-prefix matching (issue #8)
 #: changed what ``outcome`` means, and adding the ``recall_calls`` table and
 #: ``recall_followups`` view (issue #10) is new derived state that an older
-#: database simply does not have.  ``CREATE TABLE IF NOT EXISTS`` cannot see
-#: either kind of change.  Stored in :data:`META_TABLE`; a database without
-#: the marker, or with a different value, predates this version's rules and
-#: is refused.
-FORMAT_VERSION = 3
+#: database simply does not have.  Version 4 = opencode delta coalescing
+#: (PR#14 / issue #15).  Any PR that changes parser/recall derivation
+#: semantics (same source bytes -> different rows) must bump this constant.
+#: ``CREATE TABLE IF NOT EXISTS`` cannot see either kind of change.  Stored
+#: in :data:`META_TABLE`; a database without the marker, or with a different
+#: value, predates this version's rules and is refused.
+FORMAT_VERSION = 4
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
