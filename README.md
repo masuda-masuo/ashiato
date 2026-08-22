@@ -32,6 +32,8 @@ ashiato sql "SELECT ..." [--db PATH] [--format table|json|csv]
 ashiato denials [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato recalls [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato info [--db PATH]
+ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
+ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
@@ -52,6 +54,48 @@ ashiato info [--db PATH]
 - `recalls` prints the `recall_followups` view — every completed kaiba `recall` call, from
   either source format, and the evidence of what the session did afterwards — same output
   conventions as `denials`.
+- `salvage` nominates work-state changes that left no bookkeeping trail. When a session ends
+  abnormally (a freeze, a kill, context exhaustion), the post-action bookkeeping a healthy
+  session does — recording the state change in the shared kaiba agenda after a chain
+  terminates or a publish is confirmed — silently does not happen, even though the evidence
+  of the change (the tool call itself) is still in the transcript. `salvage` scans
+  `tool_calls` for such evidence and reports each as a *nomination candidate* for a human or
+  orchestrator to adjudicate. It is report-only: it writes to nothing — not the kaiba agenda,
+  not the actions ledger, not any ashiato table or view — mirroring the discipline of
+  `recalls` and `denials`, where derivation nominates and the inspecting tier files. A
+  candidate is nominated only when *both* of these hold: (1) no successful
+  `mcp__kaiba__agenda_edit` call exists in the same session at or after the evidence
+  timestamp, and (2) the kaiba `actions` ledger has no row whose `created_at` or `done_at`
+  falls in `[ts, ts + window]` — coverage from a different session or agent. `--window-minutes
+  N` sets that coverage window in minutes (default 30); `--since TS` restricts evidence to
+  timestamps at or after an ISO-8601 instant; `--limit N` caps nominations printed, with `0`
+  meaning all (default 50); `--kaiba-db PATH` points at the kaiba actions ledger (default
+  `~/.kaiba/kaiba.db`). When that ledger is absent or unreadable, the second check is skipped
+  rather than failed: `salvage` falls back to transcript-only coverage and says so
+  (`notice: no kaiba db … — coverage is transcript-only` on stderr), so the session check
+  alone decides. Exit code is `0` on success (including an empty result) and `1` when the
+  ashiato database cannot be read — missing, out of date, or failing the query.
+- `grep` is a regex search over the transcript corpus — the ergonomic layer every "where did
+  I analyse X" investigation otherwise hand-rolls as SQL plus a print loop, without reaching
+  for `ashiato sql`. By default it searches `events.text`; `--tool-calls` extends the search
+  to `tool_calls.input_summary` and `tool_calls.result_text`. `is_meta` events (harness
+  noise) are excluded unless `--include-meta` is given. The *pattern* is a Python `re` regular
+  expression, **not** DuckDB's RE2 dialect: matching is done in Python precisely so the
+  command can report the *offsets* of each match within a row's text — `re.finditer` yields
+  them for free once the pattern is compiled once — and so patterns using features RE2 lacks
+  (backreferences, certain lookarounds) behave as the Python documentation promises rather
+  than silently differing. For each hit, `grep` prints a bounded *window* of text around the
+  match: up to `--context N` characters on each side (default 200), with embedded newlines
+  replaced so the window stays on one line. `--all-matches` prints a window per match in a row
+  instead of only the first; `--whole` prints the entire matched field instead of a window.
+  Beyond the search scope there are the usual filters: `--role user|assistant` (events only —
+  a tool call has no role to filter on), `--since TS` / `--until TS` (ISO-8601 bounds),
+  `--session PREFIX` (session id prefix), and `-i` / `--ignore-case`. `--format
+  table|json|csv` chooses the output shape (default `table`; json and csv report the matched
+  `id`, `source`, `session_id`, `ts`, `label`, `field`, `offsets` and `text`), and `--limit N`
+  caps hits with `0` meaning all (default 20). Exit codes: `0` when matches are printed, `1`
+  when nothing matched (`notice: no matches` on stderr), and `2` on a bad pattern or a
+  database that cannot be read — missing, out of date, or failing the query.
 
 ```
 $ ashiato build
