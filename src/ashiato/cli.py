@@ -23,6 +23,12 @@ from ashiato.build import (
     database_info,
     default_db_path,
 )
+from ashiato.grep import DEFAULT_CONTEXT as DEFAULT_GREP_CONTEXT
+from ashiato.grep import DEFAULT_LIMIT as DEFAULT_GREP_LIMIT
+from ashiato.grep import Hit, InvalidPattern
+from ashiato.grep import search as grep_search
+from ashiato.grep import visible as grep_visible
+from ashiato.grep import window as grep_window
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import DENIAL_FOLLOWUPS_VIEW, RECALL_FOLLOWUPS_VIEW
@@ -124,6 +130,75 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=_parse_since,
         metavar="TS",
         help="only consider evidence at or after this ISO-8601 timestamp",
+    )
+
+    grep_parser = subparsers.add_parser(
+        "grep", help="regex search over transcript text with match windows"
+    )
+    grep_parser.add_argument("pattern", help="regular expression to search for")
+    grep_parser.add_argument("--db", metavar="PATH", help="database path")
+    grep_parser.add_argument("--format", choices=FORMATS, default="table", help="output format")
+    grep_parser.add_argument(
+        "--role", choices=("user", "assistant"), help="restrict event hits to one role"
+    )
+    grep_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only rows at or after this ISO-8601 timestamp",
+    )
+    grep_parser.add_argument(
+        "--until",
+        type=_parse_since,
+        metavar="TS",
+        help="only rows at or before this ISO-8601 timestamp",
+    )
+    grep_parser.add_argument(
+        "--session", metavar="PREFIX", help="restrict to sessions whose id starts with PREFIX"
+    )
+    grep_parser.add_argument(
+        "-i",
+        "--ignore-case",
+        action="store_true",
+        dest="ignore_case",
+        help="case-insensitive match",
+    )
+    grep_parser.add_argument(
+        "--tool-calls",
+        action="store_true",
+        dest="tool_calls",
+        help="also search tool_calls.input_summary and tool_calls.result_text",
+    )
+    grep_parser.add_argument(
+        "--include-meta",
+        action="store_true",
+        dest="include_meta",
+        help="include is_meta events (harness noise), excluded by default",
+    )
+    grep_parser.add_argument(
+        "--context",
+        type=_row_limit,
+        default=DEFAULT_GREP_CONTEXT,
+        metavar="N",
+        help=f"characters of context on each side of a match (default {DEFAULT_GREP_CONTEXT})",
+    )
+    grep_parser.add_argument(
+        "--all-matches",
+        action="store_true",
+        dest="all_matches",
+        help="print a window per match instead of only the first",
+    )
+    grep_parser.add_argument(
+        "--whole",
+        action="store_true",
+        help="print the full text of the matched row instead of a window",
+    )
+    grep_parser.add_argument(
+        "--limit",
+        type=_row_limit,
+        default=DEFAULT_GREP_LIMIT,
+        metavar="N",
+        help=f"maximum hits, 0 for all (default {DEFAULT_GREP_LIMIT})",
     )
 
     return parser
@@ -361,6 +436,114 @@ def _run_salvage(args: argparse.Namespace, out: Any, err: Any) -> int:
     return 0
 
 
+def _grep_header(hit: Hit) -> str:
+    ts_text = hit.ts.isoformat() if hit.ts is not None else "NULL"
+    label = f"role={hit.label}" if hit.source == "event" else f"tool={hit.label}"
+    return f"{ts_text}  session={hit.session_id}  {label}"
+
+
+def _grep_windows(hit: Hit, *, context: int, whole: bool, all_matches: bool) -> list[str]:
+    if whole:
+        return [grep_visible(hit.text)]
+    offsets = hit.offsets if all_matches else hit.offsets[:1]
+    return [grep_window(hit.text, start, end, context) for start, end in offsets]
+
+
+def _print_grep_hits(
+    hits: Sequence[Hit], *, context: int, whole: bool, all_matches: bool, stream: Any
+) -> None:
+    for hit in hits:
+        print(_grep_header(hit), file=stream)
+        for text in _grep_windows(hit, context=context, whole=whole, all_matches=all_matches):
+            print(text, file=stream)
+    print(f"({len(hits)} hit{'' if len(hits) == 1 else 's'})", file=stream)
+
+
+def _grep_structured_rows(
+    hits: Sequence[Hit], *, context: int, whole: bool, all_matches: bool
+) -> tuple[list[str], list[list[Any]]]:
+    columns = ["id", "source", "session_id", "ts", "label", "field", "offsets", "text"]
+    rows: list[list[Any]] = []
+    for hit in hits:
+        if whole:
+            rows.append(
+                [
+                    hit.id,
+                    hit.source,
+                    hit.session_id,
+                    hit.ts,
+                    hit.label,
+                    hit.field,
+                    hit.offsets,
+                    grep_visible(hit.text),
+                ]
+            )
+            continue
+        for start, end in hit.offsets if all_matches else hit.offsets[:1]:
+            rows.append(
+                [
+                    hit.id,
+                    hit.source,
+                    hit.session_id,
+                    hit.ts,
+                    hit.label,
+                    hit.field,
+                    [(start, end)],
+                    grep_window(hit.text, start, end, context),
+                ]
+            )
+    return columns, rows
+
+
+def _run_grep(args: argparse.Namespace, out: Any, err: Any) -> int:
+    db_path = _resolve_db(args.db)
+    if not db_path.exists():
+        print(f"error: no database at {db_path} (run 'ashiato build' first)", file=err)
+        return 2
+    connection = connect(db_path, read_only=True)
+    try:
+        assert_readable(connection)
+        hits = grep_search(
+            connection,
+            args.pattern,
+            role=args.role,
+            since=args.since,
+            until=args.until,
+            session=args.session,
+            ignore_case=args.ignore_case,
+            include_meta=args.include_meta,
+            tool_calls=args.tool_calls,
+            all_matches=args.all_matches,
+            limit=args.limit,
+        )
+    except InvalidPattern as error:
+        print(f"error: invalid pattern: {error}", file=err)
+        return 2
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 2
+    except duckdb.Error as error:
+        print(f"error: {error}", file=err)
+        return 2
+    finally:
+        connection.close()
+
+    if not hits:
+        print("notice: no matches", file=err)
+        return 1
+
+    if args.format == "table":
+        _print_grep_hits(
+            hits, context=args.context, whole=args.whole, all_matches=args.all_matches, stream=out
+        )
+    else:
+        columns, rows = _grep_structured_rows(
+            hits, context=args.context, whole=args.whole, all_matches=args.all_matches
+        )
+        _render(columns, rows, args.format, out)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     out, err = sys.stdout, sys.stderr
@@ -374,6 +557,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_recalls(args, out, err)
     if args.command == "salvage":
         return _run_salvage(args, out, err)
+    if args.command == "grep":
+        return _run_grep(args, out, err)
     return _run_info(args, out, err)
 
 
