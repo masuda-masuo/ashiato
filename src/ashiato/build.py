@@ -10,6 +10,15 @@ whatever the table's width, which turns a real 337 MB corpus into a half-hour
 build.  Writing a batch as newline-delimited JSON and reading it back is ~140x
 faster.  Small batches still go the plain route, and any failure of the fast
 path falls back to it, so the slow way remains the safety net.
+
+Two source formats are supported: Claude Code transcripts (``*.jsonl``,
+``sources`` / ``--source``) and opencode job event streams (``*.ndjson``,
+``opencode_sources`` / ``--opencode-source``).  They are two separate,
+explicit source lists rather than one list ashiato sniffs file-by-file: the
+two live in unrelated directory trees on a real machine, and an explicit
+second list means a Claude Code projects directory and an opencode jobs
+directory can share a build without either dragging files into the other's
+parser by mistake.
 """
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from operator import attrgetter
@@ -26,6 +35,8 @@ from pathlib import Path
 
 import duckdb
 
+from ashiato.opencode import ParsedOpenCodeFile
+from ashiato.opencode import parse_file as parse_opencode_file
 from ashiato.parser import (
     DEFAULT_RESULT_TEXT_LIMIT,
     DENIAL_PATTERNS,
@@ -35,13 +46,21 @@ from ashiato.parser import (
     ParsedFile,
     parse_file,
 )
+from ashiato.recall import (
+    RECALL_CALL_COLUMNS,
+    RecallCall,
+    extract_from_claude,
+    extract_from_opencode,
+)
 from ashiato.schema import (
     DENIAL_FOLLOWUPS_SQL,
-    DENIAL_FOLLOWUPS_VIEW,
     FORMAT_VERSION,
+    INFO_TABLES,
     META_FORMAT_KEY,
     META_SCHEMA_SQL,
     META_TABLE,
+    RECALL_FOLLOWUPS_SQL,
+    REQUIRED_VIEWS,
     SCHEMA_SQL,
     TABLES,
     column_names,
@@ -61,6 +80,7 @@ _HASH_CHUNK = 1 << 20
 _event_row = attrgetter(*EVENT_COLUMNS)
 _tool_call_row = attrgetter(*TOOL_CALL_COLUMNS)
 _session_row = attrgetter(*SESSION_COLUMNS)
+_recall_call_row = attrgetter(*RECALL_CALL_COLUMNS)
 
 
 class SchemaOutOfDate(RuntimeError):
@@ -76,6 +96,7 @@ class BuildResult:
     n_sessions: int = 0
     n_events: int = 0
     n_tool_calls: int = 0
+    n_recall_calls: int = 0
     n_parse_errors: int = 0
     n_bulk_fallbacks: int = 0
     missing_sources: list[str] = field(default_factory=list)
@@ -147,6 +168,22 @@ def _assert_format_version(connection: duckdb.DuckDBPyConnection) -> None:
         )
 
 
+def _table_columns(connection: duckdb.DuckDBPyConnection, table: str) -> tuple[str, ...]:
+    """The actual column names of *table*, or ``()`` when it does not exist.
+
+    ``PRAGMA table_info`` raises ``CatalogException`` for a table that is not
+    there at all -- which is exactly the shape of an old database predating a
+    table this version expects (``recall_calls``, added in FORMAT_VERSION 3).
+    An absent table is reported the same way a table missing every expected
+    column would be: as "missing everything", not as an unrelated crash.
+    """
+    try:
+        rows = connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+    except duckdb.CatalogException:
+        return ()
+    return tuple(row[1] for row in rows)
+
+
 def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
     """Refuse a database that predates the columns or rules this version expects.
 
@@ -162,8 +199,7 @@ def _assert_current_schema(connection: duckdb.DuckDBPyConnection) -> None:
     checked here too.
     """
     for table in TABLES:
-        rows = connection.execute(f"PRAGMA table_info('{table}')").fetchall()
-        actual = tuple(row[1] for row in rows)
+        actual = _table_columns(connection, table)
         expected = column_names(table)
         if actual != expected:
             missing = [name for name in expected if name not in actual]
@@ -187,21 +223,22 @@ def assert_readable(connection: duckdb.DuckDBPyConnection) -> None:
     built before the view existed reports DuckDB's bare "Table with name
     denial_followups does not exist!" and no way out of it.  Deciding this on
     open rather than by inspecting a failed query is what keeps a plain SQL typo
-    the user's own error: only ashiato's own tables and view are checked here.
+    the user's own error: only ashiato's own tables and views are checked here.
     """
     _assert_current_schema(connection)
-    row = connection.execute(
-        "SELECT count(*) FROM duckdb_views() WHERE view_name = ?", [DENIAL_FOLLOWUPS_VIEW]
-    ).fetchone()
-    if not row or not row[0]:
-        raise SchemaOutOfDate(
-            f"view '{DENIAL_FOLLOWUPS_VIEW}' is missing: this database was built by a "
-            "different version of ashiato -- delete the database file and build again"
-        )
+    for view in REQUIRED_VIEWS:
+        row = connection.execute(
+            "SELECT count(*) FROM duckdb_views() WHERE view_name = ?", [view]
+        ).fetchone()
+        if not row or not row[0]:
+            raise SchemaOutOfDate(
+                f"view '{view}' is missing: this database was built by a "
+                "different version of ashiato -- delete the database file and build again"
+            )
 
 
 def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
-    """Create the tables, format marker and view on a fresh database.
+    """Create the tables, format marker and views on a fresh database.
 
     An existing database that already has ashiato's tables must be current in
     columns and format marker before anything is created: ``CREATE TABLE IF
@@ -209,7 +246,7 @@ def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
     as current.  A database with no ashiato tables at all is a fresh one and
     is initialised with the marker.
 
-    The DDL and the marker stamp run as one transaction, and so does the view
+    The DDL and the marker stamp run as one transaction, and so do the views
     on top of them: DuckDB DDL is transactional, so a crash at any point in
     here rolls the whole lot back and the file stays empty -- exactly what a
     fresh ``build`` expects.  Without the transaction, a crash between the
@@ -236,24 +273,27 @@ def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
             [META_FORMAT_KEY, str(FORMAT_VERSION)],
         )
         connection.execute(DENIAL_FOLLOWUPS_SQL)
+        connection.execute(RECALL_FOLLOWUPS_SQL)
         connection.execute("COMMIT")
     except duckdb.Error:
         connection.execute("ROLLBACK")
         raise
 
 
-def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
-    """(transcript files, sources that do not exist).
+def _iter_sources(sources: Sequence[str | Path], pattern: str) -> tuple[list[Path], list[str]]:
+    """(matching files, sources that do not exist).
 
-    Directories are searched recursively for ``*.jsonl``.  The result is sorted
-    and deduplicated so a build is reproducible regardless of walk order.
+    Directories are searched recursively for *pattern*.  The result is sorted
+    and deduplicated so a build is reproducible regardless of walk order.  A
+    source that is itself a file is accepted whatever its name -- the caller
+    already said what it is by which source list it went in.
     """
     found: dict[str, Path] = {}
     missing: list[str] = []
     for source in sources:
         path = Path(source).expanduser()
         if path.is_dir():
-            for candidate in path.rglob("*.jsonl"):
+            for candidate in path.rglob(pattern):
                 if candidate.is_file():
                     found[str(candidate.resolve())] = candidate
         elif path.is_file():
@@ -261,6 +301,22 @@ def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[st
         else:
             missing.append(str(path))
     return [found[key] for key in sorted(found)], missing
+
+
+def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
+    """(Claude Code transcript files, sources that do not exist).
+
+    Directories are searched recursively for ``*.jsonl``.
+    """
+    return _iter_sources(sources, "*.jsonl")
+
+
+def iter_opencode_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
+    """(opencode events.ndjson files, sources that do not exist).
+
+    Directories are searched recursively for ``*.ndjson``.
+    """
+    return _iter_sources(sources, "*.ndjson")
 
 
 def _content_hash(path: Path) -> str:
@@ -325,6 +381,7 @@ def _insert_rows(
 def _insert_parsed(
     connection: duckdb.DuckDBPyConnection,
     parsed: ParsedFile,
+    recall_rows: Sequence[RecallCall],
     *,
     stat: os.stat_result,
     content_hash: str,
@@ -340,6 +397,12 @@ def _insert_parsed(
         connection,
         "tool_calls",
         [_tool_call_row(call) for call in parsed.tool_calls],
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "recall_calls",
+        [_recall_call_row(row) for row in recall_rows],
         scratch=scratch,
     )
     _insert_rows(
@@ -361,16 +424,55 @@ def _insert_parsed(
     )
 
 
-def _store_file(
+def _insert_opencode_parsed(
     connection: duckdb.DuckDBPyConnection,
-    parsed: ParsedFile,
+    parsed: ParsedOpenCodeFile,
+    recall_rows: Sequence[RecallCall],
     *,
-    key: str,
-    replace: bool,
     stat: os.stat_result,
     content_hash: str,
     built_at: datetime,
+    scratch: Path | None,
+) -> None:
+    """The opencode counterpart of :func:`_insert_parsed`.
+
+    Only ``recall_calls`` and ``source_files`` are touched: general-purpose
+    ingestion of opencode events into ``sessions`` / ``events`` / ``tool_calls``
+    is out of scope, so those counts are honestly zero rather than borrowed
+    from a table this format never populates.
+    """
+    _insert_rows(
+        connection,
+        "recall_calls",
+        [_recall_call_row(row) for row in recall_rows],
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "source_files",
+        [
+            (
+                parsed.file_path,
+                stat.st_size,
+                stat.st_mtime,
+                content_hash,
+                0,
+                0,
+                parsed.n_parse_errors,
+                built_at,
+            )
+        ],
+        scratch=scratch,
+    )
+
+
+def _store_file(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    key: str,
+    replace: bool,
     scratch: Path,
+    insert: Callable[[Path | None], None],
     result: BuildResult,
 ) -> bool:
     """Write one file's rows, retrying without the bulk path if that fails."""
@@ -379,14 +481,7 @@ def _store_file(
         try:
             if replace:
                 _delete_file_rows(connection, key)
-            _insert_parsed(
-                connection,
-                parsed,
-                stat=stat,
-                content_hash=content_hash,
-                built_at=built_at,
-                scratch=attempt,
-            )
+            insert(attempt)
             connection.execute("COMMIT")
             return True
         except duckdb.Error:
@@ -398,17 +493,31 @@ def _store_file(
     return False
 
 
+def _is_unchanged(
+    known: dict[str, tuple[int, float]], key: str, stat: os.stat_result
+) -> bool:
+    previous = known.get(key)
+    return (
+        previous is not None
+        and previous[0] == stat.st_size
+        and abs((previous[1] or 0.0) - stat.st_mtime) < _MTIME_TOLERANCE
+    )
+
+
 def build(
     sources: Sequence[str | Path],
     db_path: str | Path,
     *,
+    opencode_sources: Sequence[str | Path] = (),
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
 ) -> BuildResult:
-    """Parse every transcript under *sources* into the database at *db_path*."""
+    """Parse every transcript under *sources* / *opencode_sources* into *db_path*."""
     result = BuildResult(db_path=str(Path(db_path).expanduser()))
-    files, result.missing_sources = iter_transcripts(sources)
-    result.n_files = len(files)
+    claude_files, claude_missing = iter_transcripts(sources)
+    opencode_files, opencode_missing = iter_opencode_sources(opencode_sources)
+    result.missing_sources = claude_missing + opencode_missing
+    result.n_files = len(claude_files) + len(opencode_files)
 
     connection = connect(db_path)
     try:
@@ -418,20 +527,15 @@ def build(
 
         with tempfile.TemporaryDirectory(prefix="ashiato-") as tmp_dir:
             scratch = Path(tmp_dir)
-            for path in files:
+
+            for path in claude_files:
                 key = str(path.resolve())
                 try:
                     stat = path.stat()
                 except OSError:
                     result.unreadable_files.append(key)
                     continue
-
-                previous = known.get(key)
-                if (
-                    previous is not None
-                    and previous[0] == stat.st_size
-                    and abs((previous[1] or 0.0) - stat.st_mtime) < _MTIME_TOLERANCE
-                ):
+                if _is_unchanged(known, key, stat):
                     result.n_skipped += 1
                     continue
 
@@ -441,6 +545,7 @@ def build(
                         denial_patterns=denial_patterns,
                         result_text_limit=result_text_limit,
                     )
+                    recall_rows = extract_from_claude(parsed)
                     content_hash = _content_hash(path)
                 except OSError:
                     result.unreadable_files.append(key)
@@ -448,23 +553,81 @@ def build(
 
                 stored = _store_file(
                     connection,
-                    parsed,
                     key=key,
-                    replace=previous is not None,
-                    stat=stat,
-                    content_hash=content_hash,
-                    built_at=built_at,
+                    replace=key in known,
                     scratch=scratch,
+                    insert=lambda attempt,
+                    parsed=parsed,
+                    recall_rows=recall_rows,
+                    stat=stat,
+                    content_hash=content_hash: _insert_parsed(
+                        connection,
+                        parsed,
+                        recall_rows,
+                        stat=stat,
+                        content_hash=content_hash,
+                        built_at=built_at,
+                        scratch=attempt,
+                    ),
                     result=result,
                 )
                 if not stored:
                     continue
 
                 result.n_processed += 1
+                result.n_recall_calls += len(recall_rows)
+                result.n_sessions += 1 if parsed.session is not None else 0
                 result.n_events += len(parsed.events)
                 result.n_tool_calls += len(parsed.tool_calls)
                 result.n_parse_errors += parsed.n_parse_errors
-                result.n_sessions += 1 if parsed.session is not None else 0
+
+            for path in opencode_files:
+                key = str(path.resolve())
+                try:
+                    stat = path.stat()
+                except OSError:
+                    result.unreadable_files.append(key)
+                    continue
+                if _is_unchanged(known, key, stat):
+                    result.n_skipped += 1
+                    continue
+
+                try:
+                    parsed_oc = parse_opencode_file(path)
+                    recall_rows = extract_from_opencode(
+                        parsed_oc, result_text_limit=result_text_limit
+                    )
+                    content_hash = _content_hash(path)
+                except OSError:
+                    result.unreadable_files.append(key)
+                    continue
+
+                stored = _store_file(
+                    connection,
+                    key=key,
+                    replace=key in known,
+                    scratch=scratch,
+                    insert=lambda attempt,
+                    parsed_oc=parsed_oc,
+                    recall_rows=recall_rows,
+                    stat=stat,
+                    content_hash=content_hash: _insert_opencode_parsed(
+                        connection,
+                        parsed_oc,
+                        recall_rows,
+                        stat=stat,
+                        content_hash=content_hash,
+                        built_at=built_at,
+                        scratch=attempt,
+                    ),
+                    result=result,
+                )
+                if not stored:
+                    continue
+
+                result.n_processed += 1
+                result.n_recall_calls += len(recall_rows)
+                result.n_parse_errors += parsed_oc.n_parse_errors
     finally:
         connection.close()
     return result
@@ -475,14 +638,16 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
 
     The same read gate as ``sql`` and ``denials``: a database whose schema or
     format marker this version cannot vouch for is refused, so ``info`` does
-    not report a stale database as if it were current.
+    not report a stale database as if it were current.  Counts are reported
+    for :data:`ashiato.schema.INFO_TABLES`, not every table -- see that
+    constant for why ``recall_calls`` is left out of this particular report.
     """
     path = Path(db_path).expanduser()
     connection = connect(path, read_only=True)
     try:
         assert_readable(connection)
         counts: dict[str, int] = {}
-        for table in TABLES:
+        for table in INFO_TABLES:
             row = connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()
             counts[table] = row[0] if row else 0
         window = connection.execute(

@@ -5,14 +5,15 @@ the CREATE TABLE statements, the INSERT column lists, the type spec handed to
 DuckDB's JSON reader during bulk load -- is derived from them.
 
 Column order in each table matches the field order of the corresponding
-dataclass in :mod:`ashiato.parser`; ``tests/test_build.py`` asserts that, so the
-two cannot drift apart silently.
+dataclass in :mod:`ashiato.parser` (or, for ``recall_calls``,
+:mod:`ashiato.recall`); ``tests/test_build.py`` asserts that, so the two
+cannot drift apart silently.
 
 ``tool_use_id`` is the key of ``tool_calls`` but is deliberately not declared as
 a SQL PRIMARY KEY: a real corpus can contain the same id twice (a transcript
 copied or replayed across files), and a constraint violation there would abort a
 build over data that is merely redundant.  Duplicates are dropped per file at
-parse time instead.
+parse time instead.  ``recall_id`` follows the same rule for ``recall_calls``.
 """
 
 from __future__ import annotations
@@ -84,6 +85,25 @@ TOOL_CALL_TABLE: tuple[Column, ...] = (
     ("parent_tool_use_id", "VARCHAR"),
 )
 
+#: One row per completed kaiba ``recall`` call, from either source format --
+#: see :mod:`ashiato.recall`, which fills this table in at build time.
+RECALL_CALL_TABLE: tuple[Column, ...] = (
+    ("recall_id", "VARCHAR"),
+    ("session_id", "VARCHAR"),
+    ("file_path", "VARCHAR"),
+    ("source", "VARCHAR"),
+    ("seq", "BIGINT"),
+    ("ts", "TIMESTAMP"),
+    ("call_id", "VARCHAR"),
+    ("query", "VARCHAR"),
+    ("output", "VARCHAR"),
+    ("output_truncated", "BOOLEAN"),
+    ("followup_text", "VARCHAR"),
+    ("followup_truncated", "BOOLEAN"),
+    ("overlap_tokens", "VARCHAR"),
+    ("overlap_count", "BIGINT"),
+)
+
 SOURCE_FILE_TABLE: tuple[Column, ...] = (
     ("file_path", "VARCHAR"),
     ("size_bytes", "BIGINT"),
@@ -98,10 +118,13 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: Version of the *rows*, as opposed to the column layout.  Bumped whenever a
 #: rebuild must re-derive existing rows even though no column changed -- the
 #: denial rule moving from substring to anchored-prefix matching (issue #8)
-#: changed what ``outcome`` means, and ``CREATE TABLE IF NOT EXISTS`` cannot see
-#: that.  Stored in :data:`META_TABLE`; a database without the marker, or with a
-#: different value, predates this version's rules and is refused.
-FORMAT_VERSION = 2
+#: changed what ``outcome`` means, and adding the ``recall_calls`` table and
+#: ``recall_followups`` view (issue #10) is new derived state that an older
+#: database simply does not have.  ``CREATE TABLE IF NOT EXISTS`` cannot see
+#: either kind of change.  Stored in :data:`META_TABLE`; a database without
+#: the marker, or with a different value, predates this version's rules and
+#: is refused.
+FORMAT_VERSION = 3
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
@@ -119,10 +142,23 @@ TABLE_COLUMNS: dict[str, tuple[Column, ...]] = {
     "sessions": SESSION_TABLE,
     "events": EVENT_TABLE,
     "tool_calls": TOOL_CALL_TABLE,
+    "recall_calls": RECALL_CALL_TABLE,
     "source_files": SOURCE_FILE_TABLE,
 }
 
 TABLES: tuple[str, ...] = tuple(TABLE_COLUMNS)
+
+#: Tables ``ashiato info`` summarises.  ``recall_calls`` is deliberately left
+#: out of this particular report: it is a narrower table that most databases
+#: (anything built without an ``--opencode-source``, and most sessions even
+#: with one) will simply have zero rows in, and every existing ``info``
+#: output would otherwise grow a new line whether or not the caller ever
+#: touched opencode ingestion.  It still participates fully in schema
+#: creation, the schema-currency check, and the per-file incremental
+#: replace/delete -- this only narrows what ``info`` prints.  Query it
+#: directly (``ashiato sql "SELECT count(*) FROM recall_calls"``, or
+#: ``ashiato recalls``) when it matters.
+INFO_TABLES: tuple[str, ...] = tuple(table for table in TABLES if table != "recall_calls")
 
 SOURCE_FILE_COLUMNS: tuple[str, ...] = tuple(name for name, _ in SOURCE_FILE_TABLE)
 
@@ -221,6 +257,37 @@ WHERE denied.outcome = 'denied';
 
 #: Every ``followup_kind`` the view can produce.
 FOLLOWUP_KINDS: tuple[str, ...] = ("verbatim-retry", "same-tool", "other-tool", "none")
+
+#: One row per completed kaiba ``recall`` call, joined to same-session
+#: followup evidence.  Unlike ``denial_followups`` this is a thin view over a
+#: real table (``recall_calls``): the followup pairing crosses source
+#: formats and is computed once, at build time, by :mod:`ashiato.recall` --
+#: see that module's docstring for why a read-time view over raw events
+#: does not work the way it does for denials.
+RECALL_FOLLOWUPS_VIEW = "recall_followups"
+
+RECALL_FOLLOWUPS_SQL = f'''
+CREATE OR REPLACE VIEW "{RECALL_FOLLOWUPS_VIEW}" AS
+SELECT
+    recall_id,
+    session_id,
+    file_path,
+    source,
+    seq,
+    ts,
+    call_id,
+    query,
+    output,
+    output_truncated,
+    followup_text,
+    followup_truncated,
+    overlap_tokens,
+    overlap_count
+FROM "recall_calls";
+'''
+
+#: Every view a current database must have; checked by ``assert_readable``.
+REQUIRED_VIEWS: tuple[str, ...] = (DENIAL_FOLLOWUPS_VIEW, RECALL_FOLLOWUPS_VIEW)
 
 
 def insert_sql(table: str) -> str:

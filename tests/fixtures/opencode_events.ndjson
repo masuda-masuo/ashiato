@@ -1,0 +1,13 @@
+{"id":"evt_1","type":"message.part.updated","properties":{"sessionID":"ses_aaa","part":{"id":"prt_1","messageID":"msg_1","sessionID":"ses_aaa","type":"text","text":"Let me check kaiba for prior guidance before editing anything."},"time":900}}
+{"id":"evt_2","type":"message.part.updated","properties":{"sessionID":"ses_aaa","part":{"id":"prt_2","messageID":"msg_2","sessionID":"ses_aaa","type":"tool","tool":"kaiba_recall","callID":"call_2","state":{"status":"pending","input":{"query":"denial"}}},"time":1000}}
+{"id":"evt_3","type":"message.part.updated","properties":{"sessionID":"ses_aaa","part":{"id":"prt_2","messageID":"msg_2","sessionID":"ses_aaa","type":"tool","tool":"kaiba_recall","callID":"call_2","state":{"status":"completed","input":{"query":"denial pattern anchoring"},"output":"Use anchored prefix matching for denial_pattern_x9 tokens.","time":{"start":1000,"end":1300}}},"time":1300}}
+{"id":"evt_4","type":"message.part.delta","properties":{"sessionID":"ses_aaa","field":"text","delta":"Applying denial_pattern_x9 as documented in the recall output."}}
+{"id":"evt_5","type":"message.part.updated","properties":{"sessionID":"ses_bbb","part":{"id":"prt_5","messageID":"msg_5","sessionID":"ses_bbb","type":"tool","tool":"kaiba_recall","callID":"call_5","state":{"status":"completed","input":{"query":"unrelated topic"},"output":"Consider orphaned_snippet_zz for edge cases.","time":{"start":2000,"end":2300}}},"time":2300}}
+{"id":"evt_6","type":"message.part.delta","properties":{"sessionID":"ses_bbb","field":"text","delta":"Proceeding with the standard approach and ignoring that suggestion."}}
+{"id":"evt_7","type":"message.part.updated","properties":{"sessionID":"ses_ccc","part":{"id":"prt_7","messageID":"msg_7","sessionID":"ses_ccc","type":"tool","tool":"kaiba_recall","callID":"call_7","state":{"status":"pending","input":{"query":"still running"}}},"time":3000}}
+{"id":"evt_8","type":"message.part.updated","properties":{"sessionID":"ses_ddd","part":{"id":"prt_8","messageID":"msg_8","sessionID":"ses_ddd","type":"tool","tool":"bash","callID":"call_8","state":{"status":"completed","input":{"command":"ls -la"},"output":"file1\nfile2","time":{"start":4000,"end":4100}}},"time":4100}}
+not valid json at all {{{
+[1, 2, 3]
+{"id":"evt_11","type":"step.started","properties":{"sessionID":"ses_eee"}}
+{"id":"evt_12","type":"message.part.updated","properties":{"sessionID":"ses_eee","part":{"id":"prt_12","type":"file","sessionID":"ses_eee","filename":"notes.md"},"time":5000}}
+{"id":"evt_13","type":"message.part.updated","properties":{"sessionID":"ses_eee","part":{"id":"prt_13","messageID":"msg_13","sessionID":"ses_eee","type":"tool","tool":"kaiba_recall","callID":"call_13"},"time":5100}}
