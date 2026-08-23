@@ -502,3 +502,178 @@ def test_recalls_help_exits_zero():
     with pytest.raises(SystemExit) as excinfo:
         main(["recalls", "--help"])
     assert excinfo.value.code == 0
+
+
+# ---------------------------------------------------------------- schema
+
+
+def test_schema_lists_tables_and_views_without_database(capsys: pytest.CaptureFixture[str]):
+    """ashiato schema works with no database present."""
+    assert main(["schema"]) == 0
+    out = capsys.readouterr().out
+    # All tables
+    assert "sessions             table" in out
+    assert "events               table" in out
+    assert "tool_calls           table" in out
+    assert "recall_calls         table" in out
+    assert "source_files         table" in out
+    # Both views
+    assert "denial_followups     view" in out
+    assert "recall_followups     view" in out
+
+
+def test_schema_describes_table_columns_without_database(capsys: pytest.CaptureFixture[str]):
+    """ashiato schema <table> prints columns without a database."""
+    assert main(["schema", "sessions"]) == 0
+    out = capsys.readouterr().out
+    assert "sessions (table)" in out
+    assert "session_id                     VARCHAR" in out
+    assert "started_at                     TIMESTAMP" in out
+
+
+def test_schema_describes_view_columns_without_database(capsys: pytest.CaptureFixture[str]):
+    """ashiato schema <view> prints columns without a database."""
+    assert main(["schema", "denial_followups"]) == 0
+    out = capsys.readouterr().out
+    assert "denial_followups (view)" in out
+    assert "followup_kind                  VARCHAR" in out
+    assert "gap_seconds                    DOUBLE" in out
+
+    assert main(["schema", "recall_followups"]) == 0
+    out = capsys.readouterr().out
+    assert "recall_followups (view)" in out
+    assert "overlap_count                  BIGINT" in out
+
+
+def test_schema_unknown_table_fails_cleanly(capsys: pytest.CaptureFixture[str]):
+    assert main(["schema", "nonexistent"]) == 1
+    err = capsys.readouterr().err
+    assert "error: unknown table or view: nonexistent" in err
+    assert "Available:" in err
+
+
+# ---------------------------------------------------------------- info: roots and freshness
+
+
+def test_info_names_all_roots_including_empty(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """After a build, info names every root passed, including roots with no files."""
+    # Create a fixture directory with some files
+    src_with_files = tmp_path / "src_with_files"
+    src_with_files.mkdir()
+    shutil.copy(FIXTURES / "session_main.jsonl", src_with_files)
+
+    # Create an empty source directory
+    src_empty = tmp_path / "src_empty"
+    src_empty.mkdir()
+
+    # Create an opencode source directory (also empty)
+    opencode_empty = tmp_path / "opencode_empty"
+    opencode_empty.mkdir()
+
+    path = tmp_path / "out.duckdb"
+    assert (
+        main(
+            [
+                "build",
+                "--source",
+                str(src_with_files),
+                "--source",
+                str(src_empty),
+                "--opencode-source",
+                str(opencode_empty),
+                "--db",
+                str(path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["info", "--db", str(path)]) == 0
+    out = capsys.readouterr().out
+
+    # All three source kinds are reported
+    assert "sources" in out
+    assert "opencode_sources" in out
+    assert "cursor_sources" in out
+
+    # The non-empty source shows its file count
+    assert f"sources            {src_with_files} (1 file)" in out
+    # The empty sources show (0 files) because the root was passed but contributed no files
+    assert f"sources            {src_empty} (0 files)" in out
+    assert f"opencode_sources   {opencode_empty} (0 files)" in out
+    # cursor_sources not passed, so it shows (none)
+    assert "cursor_sources     (none)" in out
+
+
+def test_info_on_database_without_root_keys_reports_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """info on a database without recorded-roots keys reports 'unknown', not 'none' or error."""
+    # Build a database
+    path = tmp_path / "out.duckdb"
+    assert main(["build", "--source", str(FIXTURES), "--db", str(path)]) == 0
+    capsys.readouterr()
+
+    # Remove the root-recording meta keys to simulate an old database
+    from ashiato.build import connect
+    from ashiato.schema import (
+        META_CURSOR_SOURCES_KEY,
+        META_OPENCODE_SOURCES_KEY,
+        META_SOURCES_KEY,
+        META_TABLE,
+    )
+
+    conn = connect(path)
+    try:
+        conn.execute(
+            f'DELETE FROM "{META_TABLE}" WHERE key IN (?, ?, ?)',
+            [META_SOURCES_KEY, META_OPENCODE_SOURCES_KEY, META_CURSOR_SOURCES_KEY],
+        )
+    finally:
+        conn.close()
+
+    # info should succeed and report roots as unknown
+    assert main(["info", "--db", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "ingested roots: unknown (database built before root recording" in out
+    assert "freshness: unknown (roots not recorded)" in out
+
+
+def test_freshness_gap_zero_after_build(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """Freshness gap is zero right after a build."""
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy(FIXTURES / "session_main.jsonl", src)
+
+    path = tmp_path / "out.duckdb"
+    assert main(["build", "--source", str(src), "--db", str(path)]) == 0
+    capsys.readouterr()
+
+    assert main(["info", "--db", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "freshness: current (no new or changed files under recorded roots)" in out
+
+
+def test_freshness_gap_one_after_adding_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """Adding one new transcript file under a recorded root makes freshness gap exactly one."""
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy(FIXTURES / "session_main.jsonl", src)
+
+    path = tmp_path / "out.duckdb"
+    assert main(["build", "--source", str(src), "--db", str(path)]) == 0
+    capsys.readouterr()
+
+    # Freshness is zero after build
+    assert main(["info", "--db", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "freshness: current" in out
+
+    # Add a new file
+    shutil.copy(FIXTURES / "session_snake.jsonl", src / "new_file.jsonl")
+
+    # Freshness gap should now be 1
+    assert main(["info", "--db", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "freshness: 1 new or changed file under recorded roots" in out

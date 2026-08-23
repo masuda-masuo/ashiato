@@ -32,6 +32,7 @@ ashiato sql "SELECT ..." [--db PATH] [--format table|json|csv]
 ashiato denials [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato recalls [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato info [--db PATH]
+ashiato schema [TABLE] [--db PATH]
 ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ```
@@ -109,6 +110,45 @@ ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistan
   when nothing matched (`notice: no matches` on stderr), and `2` on a bad pattern or a
   database that cannot be read — missing, out of date, or failing the query.
 
+- `schema` lists the tables and views in the ashiato schema, or shows the columns
+  and types for a specific table or view. It works without a database -- the schema
+  is a property of the code, not of any particular build. Pass `--db PATH` to also
+  show view columns (which require a database to inspect).
+```
+$ ashiato schema
+  sessions                table
+  events                  table
+  tool_calls              table
+  recall_calls            table
+  source_files            table
+  denial_followups        view
+  recall_followups        view
+
+$ ashiato schema tool_calls
+tool_calls (table)
+  tool_use_id                   VARCHAR
+  session_id                    VARCHAR
+  file_path                     VARCHAR
+  seq                           BIGINT
+  ts                            TIMESTAMP
+  call_event_id                 VARCHAR
+  result_event_id               VARCHAR
+  tool_name                     VARCHAR
+  tool_kind                     VARCHAR
+  mcp_server                    VARCHAR
+  input                         JSON
+  input_summary                 VARCHAR
+  outcome                       VARCHAR
+  is_error                      BOOLEAN
+  result_text                   VARCHAR
+  result_truncated              BOOLEAN
+  duration_ms                   BIGINT
+  permission_mode               VARCHAR
+  cwd                           VARCHAR
+  is_sidechain                  BOOLEAN
+  parent_tool_use_id            VARCHAR
+```
+
 ```
 $ ashiato build
 database: /home/you/.local/share/ashiato/ashiato.duckdb
@@ -119,6 +159,20 @@ unparseable lines skipped: 3
 $ ashiato sql "SELECT tool_name, outcome, count(*) FROM tool_calls GROUP BY 1,2 ORDER BY 3 DESC LIMIT 5"
 $ ashiato sql "SELECT tool_use_id, input->>'\$.command' AS cmd FROM tool_calls WHERE tool_name='Bash' AND outcome='denied'"
 $ ashiato info
+database: /home/you/.local/share/ashiato/ashiato.duckdb
+  sessions              251
+  events             412884
+  tool_calls          61240
+  source_files         251
+time window: 2026-01-15 08:30:00 .. 2026-08-22 14:22:11
+ingested roots:
+    sources: /home/you/.claude/projects (245 files)
+    opencode_sources: /home/you/.kusabi (6 files)
+    cursor_sources: (none)
+freshness: 3 new or changed files under recorded roots (run 'ashiato build' to update)
+
+$ ashiato schema
+$ ashiato schema tool_calls
 ```
 
 ## Tables

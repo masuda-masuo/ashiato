@@ -31,7 +31,14 @@ from ashiato.grep import visible as grep_visible
 from ashiato.grep import window as grep_window
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
-from ashiato.schema import DENIAL_FOLLOWUPS_VIEW, RECALL_FOLLOWUPS_VIEW
+from ashiato.schema import (
+    DENIAL_FOLLOWUPS_VIEW,
+    RECALL_FOLLOWUPS_VIEW,
+    REQUIRED_VIEWS,
+    TABLE_COLUMNS,
+    TABLES,
+    VIEW_COLUMNS,
+)
 
 FORMATS = ("table", "json", "csv")
 
@@ -113,6 +120,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     info_parser = subparsers.add_parser("info", help="describe the database")
     info_parser.add_argument("--db", metavar="PATH", help="database path")
+
+    schema_parser = subparsers.add_parser("schema", help="show table/view columns")
+    schema_parser.add_argument("table", nargs="?", help="table or view name to describe")
+    schema_parser.add_argument(
+        "--db", metavar="PATH", help="database path (optional; schema is derived from code)"
+    )
 
     salvage_parser = subparsers.add_parser(
         "salvage", help="nominate work-state changes with no bookkeeping trail"
@@ -413,6 +426,82 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
         else "empty"
     )
     print(f"time window: {window}", file=out)
+
+    # Ingested roots
+    if info.sources is None and info.opencode_sources is None and info.cursor_sources is None:
+        print(
+            "ingested roots: unknown (database built before root recording; "
+            "rebuild to record them)",
+            file=out,
+        )
+    else:
+        print("ingested roots:", file=out)
+        _print_roots("  sources", info.sources or [], out)
+        _print_roots("  opencode_sources", info.opencode_sources or [], out)
+        _print_roots("  cursor_sources", info.cursor_sources or [], out)
+
+    # Freshness gap
+    if info.freshness_gap is None:
+        print("freshness: unknown (roots not recorded)", file=out)
+    elif info.freshness_gap == 0:
+        print("freshness: current (no new or changed files under recorded roots)", file=out)
+    else:
+        plural = "s" if info.freshness_gap != 1 else ""
+        print(
+            f"freshness: {info.freshness_gap} new or changed file{plural} "
+            "under recorded roots (run 'ashiato build' to update)",
+            file=out,
+        )
+
+    return 0
+
+
+def _print_roots(label: str, roots: list[tuple[str, int]], out: Any) -> None:
+    if roots:
+        for root, count in roots:
+            root_part = f"{root} ({count} file{'s' if count != 1 else ''})"
+            print(f"  {label:<20} {root_part}", file=out)
+    else:
+        print(f"  {label:<20} (none)", file=out)
+
+
+def _run_schema(args: argparse.Namespace, out: Any, err: Any) -> int:
+    """List tables/views and their columns.
+
+    The schema is derived from the code (TABLE_COLUMNS and REQUIRED_VIEWS),
+    not from a particular database, so this works without a database.
+    """
+    # Build the combined schema: tables + views
+    all_names = list(TABLES) + list(REQUIRED_VIEWS)
+
+    if args.table is None:
+        # List all tables and views
+        for name in all_names:
+            kind = "table" if name in TABLES else "view"
+            print(f"  {name:<20} {kind}", file=out)
+        return 0
+
+    # Describe a specific table or view
+    table_name = args.table
+    if table_name not in all_names:
+        print(f"error: unknown table or view: {table_name}", file=err)
+        print("Available:", file=err)
+        for name in all_names:
+            kind = "table" if name in TABLES else "view"
+            print(f"  {name:<20} {kind}", file=err)
+        return 1
+
+    if table_name in TABLE_COLUMNS:
+        columns = TABLE_COLUMNS[table_name]
+        print(f"{table_name} (table)", file=out)
+        for col_name, col_type in columns:
+            print(f"  {col_name:<30} {col_type}", file=out)
+    else:
+        # View - columns are defined in VIEW_COLUMNS so this works without a database
+        print(f"{table_name} (view)", file=out)
+        columns = VIEW_COLUMNS[table_name]
+        for col_name, col_type in columns:
+            print(f"  {col_name:<30} {col_type}", file=out)
     return 0
 
 
@@ -581,6 +670,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_denials(args, out, err)
     if args.command == "recalls":
         return _run_recalls(args, out, err)
+    if args.command == "info":
+        return _run_info(args, out, err)
+    if args.command == "schema":
+        return _run_schema(args, out, err)
     if args.command == "salvage":
         return _run_salvage(args, out, err)
     if args.command == "grep":

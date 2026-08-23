@@ -140,6 +140,15 @@ META_TABLE = "ashiato_meta"
 #: The key under :data:`META_TABLE` that carries :data:`FORMAT_VERSION`.
 META_FORMAT_KEY = "format_version"
 
+#: Keys under :data:`META_TABLE` that record the roots passed to ``build``.
+#: Three separate lists because the three source kinds have separate parsers
+#: and separate meanings; collapsing them loses which parser covers what.
+#: Stored as JSON arrays of absolute paths.  A root that matched no files is
+#: still recorded -- it explains an absence.
+META_SOURCES_KEY = "sources"
+META_OPENCODE_SOURCES_KEY = "opencode_sources"
+META_CURSOR_SOURCES_KEY = "cursor_sources"
+
 META_SCHEMA_SQL = (
     f'CREATE TABLE IF NOT EXISTS "{META_TABLE}" (key VARCHAR PRIMARY KEY, value VARCHAR)'
 )
@@ -294,6 +303,31 @@ FROM "recall_calls";
 
 #: Every view a current database must have; checked by ``assert_readable``.
 REQUIRED_VIEWS: tuple[str, ...] = (DENIAL_FOLLOWUPS_VIEW, RECALL_FOLLOWUPS_VIEW)
+
+#: Column definitions for views, so ``ashiato schema`` can describe them
+#: without a database.  These must match the SELECT clauses in the view SQL.
+DENIAL_FOLLOWUPS_COLUMNS: tuple[Column, ...] = (
+    ("session_id", "VARCHAR"),
+    ("seq", "BIGINT"),
+    ("ts", "TIMESTAMP"),
+    ("tool_name", "VARCHAR"),
+    ("input_summary", "VARCHAR"),
+    ("permission_mode", "VARCHAR"),
+    ("cwd", "VARCHAR"),
+    ("next_tool_name", "VARCHAR"),
+    ("next_input_summary", "VARCHAR"),
+    ("next_outcome", "VARCHAR"),
+    ("next_ts", "TIMESTAMP"),
+    ("gap_seconds", "DOUBLE"),
+    ("followup_kind", "VARCHAR"),
+)
+
+RECALL_FOLLOWUPS_COLUMNS: tuple[Column, ...] = RECALL_CALL_TABLE
+
+VIEW_COLUMNS: dict[str, tuple[Column, ...]] = {
+    DENIAL_FOLLOWUPS_VIEW: DENIAL_FOLLOWUPS_COLUMNS,
+    RECALL_FOLLOWUPS_VIEW: RECALL_FOLLOWUPS_COLUMNS,
+}
 
 
 def insert_sql(table: str) -> str:
