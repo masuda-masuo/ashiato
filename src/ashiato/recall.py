@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
 
+from ashiato.cursor import CursorToolCall, ParsedCursorFile
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, ParsedFile
 
@@ -34,9 +35,17 @@ from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, ParsedFile
 CLAUDE_RECALL_TOOL = "mcp__kaiba__recall"
 OPENCODE_RECALL_TOOL = "kaiba_recall"
 
+#: Cursor calls every MCP tool through one block name, ``CallMcpTool``; which
+#: MCP tool it is comes from ``input.server`` / ``input.toolName`` instead of
+#: from the block name itself, unlike the other two sources.
+CURSOR_MCP_TOOL_NAME = "CallMcpTool"
+CURSOR_RECALL_SERVER = "kaiba"
+CURSOR_RECALL_TOOL = "recall"
+
 #: Values ``recall_calls.source`` takes.
 SOURCE_CLAUDE_CODE = "claude_code"
 SOURCE_OPENCODE = "opencode"
+SOURCE_CURSOR = "cursor"
 
 #: How much of a session's post-recall activity is scanned for "was this
 #: used" evidence: whichever bound is hit first.  Generous on purpose --
@@ -275,6 +284,135 @@ def extract_from_opencode(
                 call_id=call.call_id,
                 query=query,
                 output=output or None,
+                output_truncated=output_truncated,
+                followup_text=followup_text or None,
+                followup_truncated=followup_truncated,
+                overlap_tokens=json.dumps(overlap_tokens, ensure_ascii=False),
+                overlap_count=overlap_count,
+            )
+        )
+    return rows
+
+
+def _is_cursor_recall(call: CursorToolCall) -> bool:
+    if call.name != CURSOR_MCP_TOOL_NAME or not isinstance(call.input, dict):
+        return False
+    return (
+        call.input.get("server") == CURSOR_RECALL_SERVER
+        and call.input.get("toolName") == CURSOR_RECALL_TOOL
+    )
+
+
+def _cursor_activity_text(call: CursorToolCall, *, result_text_limit: int) -> str | None:
+    """Render one non-text ``tool_use`` block as one activity item.
+
+    A ``CallMcpTool`` block (any MCP server, not just kaiba's recall) is
+    rendered as ``server/toolName`` plus its compact ``arguments`` -- the
+    ``description`` field and the raw ``CallMcpTool`` wrapper are noise for
+    "was this used" evidence.  Any other tool is rendered as its own name
+    plus its compact ``input``.
+    """
+    if call.name == CURSOR_MCP_TOOL_NAME and isinstance(call.input, dict):
+        server = call.input.get("server")
+        tool_name = call.input.get("toolName")
+        arguments = call.input.get("arguments")
+        label = "/".join(part for part in (server, tool_name) if isinstance(part, str))
+        args_json = (
+            json.dumps(arguments, ensure_ascii=False, separators=(",", ":")) if arguments else ""
+        )
+        text = f"{label or call.name} {args_json}".strip()
+    else:
+        input_json = (
+            json.dumps(call.input, ensure_ascii=False, separators=(",", ":")) if call.input else ""
+        )
+        text = f"{call.name or ''} {input_json}".strip()
+    if not text:
+        return None
+    return text[:result_text_limit]
+
+
+def extract_from_cursor(
+    parsed: ParsedCursorFile,
+    kaiba_recalls_by_query: Mapping[str, Sequence[tuple[datetime | None, str]]] | None = None,
+    *,
+    result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
+) -> list[RecallCall]:
+    """Kaiba recall calls in one Cursor transcript, paired with followup evidence.
+
+    Unlike the other two sources, a Cursor transcript never carries the
+    recall's own result: there are no ``tool_result`` blocks at all.  The
+    output and timestamp instead come from *kaiba_recalls_by_query*, one
+    entry per ``(agent='cursor', query)`` row of kaiba's own ``recalls``
+    ledger, ordered by ``created_at`` -- see :func:`ashiato.build.build` for
+    how that mapping is assembled from the sqlite ledger.  The n-th
+    occurrence of a query pairs with the n-th row for that query; a query
+    with no mapping entry, or with fewer rows than occurrences, leaves
+    ``output`` / ``ts`` NULL for the unpaired occurrences rather than
+    failing -- the row still exists so the population count is right.
+
+    Occurrences are counted **per file**: this call owns a fresh counter,
+    never shared with any other transcript. If two different transcript
+    files issue the same query text, both independently compute occurrence
+    index 0 and pair with the same ledger row -- a documented limitation,
+    not a bug to engineer around, since kaiba's ``recalls`` ledger has no
+    notion of which transcript file made a call.
+
+    Activity mirrors the other extractors: every assistant text chunk and
+    every other completed-shape tool call (rendered by
+    :func:`_cursor_activity_text`), grouped by session and ordered by line
+    number.  A recall call sharing its own transcript line with another tool
+    call (the same-line MCP call in the brief's example) is excluded from
+    both prefix and suffix by :func:`_split`'s "strictly later line" rule,
+    exactly as for the other two sources -- no special-casing needed here.
+    """
+    kaiba_recalls_by_query = kaiba_recalls_by_query or {}
+    occurrence_counts: dict[str, int] = {}
+
+    activity: dict[str | None, list[_Activity]] = {}
+    for chunk in parsed.text_chunks:
+        activity.setdefault(chunk.session_id, []).append(_Activity(chunk.seq, chunk.text))
+    for call in parsed.tool_calls:
+        text = _cursor_activity_text(call, result_text_limit=result_text_limit)
+        if text:
+            activity.setdefault(call.session_id, []).append(_Activity(call.seq, text))
+    for items in activity.values():
+        items.sort(key=lambda item: item.seq)
+
+    rows: list[RecallCall] = []
+    for call in parsed.tool_calls:
+        if not _is_cursor_recall(call):
+            continue
+        arguments = call.input.get("arguments") if isinstance(call.input, dict) else None
+        query = arguments.get("query") if isinstance(arguments, dict) else None
+        query = query if isinstance(query, str) else None
+
+        ts = None
+        raw_output: str | None = None
+        if query is not None:
+            candidates = kaiba_recalls_by_query.get(query, [])
+            index = occurrence_counts.get(query, 0)
+            occurrence_counts[query] = index + 1
+            if index < len(candidates):
+                ts, raw_output = candidates[index]
+
+        output = raw_output[:result_text_limit] if raw_output else None
+        output_truncated = bool(raw_output) and len(raw_output) > result_text_limit
+
+        prefix, suffix = _split(activity.get(call.session_id, []), call.seq)
+        followup_text, followup_truncated = _bounded_suffix(suffix)
+        overlap_tokens, overlap_count = _overlap(output, prefix, suffix)
+
+        rows.append(
+            RecallCall(
+                recall_id=f"{call.file_path}:{call.call_id}",
+                session_id=call.session_id,
+                file_path=call.file_path,
+                source=SOURCE_CURSOR,
+                seq=call.seq,
+                ts=ts,
+                call_id=call.call_id,
+                query=query,
+                output=output,
                 output_truncated=output_truncated,
                 followup_text=followup_text or None,
                 followup_truncated=followup_truncated,

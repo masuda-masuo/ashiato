@@ -1,0 +1,6 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Sunday, Aug 23, 2026, 2:58 AM (UTC+9)</timestamp>\n<user_query>\nWhat does the recall say about denial_pattern_x9?\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Let me check kaiba first."},{"type":"tool_use","name":"CallMcpTool","input":{"server":"kaiba","toolName":"recall","arguments":{"query":"denial_pattern_x9","top_k":10},"description":"kaiba recall"}},{"type":"tool_use","name":"CallMcpTool","input":{"server":"other","toolName":"lookup","arguments":{"id":42},"description":"other mcp"}}]}}
+{"status":"ok","type":"tool_status"}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Applying denial_pattern_x9 as documented."},{"type":"tool_use","name":"Read","input":{"path":"/home/user/project/notes.md"}}]}}
+{"type":"turn_ended","status":"success"}
+not valid json at all {{{
