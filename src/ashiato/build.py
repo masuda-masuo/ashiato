@@ -66,8 +66,11 @@ from ashiato.schema import (
     DENIAL_FOLLOWUPS_SQL,
     FORMAT_VERSION,
     INFO_TABLES,
+    META_CURSOR_SOURCES_KEY,
     META_FORMAT_KEY,
+    META_OPENCODE_SOURCES_KEY,
     META_SCHEMA_SQL,
+    META_SOURCES_KEY,
     META_TABLE,
     RECALL_FOLLOWUPS_SQL,
     REQUIRED_VIEWS,
@@ -126,6 +129,14 @@ class DatabaseInfo:
     table_counts: dict[str, int]
     started_at: datetime | None
     ended_at: datetime | None
+    #: Ingested roots, per kind.  Each is a list of (root_path, file_count) pairs.
+    #: ``None`` means the database was built before roots were recorded.
+    sources: list[tuple[str, int]] | None = None
+    opencode_sources: list[tuple[str, int]] | None = None
+    cursor_sources: list[tuple[str, int]] | None = None
+    #: Number of files under the recorded roots that are not in source_files,
+    #: or have a different size/mtime.  ``None`` when roots are unknown.
+    freshness_gap: int | None = None
 
 
 def default_db_path() -> Path:
@@ -253,8 +264,14 @@ def assert_readable(connection: duckdb.DuckDBPyConnection) -> None:
             )
 
 
-def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
-    """Create the tables, format marker and views on a fresh database.
+def create_schema(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    sources: Sequence[str | Path] | None = None,
+    opencode_sources: Sequence[str | Path] | None = None,
+    cursor_sources: Sequence[str | Path] | None = None,
+) -> None:
+    """Create the tables, format marker, views, and recorded roots on a fresh database.
 
     An existing database that already has ashiato's tables must be current in
     columns and format marker before anything is created: ``CREATE TABLE IF
@@ -262,13 +279,22 @@ def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
     as current.  A database with no ashiato tables at all is a fresh one and
     is initialised with the marker.
 
-    The DDL and the marker stamp run as one transaction, and so do the views
-    on top of them: DuckDB DDL is transactional, so a crash at any point in
-    here rolls the whole lot back and the file stays empty -- exactly what a
-    fresh ``build`` expects.  Without the transaction, a crash between the
-    ``CREATE TABLE`` statements and the marker insert would leave ashiato
-    tables with no marker, and the next build would refuse an empty, perfectly
-    rebuildable file.
+    The DDL, the marker stamp, and the recorded roots run as one transaction,
+    and so do the views on top of them: DuckDB DDL is transactional, so a crash
+    at any point in here rolls the whole lot back and the file stays empty --
+    exactly what a fresh ``build`` expects.  Without the transaction, a crash
+    between the ``CREATE TABLE`` statements and the marker insert would leave
+    ashiato tables with no marker, and the next build would refuse an empty,
+    perfectly rebuildable file.
+
+    When *sources*, *opencode_sources*, or *cursor_sources* are provided, they
+    are resolved to absolute paths and stored in :data:`META_TABLE` as JSON
+    arrays under :data:`META_SOURCES_KEY`, :data:`META_OPENCODE_SOURCES_KEY`,
+    and :data:`META_CURSOR_SOURCES_KEY`.  A root that matched no files is still
+    recorded -- it explains an absence.  When any sequence is ``None`` (the
+    default), the corresponding key is not written, preserving whatever value
+    may already be in the table (for callers that only create the schema
+    without a full build).
     """
     existing = {
         row[0]
@@ -288,12 +314,122 @@ def create_schema(connection: duckdb.DuckDBPyConnection) -> None:
             f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
             [META_FORMAT_KEY, str(FORMAT_VERSION)],
         )
+        if sources is not None:
+            resolved = [str(Path(s).expanduser().resolve()) for s in sources]
+            connection.execute(
+                f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
+                [META_SOURCES_KEY, json.dumps(resolved)],
+            )
+        if opencode_sources is not None:
+            resolved = [str(Path(s).expanduser().resolve()) for s in opencode_sources]
+            connection.execute(
+                f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
+                [META_OPENCODE_SOURCES_KEY, json.dumps(resolved)],
+            )
+        if cursor_sources is not None:
+            resolved = [str(Path(s).expanduser().resolve()) for s in cursor_sources]
+            connection.execute(
+                f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
+                [META_CURSOR_SOURCES_KEY, json.dumps(resolved)],
+            )
         connection.execute(DENIAL_FOLLOWUPS_SQL)
         connection.execute(RECALL_FOLLOWUPS_SQL)
         connection.execute("COMMIT")
     except duckdb.Error:
         connection.execute("ROLLBACK")
         raise
+
+
+def _read_meta_json_list(connection: duckdb.DuckDBPyConnection, key: str) -> list[str] | None:
+    """Read a JSON array from META_TABLE, or None if the key is absent."""
+    tables = {
+        row[0]
+        for row in connection.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    }
+    if META_TABLE not in tables:
+        return None
+    row = connection.execute(
+        f'SELECT value FROM "{META_TABLE}" WHERE key = ?', [key]
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+
+
+def _count_files_per_root(
+    known: dict[str, tuple[int, float]], roots: list[str]
+) -> list[tuple[str, int]]:
+    """Count how many files from source_files fall under each root.
+
+    A file is attributed to the *most specific* (longest) root that contains it.
+    This makes the per-root counts deterministic regardless of the order in
+    which roots are passed. Roots that match no files still appear with count 0.
+    """
+    # Sort roots by length (descending) so the most specific root is checked first.
+    # We keep the original order for equal-length roots to preserve stability.
+    sorted_roots = sorted(roots, key=len, reverse=True)
+    counts: dict[str, int] = {root: 0 for root in roots}
+    for file_path in known:
+        file_p = Path(file_path)
+        for root in sorted_roots:
+            try:
+                file_p.relative_to(root)
+                counts[root] += 1
+                break  # Attributed to the most specific containing root
+            except ValueError:
+                continue
+    return [(root, counts[root]) for root in roots]
+
+
+def _compute_freshness_gap(
+    connection: duckdb.DuckDBPyConnection,
+    sources: list[str],
+    opencode_sources: list[str],
+    cursor_sources: list[str],
+) -> int:
+    """Count files under roots that are not in source_files or have different size/mtime.
+
+    This mirrors the condition in _is_unchanged: a file is "fresh" if it exists in
+    source_files with the same size and mtime (within tolerance). The gap is the
+    number of files that would be re-read by build right now.
+    """
+    known = _known_sources(connection)
+    gap = 0
+
+    # Check Claude Code sources (*.jsonl)
+    for file_path in _iter_sources(sources, "*.jsonl")[0]:
+        key = str(file_path.resolve())
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if not _is_unchanged(known, key, stat):
+            gap += 1
+
+    # Check opencode sources (*.ndjson)
+    for file_path in _iter_sources(opencode_sources, "*.ndjson")[0]:
+        key = str(file_path.resolve())
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if not _is_unchanged(known, key, stat):
+            gap += 1
+
+    # Check Cursor sources (*.jsonl)
+    for file_path in _iter_sources(cursor_sources, "*.jsonl")[0]:
+        key = str(file_path.resolve())
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if not _is_unchanged(known, key, stat):
+            gap += 1
+
+    return gap
 
 
 def _iter_sources(sources: Sequence[str | Path], pattern: str) -> tuple[list[Path], list[str]]:
@@ -655,7 +791,12 @@ def build(
 
     connection = connect(db_path)
     try:
-        create_schema(connection)
+        create_schema(
+            connection,
+            sources=sources,
+            opencode_sources=opencode_sources,
+            cursor_sources=cursor_sources,
+        )
         known = _known_sources(connection)
         built_at = datetime.now(UTC).replace(tzinfo=None)
 
@@ -818,13 +959,21 @@ def build(
 
 
 def database_info(db_path: str | Path) -> DatabaseInfo:
-    """Row counts per table and the time window the transcripts cover.
+    """Row counts per table, the time window, ingested roots, and freshness.
 
     The same read gate as ``sql`` and ``denials``: a database whose schema or
     format marker this version cannot vouch for is refused, so ``info`` does
     not report a stale database as if it were current.  Counts are reported
     for :data:`ashiato.schema.INFO_TABLES`, not every table -- see that
     constant for why ``recall_calls`` is left out of this particular report.
+
+    Roots are read from :data:`META_TABLE`.  When absent (database built before
+    this feature), they are reported as ``None`` rather than empty lists, so
+    the caller can distinguish "no roots were used" from "roots were not
+    recorded".  The freshness gap is the number of files under the recorded
+    roots that are not in ``source_files`` or have a different size/mtime --
+    the same condition ``build`` uses to decide what to re-read.  When roots
+    are unknown, the gap is ``None``.
     """
     path = Path(db_path).expanduser()
     connection = connect(path, read_only=True)
@@ -838,8 +987,45 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
             "SELECT min(started_at), max(ended_at) FROM sessions"
         ).fetchone()
         started_at, ended_at = window if window else (None, None)
+
+        # Read recorded roots
+        sources = _read_meta_json_list(connection, META_SOURCES_KEY)
+        opencode_sources = _read_meta_json_list(connection, META_OPENCODE_SOURCES_KEY)
+        cursor_sources = _read_meta_json_list(connection, META_CURSOR_SOURCES_KEY)
+
+        # If no roots recorded, return early with None for roots and gap
+        if sources is None and opencode_sources is None and cursor_sources is None:
+            return DatabaseInfo(
+                db_path=str(path),
+                table_counts=counts,
+                started_at=started_at,
+                ended_at=ended_at,
+                sources=None,
+                opencode_sources=None,
+                cursor_sources=None,
+                freshness_gap=None,
+            )
+
+        # Count files per root from source_files
+        known = _known_sources(connection)
+        source_counts = _count_files_per_root(known, sources or [])
+        opencode_counts = _count_files_per_root(known, opencode_sources or [])
+        cursor_counts = _count_files_per_root(known, cursor_sources or [])
+
+        # Compute freshness gap
+        freshness_gap = _compute_freshness_gap(
+            connection, sources or [], opencode_sources or [], cursor_sources or []
+        )
+
+        return DatabaseInfo(
+            db_path=str(path),
+            table_counts=counts,
+            started_at=started_at,
+            ended_at=ended_at,
+            sources=source_counts,
+            opencode_sources=opencode_counts,
+            cursor_sources=cursor_counts,
+            freshness_gap=freshness_gap,
+        )
     finally:
         connection.close()
-    return DatabaseInfo(
-        db_path=str(path), table_counts=counts, started_at=started_at, ended_at=ended_at
-    )
