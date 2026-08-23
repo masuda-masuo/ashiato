@@ -28,7 +28,13 @@ from ashiato.build import (
 )
 from ashiato.opencode import OpenCodeToolCall, ParsedOpenCodeFile
 from ashiato.parser import EVENT_COLUMNS, SESSION_COLUMNS, TOOL_CALL_COLUMNS
-from ashiato.recall import RECALL_CALL_COLUMNS, extract_from_opencode
+from ashiato.recall import (
+    RECALL_CALL_COLUMNS,
+    _Activity,
+    _is_distinctive,
+    _overlap,
+    extract_from_opencode,
+)
 from ashiato.schema import (
     FOLLOWUP_KINDS,
     FORMAT_VERSION,
@@ -1357,6 +1363,95 @@ def test_opencode_build_is_incremental(tmp_path: Path):
         assert scalar(connection, "SELECT count(*) FROM recall_calls") == 2
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------- overlap distinctive-shape rule
+
+
+def test_is_distinctive_classifies_tokens_by_shape():
+    # Plain English words: no shape char, no inner capital -> not distinctive.
+    assert not _is_distinctive("different")
+    assert not _is_distinctive("green")
+    assert not _is_distinctive("PASS")
+    assert not _is_distinctive("bytes")
+    # Bare ISO date / date-hour prefix -> excluded even though it has digits/dashes.
+    assert not _is_distinctive("2026-08-16")
+    assert not _is_distinctive("2026-08-16T04")
+    assert not _is_distinctive("2026-08-16T04:15Z")
+    # All-digit token -> excluded.
+    assert not _is_distinctive("2101")
+    # Shape char present -> distinctive.
+    assert _is_distinctive("741d50b")
+    assert _is_distinctive("#852")
+    assert _is_distinctive("21ms")
+    assert _is_distinctive("src/ashiato/recall.py")
+    assert _is_distinctive("kusabi#274")
+    assert _is_distinctive("--container")
+    assert _is_distinctive("chain-msvthdq26fdc")
+    # camelCase / PascalCase inner capital -> distinctive even with no shape char.
+    assert _is_distinctive("deriveDisposition")
+    assert _is_distinctive("FastMCP")
+
+
+def test_overlap_excludes_ordinary_words_dates_and_all_digits():
+    # Recall output and the followup both contain only ordinary English and
+    # a bare date: nothing counts.
+    output = "The green test was different after seeing 2026-08-16 and 2026-08-16T04."
+    prefix: list[_Activity] = []
+    suffix = [_Activity(2, "The green test was different after seeing 2026-08-16T04 later.")]
+    tokens, count = _overlap(output, prefix, suffix)
+    assert count == 0
+    assert tokens == []
+    # When the shared token is all digits it is also excluded.
+    output2 = "Count was 2101 this time."
+    suffix2 = [_Activity(2, "The count 2101 appeared again.")]
+    assert _overlap(output2, prefix, suffix2)[1] == 0
+
+
+def test_overlap_counts_distinctive_shared_tokens():
+    output = (
+        "Use deriveDisposition with src/ashiato/recall.py and kusabi#274, "
+        "--container and hash 741d50b here"
+    )
+    prefix: list[_Activity] = []
+    suffix = [
+        _Activity(
+            2,
+            "Then deriveDisposition ran src/ashiato/recall.py via kusabi#274 with "
+            "--container; hash 741d50b confirmed",
+        )
+    ]
+    tokens, count = _overlap(output, prefix, suffix)
+    assert count == 5
+    assert set(tokens) == {
+        "deriveDisposition",
+        "src/ashiato/recall.py",
+        "kusabi#274",
+        "--container",
+        "741d50b",
+    }
+
+
+def test_overlap_prefix_still_excludes_distinctive_token():
+    # A distinctive token the session already used before the recall is removed.
+    output = "Reuse deriveDisposition here."
+    prefix = [_Activity(1, "Earlier we set deriveDisposition to pending.")]
+    suffix = [_Activity(2, "Now deriveDisposition is applied as recalled.")]
+    tokens, count = _overlap(output, prefix, suffix)
+    assert count == 0
+    assert tokens == []
+
+
+def test_overlap_mixed_tokens_counts_only_distinctive():
+    # Same output/suffix pair: ordinary words ignored, distinctive ones counted.
+    output = "The different test used deriveDisposition and a date 2026-08-16."
+    prefix: list[_Activity] = []
+    suffix = [
+        _Activity(2, "We ran deriveDisposition; the different test passed on 2026-08-16.")
+    ]
+    tokens, count = _overlap(output, prefix, suffix)
+    assert count == 1
+    assert tokens == ["deriveDisposition"]
 
 
 def test_a_mixed_build_ingests_both_formats_without_disturbing_the_other(tmp_path: Path):
