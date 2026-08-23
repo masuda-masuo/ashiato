@@ -11,14 +11,19 @@ build.  Writing a batch as newline-delimited JSON and reading it back is ~140x
 faster.  Small batches still go the plain route, and any failure of the fast
 path falls back to it, so the slow way remains the safety net.
 
-Two source formats are supported: Claude Code transcripts (``*.jsonl``,
-``sources`` / ``--source``) and opencode job event streams (``*.ndjson``,
-``opencode_sources`` / ``--opencode-source``).  They are two separate,
+Three source formats are supported: Claude Code transcripts (``*.jsonl``,
+``sources`` / ``--source``), opencode job event streams (``*.ndjson``,
+``opencode_sources`` / ``--opencode-source``), and Cursor agent transcripts
+(``*.jsonl``, ``cursor_sources`` / ``--cursor-source``).  They are separate,
 explicit source lists rather than one list ashiato sniffs file-by-file: the
-two live in unrelated directory trees on a real machine, and an explicit
-second list means a Claude Code projects directory and an opencode jobs
-directory can share a build without either dragging files into the other's
-parser by mistake.
+three live in unrelated directory trees on a real machine, and explicit
+lists mean a Claude Code projects directory, an opencode jobs directory, and
+a Cursor agent-transcripts directory can share a build without any of them
+dragging files into another's parser by mistake -- true even for Claude Code
+and Cursor, which share the same ``*.jsonl`` extension.  A Cursor recall
+call also needs kaiba's own ``recalls`` ledger (``kaiba_db_path`` /
+``--kaiba-db``) to fill in its output and timestamp; see
+:func:`ashiato.recall.extract_from_cursor` for why.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -35,6 +41,8 @@ from pathlib import Path
 
 import duckdb
 
+from ashiato.cursor import ParsedCursorFile
+from ashiato.cursor import parse_file as parse_cursor_file
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.opencode import parse_file as parse_opencode_file
 from ashiato.parser import (
@@ -50,8 +58,10 @@ from ashiato.recall import (
     RECALL_CALL_COLUMNS,
     RecallCall,
     extract_from_claude,
+    extract_from_cursor,
     extract_from_opencode,
 )
+from ashiato.salvage import default_kaiba_db_path, open_kaiba, parse_kaiba_ts
 from ashiato.schema import (
     DENIAL_FOLLOWUPS_SQL,
     FORMAT_VERSION,
@@ -102,6 +112,12 @@ class BuildResult:
     missing_sources: list[str] = field(default_factory=list)
     unreadable_files: list[str] = field(default_factory=list)
     failed_files: list[str] = field(default_factory=list)
+    #: The kaiba db path, when Cursor sources were given but the db at that
+    #: path could not be opened (missing, corrupt, or missing ``recalls``) --
+    #: ``None`` when no Cursor sources were given, or the db opened fine.
+    #: Rows are still produced with NULL output/ts; this is just so the CLI
+    #: can tell the caller why.
+    kaiba_db_unavailable: str | None = None
 
 
 @dataclass
@@ -319,6 +335,17 @@ def iter_opencode_sources(sources: Sequence[str | Path]) -> tuple[list[Path], li
     return _iter_sources(sources, "*.ndjson")
 
 
+def iter_cursor_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
+    """(Cursor agent-transcript files, sources that do not exist).
+
+    Directories are searched recursively for ``*.jsonl`` -- the same
+    extension Claude Code transcripts use, but Cursor keeps its own directory
+    tree (``~/.cursor/projects/<project>/agent-transcripts/<id>/<id>.jsonl``),
+    so the two source lists never see each other's files in practice.
+    """
+    return _iter_sources(sources, "*.jsonl")
+
+
 def _content_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -466,6 +493,83 @@ def _insert_opencode_parsed(
     )
 
 
+def _insert_cursor_parsed(
+    connection: duckdb.DuckDBPyConnection,
+    parsed: ParsedCursorFile,
+    recall_rows: Sequence[RecallCall],
+    *,
+    stat: os.stat_result,
+    content_hash: str,
+    built_at: datetime,
+    scratch: Path | None,
+) -> None:
+    """The Cursor counterpart of :func:`_insert_parsed` / :func:`_insert_opencode_parsed`.
+
+    Same scope as opencode: only ``recall_calls`` and ``source_files`` are
+    touched, never ``sessions`` / ``events`` / ``tool_calls``.
+    """
+    _insert_rows(
+        connection,
+        "recall_calls",
+        [_recall_call_row(row) for row in recall_rows],
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "source_files",
+        [
+            (
+                parsed.file_path,
+                stat.st_size,
+                stat.st_mtime,
+                content_hash,
+                0,
+                0,
+                parsed.n_parse_errors,
+                built_at,
+            )
+        ],
+        scratch=scratch,
+    )
+
+
+def _fetch_cursor_kaiba_recalls(
+    connection: sqlite3.Connection,
+) -> dict[str, list[tuple[datetime | None, str]]]:
+    """query -> [(created_at, output), ...] for every ``agent = 'cursor'`` recall row.
+
+    ``output`` is the joined ``content`` of every ``matches[*].id`` a row
+    names, in ``matches`` order -- what kaiba actually returned.  A
+    ``matches`` id with no matching ``conclusions`` row (retired and purged,
+    or simply absent) contributes nothing rather than failing the row.  Rows
+    are ordered by ``created_at`` so the n-th occurrence of a query in a
+    transcript can pair with the n-th row here, per :func:`ashiato.recall.extract_from_cursor`.
+    """
+    conclusions: dict[object, str] = dict(
+        connection.execute("SELECT id, content FROM conclusions").fetchall()
+    )
+    by_query: dict[str, list[tuple[datetime | None, str]]] = {}
+    rows = connection.execute(
+        "SELECT created_at, query, matches FROM recalls WHERE agent = 'cursor' ORDER BY created_at"
+    ).fetchall()
+    for created_at, query, matches_json in rows:
+        if not isinstance(query, str):
+            continue
+        try:
+            matches = json.loads(matches_json) if matches_json else []
+        except ValueError:
+            matches = []
+        if not isinstance(matches, list):
+            matches = []
+        pieces = [
+            conclusions[match["id"]]
+            for match in matches
+            if isinstance(match, dict) and match.get("id") in conclusions
+        ]
+        by_query.setdefault(query, []).append((parse_kaiba_ts(created_at), "\n".join(pieces)))
+    return by_query
+
+
 def _store_file(
     connection: duckdb.DuckDBPyConnection,
     *,
@@ -509,15 +613,45 @@ def build(
     db_path: str | Path,
     *,
     opencode_sources: Sequence[str | Path] = (),
+    cursor_sources: Sequence[str | Path] = (),
+    kaiba_db_path: str | Path | None = None,
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
 ) -> BuildResult:
-    """Parse every transcript under *sources* / *opencode_sources* into *db_path*."""
+    """Parse every transcript under *sources* / *opencode_sources* / *cursor_sources*.
+
+    *kaiba_db_path* (default :func:`ashiato.salvage.default_kaiba_db_path`) is
+    only ever opened when *cursor_sources* actually resolves to at least one
+    file: a Cursor recall call's output/timestamp is reconstructed by joining
+    its query against kaiba's own ``recalls`` ledger (see
+    :func:`ashiato.recall.extract_from_cursor`), and a build with no Cursor
+    sources has no such join to perform.  A missing or unreadable kaiba db
+    does not fail the build -- rows are produced with NULL output/ts, and
+    :attr:`BuildResult.kaiba_db_unavailable` records the path so the CLI can
+    say so.
+    """
     result = BuildResult(db_path=str(Path(db_path).expanduser()))
     claude_files, claude_missing = iter_transcripts(sources)
     opencode_files, opencode_missing = iter_opencode_sources(opencode_sources)
-    result.missing_sources = claude_missing + opencode_missing
-    result.n_files = len(claude_files) + len(opencode_files)
+    cursor_files, cursor_missing = iter_cursor_sources(cursor_sources)
+    result.missing_sources = claude_missing + opencode_missing + cursor_missing
+    result.n_files = len(claude_files) + len(opencode_files) + len(cursor_files)
+
+    kaiba_recalls_by_query: dict[str, list[tuple[datetime | None, str]]] = {}
+    if cursor_files:
+        resolved_kaiba_path = (
+            Path(kaiba_db_path).expanduser()
+            if kaiba_db_path is not None
+            else default_kaiba_db_path()
+        )
+        kaiba_connection = open_kaiba(resolved_kaiba_path, probe_table="recalls")
+        if kaiba_connection is None:
+            result.kaiba_db_unavailable = str(resolved_kaiba_path)
+        else:
+            try:
+                kaiba_recalls_by_query = _fetch_cursor_kaiba_recalls(kaiba_connection)
+            finally:
+                kaiba_connection.close()
 
     connection = connect(db_path)
     try:
@@ -628,6 +762,56 @@ def build(
                 result.n_processed += 1
                 result.n_recall_calls += len(recall_rows)
                 result.n_parse_errors += parsed_oc.n_parse_errors
+
+            for path in cursor_files:
+                key = str(path.resolve())
+                try:
+                    stat = path.stat()
+                except OSError:
+                    result.unreadable_files.append(key)
+                    continue
+                if _is_unchanged(known, key, stat):
+                    result.n_skipped += 1
+                    continue
+
+                try:
+                    parsed_cur = parse_cursor_file(path)
+                    recall_rows = extract_from_cursor(
+                        parsed_cur,
+                        kaiba_recalls_by_query,
+                        result_text_limit=result_text_limit,
+                    )
+                    content_hash = _content_hash(path)
+                except OSError:
+                    result.unreadable_files.append(key)
+                    continue
+
+                stored = _store_file(
+                    connection,
+                    key=key,
+                    replace=key in known,
+                    scratch=scratch,
+                    insert=lambda attempt,
+                    parsed_cur=parsed_cur,
+                    recall_rows=recall_rows,
+                    stat=stat,
+                    content_hash=content_hash: _insert_cursor_parsed(
+                        connection,
+                        parsed_cur,
+                        recall_rows,
+                        stat=stat,
+                        content_hash=content_hash,
+                        built_at=built_at,
+                        scratch=attempt,
+                    ),
+                    result=result,
+                )
+                if not stored:
+                    continue
+
+                result.n_processed += 1
+                result.n_recall_calls += len(recall_rows)
+                result.n_parse_errors += parsed_cur.n_parse_errors
     finally:
         connection.close()
     return result

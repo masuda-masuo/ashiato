@@ -94,12 +94,19 @@ def default_kaiba_db_path() -> Path:
     return Path.home() / ".kaiba" / "kaiba.db"
 
 
-def open_kaiba(path: Path) -> sqlite3.Connection | None:
-    """Open the kaiba actions ledger read-only, or ``None`` when it cannot be used.
+def open_kaiba(path: Path, *, probe_table: str = "actions") -> sqlite3.Connection | None:
+    """Open a kaiba sqlite db read-only, or ``None`` when it cannot be used.
 
     Absence and corruption are both treated as "no coverage data available"
-    rather than errors: the caller falls back to transcript-only nomination
-    and says so, instead of failing the whole command.
+    rather than errors: the caller falls back to a degraded mode and says so,
+    instead of failing the whole command.  *probe_table* is the table this
+    caller actually needs -- ``salvage`` reads ``actions``, the Cursor recall
+    join in :mod:`ashiato.build` reads ``recalls`` -- so a kaiba db missing
+    the table a given caller depends on is treated the same as one missing
+    entirely, rather than handed back as unusable in a way the caller does
+    not find out about until its first query fails.  Always a literal from
+    calling code, never a value from the CLI, so there is no injection risk
+    in composing it into SQL.
     """
     if not path.exists():
         return None
@@ -109,14 +116,14 @@ def open_kaiba(path: Path) -> sqlite3.Connection | None:
     except sqlite3.Error:
         return None
     try:
-        connection.execute("SELECT 1 FROM actions LIMIT 1")
+        connection.execute(f"SELECT 1 FROM {probe_table} LIMIT 1")
     except sqlite3.Error:
         connection.close()
         return None
     return connection
 
 
-def _parse_kaiba_ts(value: str | None) -> datetime | None:
+def parse_kaiba_ts(value: str | None) -> datetime | None:
     """ISO-8601 kaiba timestamp to a naive UTC datetime, matching DuckDB's ``ts``."""
     if not value:
         return None
@@ -135,7 +142,7 @@ def fetch_kaiba_action_timestamps(connection: sqlite3.Connection) -> list[dateti
     timestamps: list[datetime] = []
     for created_at, done_at in rows:
         for value in (created_at, done_at):
-            parsed = _parse_kaiba_ts(value)
+            parsed = parse_kaiba_ts(value)
             if parsed is not None:
                 timestamps.append(parsed)
     return timestamps

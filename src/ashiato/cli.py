@@ -64,6 +64,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="directory searched recursively for opencode *.ndjson job event streams (repeatable)",
     )
+    build_parser.add_argument(
+        "--cursor-source",
+        action="append",
+        dest="cursor_source",
+        metavar="DIR",
+        help="directory searched recursively for Cursor agent-transcript *.jsonl (repeatable)",
+    )
+    build_parser.add_argument(
+        "--kaiba-db",
+        metavar="PATH",
+        help="kaiba sqlite db used to fill in Cursor recall output/ts (default ~/.kaiba/kaiba.db)",
+    )
     build_parser.add_argument("--db", metavar="PATH", help="database path")
 
     sql_parser = subparsers.add_parser("sql", help="run a query against the database")
@@ -302,9 +314,17 @@ def _run_query(
 def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     sources = args.source or [str(DEFAULT_SOURCE)]
     opencode_sources = args.opencode_source or []
+    cursor_sources = args.cursor_source or []
+    kaiba_db_path = Path(args.kaiba_db).expanduser() if args.kaiba_db else None
     db_path = _resolve_db(args.db)
     try:
-        result = build(sources, db_path, opencode_sources=opencode_sources)
+        result = build(
+            sources,
+            db_path,
+            opencode_sources=opencode_sources,
+            cursor_sources=cursor_sources,
+            kaiba_db_path=kaiba_db_path,
+        )
     except SchemaOutOfDate as error:
         print(f"error: {error}", file=err)
         return 1
@@ -315,6 +335,12 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
         print(f"warning: could not read: {path}", file=err)
     for path in result.failed_files:
         print(f"warning: could not store: {path}", file=err)
+    if result.kaiba_db_unavailable:
+        print(
+            f"notice: no kaiba db at {result.kaiba_db_unavailable} -- "
+            "Cursor recall rows have NULL output/ts",
+            file=err,
+        )
 
     print(f"database: {result.db_path}", file=out)
     print(

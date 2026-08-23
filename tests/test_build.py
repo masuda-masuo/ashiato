@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -23,9 +24,11 @@ from ashiato.build import (
     create_schema,
     database_info,
     default_db_path,
+    iter_cursor_sources,
     iter_opencode_sources,
     iter_transcripts,
 )
+from ashiato.cli import main
 from ashiato.opencode import OpenCodeToolCall, ParsedOpenCodeFile
 from ashiato.parser import EVENT_COLUMNS, SESSION_COLUMNS, TOOL_CALL_COLUMNS
 from ashiato.recall import (
@@ -1528,3 +1531,305 @@ def test_recalls_view_missing_alone_also_names_the_fix(tmp_path: Path):
             assert_readable(connection)
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------- recall_calls (cursor)
+
+CURSOR_TRANSCRIPT_LINES = [
+    {
+        "role": "user",
+        "message": {
+            "content": [
+                {"type": "text", "text": "<user_query>\nWhat about denial_pattern_x9?\n</user_query>"}
+            ]
+        },
+    },
+    {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "Let me check kaiba first."},
+                {
+                    "type": "tool_use",
+                    "name": "CallMcpTool",
+                    "input": {
+                        "server": "kaiba",
+                        "toolName": "recall",
+                        "arguments": {"query": "denial_pattern_x9", "top_k": 10},
+                    },
+                },
+            ]
+        },
+    },
+    {"type": "turn_ended", "status": "success"},
+]
+
+
+def _write_cursor_transcript(path: Path, lines: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+
+def _make_kaiba_recalls_db(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE recalls (id INTEGER PRIMARY KEY, created_at TEXT, agent TEXT, "
+            "query TEXT, top_k INTEGER, matches TEXT, mu REAL, sd REAL, floor_z REAL, "
+            "below_floor INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE conclusions (id INTEGER PRIMARY KEY, content TEXT, author TEXT, "
+            "created_at TEXT, embedding TEXT, embedding_model TEXT, retired_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO recalls (created_at, agent, query, matches) VALUES "
+            "('2026-08-20T10:00:00Z', 'cursor', 'denial_pattern_x9', ?)",
+            [json.dumps([{"id": 1, "score": 0.9}])],
+        )
+        connection.execute(
+            "INSERT INTO conclusions (id, content) VALUES "
+            "(1, 'Use anchored prefix matching for denial_pattern_x9 tokens.')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_iter_cursor_sources_finds_jsonl_recursively(tmp_path: Path):
+    nested = tmp_path / "agent-transcripts" / "abc123"
+    nested.mkdir(parents=True)
+    (nested / "abc123.jsonl").write_text("", encoding="utf-8")
+    files, missing = iter_cursor_sources([tmp_path])
+    assert [f.name for f in files] == ["abc123.jsonl"]
+    assert missing == []
+
+
+def test_cursor_sources_default_to_no_kaiba_lookup_and_build_is_unaffected(tmp_path: Path):
+    """Omitting --cursor-source (empty cursor_sources) changes nothing about a plain build."""
+    result = build([FIXTURES], tmp_path / "unaffected.duckdb")
+    assert result.n_recall_calls == 0
+    assert result.kaiba_db_unavailable is None
+
+
+def test_cursor_recall_calls_are_extracted_with_kaiba_join(tmp_path: Path):
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    assert result.n_processed == 1
+    assert result.n_recall_calls == 1
+    assert result.kaiba_db_unavailable is None
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT source, session_id, query, output, ts FROM recall_calls"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row[0] == "cursor"
+    assert row[1] == "sess1"
+    assert row[2] == "denial_pattern_x9"
+    assert row[3] == "Use anchored prefix matching for denial_pattern_x9 tokens."
+    assert row[4] is not None
+
+
+def test_cursor_build_is_incremental(tmp_path: Path):
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    again = build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    assert again.n_processed == 0
+    assert again.n_skipped == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM recall_calls") == 1
+    finally:
+        connection.close()
+
+
+def test_a_missing_kaiba_db_does_not_fail_the_build(tmp_path: Path):
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+
+    db_path = tmp_path / "cursor.duckdb"
+    missing_kaiba = tmp_path / "nowhere" / "kaiba.db"
+    result = build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=missing_kaiba)
+    assert result.n_processed == 1
+    assert result.n_recall_calls == 1
+    assert result.kaiba_db_unavailable == str(missing_kaiba)
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute("SELECT output, ts FROM recall_calls").fetchone()
+    finally:
+        connection.close()
+    assert row == (None, None)
+
+
+def test_cursor_never_touches_sessions_events_or_tool_calls(tmp_path: Path):
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    assert result.n_sessions == 0
+    assert result.n_events == 0
+    assert result.n_tool_calls == 0
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 0
+        assert scalar(connection, "SELECT count(*) FROM events") == 0
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 0
+    finally:
+        connection.close()
+
+
+def _single_cursor_recall_line(query: str) -> dict:
+    return {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "CallMcpTool",
+                    "input": {"server": "kaiba", "toolName": "recall", "arguments": {"query": query}},
+                }
+            ]
+        },
+    }
+
+
+def _make_kaiba_recalls_db_with_two_rows_for_one_query(path: Path, query: str) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE recalls (id INTEGER PRIMARY KEY, created_at TEXT, agent TEXT, "
+            "query TEXT, top_k INTEGER, matches TEXT, mu REAL, sd REAL, floor_z REAL, "
+            "below_floor INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE conclusions (id INTEGER PRIMARY KEY, content TEXT, author TEXT, "
+            "created_at TEXT, embedding TEXT, embedding_model TEXT, retired_at TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO recalls (created_at, agent, query, matches) VALUES (?, 'cursor', ?, ?)",
+            [
+                ("2026-08-20T10:00:00Z", query, json.dumps([{"id": 1, "score": 0.9}])),
+                ("2026-08-20T11:00:00Z", query, json.dumps([{"id": 2, "score": 0.9}])),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO conclusions (id, content) VALUES (?, ?)",
+            [(1, "first ledger row content"), (2, "second ledger row content")],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_two_cursor_files_sharing_a_query_both_pair_with_the_first_ledger_row(
+    tmp_path: Path,
+):
+    """Occurrences are counted per file, not across the build (ashiato#20 rework).
+
+    Two different Cursor session files each issue the identical query text once.
+    Since each file's occurrence counter is its own, both independently compute
+    occurrence index 0 and pair with the *same* first ledger row -- a documented
+    limitation, not something the build tries to disambiguate across files.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    (transcript_dir / "session_a.jsonl").write_text(
+        json.dumps(_single_cursor_recall_line("shared query")) + "\n", encoding="utf-8"
+    )
+    (transcript_dir / "session_b.jsonl").write_text(
+        json.dumps(_single_cursor_recall_line("shared query")) + "\n", encoding="utf-8"
+    )
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db_with_two_rows_for_one_query(kaiba_path, "shared query")
+
+    db_path = tmp_path / "shared_query.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    assert result.n_processed == 2
+    assert result.n_recall_calls == 2
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT session_id, output FROM recall_calls ORDER BY session_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("session_a", "first ledger row content"),
+        ("session_b", "first ledger row content"),
+    ]
+
+
+def test_cli_build_with_cursor_source_and_kaiba_db(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+    db_path = tmp_path / "cli_cursor.duckdb"
+
+    assert (
+        main(
+            [
+                "build",
+                "--cursor-source",
+                str(transcript_dir),
+                "--kaiba-db",
+                str(kaiba_path),
+                "--db",
+                str(db_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "1 recall calls" in out
+
+
+def test_cli_build_reports_a_missing_kaiba_db(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    missing_kaiba = tmp_path / "nowhere" / "kaiba.db"
+    db_path = tmp_path / "cli_missing_kaiba.duckdb"
+
+    assert (
+        main(
+            [
+                "build",
+                "--cursor-source",
+                str(transcript_dir),
+                "--kaiba-db",
+                str(missing_kaiba),
+                "--db",
+                str(db_path),
+            ]
+        )
+        == 0
+    )
+    err = capsys.readouterr().err
+    assert "no kaiba db at" in err

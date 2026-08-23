@@ -27,7 +27,7 @@ Python 3.11+. The only runtime dependency is `duckdb`.
 ## Use
 
 ```
-ashiato build [--source DIR]... [--opencode-source DIR]... [--db PATH]
+ashiato build [--source DIR]... [--opencode-source DIR]... [--cursor-source DIR]... [--kaiba-db PATH] [--db PATH]
 ashiato sql "SELECT ..." [--db PATH] [--format table|json|csv]
 ashiato denials [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
 ashiato recalls [--db PATH] [--format table|json|csv] [--limit N] [--session ID]
@@ -44,6 +44,18 @@ ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistan
   second explicit list means ashiato never has to sniff a file's format to know which
   parser to run. Nothing is scanned for `*.ndjson` by default -- pass `--opencode-source`
   to opt in.
+- `--cursor-source` is repeatable and is searched recursively for `*.jsonl` Cursor
+  agent-transcript files (`~/.cursor/projects/<project>/agent-transcripts/<id>/<id>.jsonl`
+  on a machine that has them). A separate list for the same reason as `--opencode-source`:
+  Cursor keeps its own directory tree, so a second explicit list means it never gets
+  swept into the plain `--source` scan even though both use the `*.jsonl` extension.
+  Nothing is scanned for Cursor transcripts by default -- pass `--cursor-source` to opt
+  in. `--kaiba-db PATH` (default `~/.kaiba/kaiba.db`) is only read when `--cursor-source`
+  is given: a Cursor transcript carries no tool results at all, so a recall call's
+  `output` and `ts` are reconstructed by joining its query against kaiba's own `recalls`
+  ledger instead (see `recall_calls` below). A kaiba db that does not exist or cannot be
+  read does not fail the build -- affected rows simply get `NULL` `output` / `ts`, and
+  `build` prints one line saying so.
 - `--db` defaults to `$XDG_DATA_HOME/ashiato/ashiato.duckdb`, falling back to
   `~/.local/share/ashiato/ashiato.duckdb`. Parent directories are created as needed.
 - `build` is incremental: a file whose path, size and mtime are unchanged since the last
@@ -52,8 +64,8 @@ ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistan
 - `denials` prints the `denial_followups` view — every denied tool call and what the
   session did next — newest first, 50 rows by default (`--limit 0` for all).
 - `recalls` prints the `recall_followups` view — every completed kaiba `recall` call, from
-  either source format, and the evidence of what the session did afterwards — same output
-  conventions as `denials`.
+  any of the three source formats, and the evidence of what the session did afterwards —
+  same output conventions as `denials`.
 - `salvage` nominates work-state changes that left no bookkeeping trail. When a session ends
   abnormally (a freeze, a kill, context exhaustion), the post-action bookkeeping a healthy
   session does — recording the state change in the shared kaiba agenda after a chain
@@ -174,14 +186,31 @@ text, before truncation.
 `recall_id`, `session_id`, `file_path`, `source`, `seq`, `ts`, `call_id`, `query`, `output`,
 `output_truncated`, `followup_text`, `followup_truncated`, `overlap_tokens`, `overlap_count`.
 
-Filled at build time by `ashiato.recall`, from either source format: `mcp__kaiba__recall`
-tool_use/tool_result pairs in a Claude Code transcript, or completed `kaiba_recall`
-`message.part.updated` records in an opencode events.ndjson file (`source` records which).
-`query` and `output` are the call's input and returned text; `followup_text` is a bounded
-(30 items or 8,000 characters, whichever comes first) concatenation of the same session's
-activity on strictly later lines -- assistant text and other completed tool calls -- the
-same "strictly later line" rule `denial_followups` uses, so a call issued in parallel with
-the recall is never mistaken for a reaction to it.
+Filled at build time by `ashiato.recall`, from any of three source formats (`source`
+records which): `mcp__kaiba__recall` tool_use/tool_result pairs in a Claude Code
+transcript, completed `kaiba_recall` `message.part.updated` records in an opencode
+events.ndjson file, or `CallMcpTool` blocks (`server="kaiba"`, `toolName="recall"`) in a
+Cursor agent transcript. `query` and `output` are the call's input and returned text;
+`followup_text` is a bounded (30 items or 8,000 characters, whichever comes first)
+concatenation of the same session's activity on strictly later lines -- assistant text
+and other completed tool calls -- the same "strictly later line" rule `denial_followups`
+uses, so a call issued in parallel with the recall is never mistaken for a reaction to it.
+
+Cursor is a special case: its transcripts carry no tool results at all (no `tool_result`
+blocks, ever), so `output` and `ts` cannot come from the transcript the way they do for
+the other two sources. Instead they are reconstructed from kaiba's own `recalls` ledger
+(`~/.kaiba/kaiba.db`, read via `--kaiba-db`): the n-th occurrence of a query *within one
+Cursor transcript file* pairs with the n-th `agent = 'cursor'` row for that query, ordered
+by `created_at`, and `output` is the joined `content` of that row's `matches`, in
+`matches` order. Occurrences are counted per file, not across the build: two different
+transcript files that issue an identical query text both pair with the same ledger rows,
+so the `output` of one may be another session's returned text -- a documented limitation,
+not something ashiato tries to disambiguate. A query with no ledger row, or more
+transcript occurrences than ledger rows, still gets a row -- just with `output` / `ts`
+left `NULL`. Followup evidence for a Cursor row is
+correspondingly narrower: assistant text and other tool calls' *inputs* only (rendered as
+`server/toolName` plus arguments for another MCP call, or the tool's own name plus its
+input otherwise) -- never a tool's output, since Cursor transcripts do not carry one.
 
 `overlap_tokens` / `overlap_count` are one deterministic, mechanical "was this used" signal:
 tokens matching `[A-Za-z0-9_#./-]{4,}` present in `output` *and* in the post-recall suffix
@@ -239,11 +268,12 @@ $ ashiato sql "SELECT followup_kind, count(*) FROM denial_followups GROUP BY 1 O
 
 ### `recall_followups` — a thin view over `recall_calls`
 
-Unlike `denial_followups`, this is not derived on read: the followup pairing crosses source
-formats (Claude Code's tool_use/tool_result pairs vs. opencode's message parts), so there is
-no single raw table to define a read-time view over. `ashiato.recall` computes the pairing
-once, at build time, into `recall_calls`; `recall_followups` just selects from it with a
-stable column order, the same shape `denial_followups` presents.
+Unlike `denial_followups`, this is not derived on read: the followup pairing crosses three
+source formats (Claude Code's tool_use/tool_result pairs, opencode's message parts, and
+Cursor's transcript-plus-kaiba-ledger join), so there is no single raw table to define a
+read-time view over. `ashiato.recall` computes the pairing once, at build time, into
+`recall_calls`; `recall_followups` just selects from it with a stable column order, the
+same shape `denial_followups` presents.
 
 ```
 $ ashiato recalls --limit 5
