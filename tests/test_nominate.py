@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 from ashiato.build import build, connect
 from ashiato.cli import main
 from ashiato.nominate import (
+    _load_exclude_file,
     mine_negative_facts,
     mine_stable_outputs,
     normalize_command,
@@ -315,6 +317,40 @@ def db(tmp_path: Path, transcript_dir: Path) -> Path:
     return path
 
 
+def _build_bash_db(
+    tmp_path: Path,
+    *,
+    command: str,
+    result_text: str,
+    is_error: bool = True,
+    n_sessions: int = 3,
+    prefix: str = "case",
+) -> Path:
+    """Private DuckDB with the same Bash error in n_sessions sessions."""
+    records: list[dict] = []
+    for i in range(n_sessions):
+        sid = f"ses-{prefix}-{i + 1}"
+        ts = f"2026-08-{20 + i}T10:00:00Z"
+        _call(
+            records,
+            f"{prefix}{i}",
+            sid,
+            ts,
+            ts,
+            "Bash",
+            {"command": command},
+            result_text,
+            is_error=is_error,
+        )
+    transcript = tmp_path / f"{prefix}_transcript.jsonl"
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    db_path = tmp_path / f"{prefix}.duckdb"
+    build([transcript], db_path)
+    return db_path
+
+
 # ---------------------------------------------------------------- normalization unit tests
 
 
@@ -411,6 +447,52 @@ class TestMineNegativeFacts:
         if neg is not None:
             # Should have 3 distinct sessions, not 4
             assert len(neg.session_ids) == 3
+
+    @pytest.mark.parametrize(
+        "result_text",
+        [
+            "Exit code 143",
+            "Command timed out",
+            "Exit code 124",
+            "Exit code 137",
+            "Exit code 144",
+            (
+                "This operation is temporarily unavailable, so auto mode "
+                "cannot determine a permission"
+            ),
+        ],
+    )
+    def test_operational_deaths_are_not_nominated(
+        self, tmp_path: Path, result_text: str
+    ) -> None:
+        db_path = _build_bash_db(
+            tmp_path,
+            command="sleep 30",
+            result_text=result_text,
+            is_error=True,
+            prefix="death",
+        )
+        connection = connect(db_path, read_only=True)
+        try:
+            candidates = mine_negative_facts(connection, min_sessions=3)
+        finally:
+            connection.close()
+        assert candidates == []
+
+    def test_jq_command_not_found_is_nominated(self, tmp_path: Path) -> None:
+        db_path = _build_bash_db(
+            tmp_path,
+            command="jq .",
+            result_text="jq: command not found",
+            is_error=True,
+            prefix="jq",
+        )
+        connection = connect(db_path, read_only=True)
+        try:
+            candidates = mine_negative_facts(connection, min_sessions=3)
+        finally:
+            connection.close()
+        assert any("jq: command not found" in c.sample_output for c in candidates)
 
 
 # ---------------------------------------------------------------- stable-output miner tests
@@ -530,6 +612,10 @@ class TestRunIntegration:
             assert "command" in item
             assert "sample_output" in item
             assert "draft" in item
+            assert "first_seen" in item
+            assert "last_seen" in item
+            assert item["first_seen"] is not None
+            assert item["last_seen"] is not None
 
     def test_exit_code_0_when_candidates_exist(self, db: Path) -> None:
         out_sio = io.StringIO()
@@ -572,3 +658,88 @@ def test_nominate_json_output(db: Path, capsys: pytest.CaptureFixture[str]) -> N
     payload = json.loads(out)
     assert isinstance(payload, list)
     assert len(payload) >= 1
+
+
+# ---------------------------------------------------------------- exclude-file tests
+
+
+class TestExcludeFile:
+    def test_regex_suppresses_otherwise_stable_output(
+        self, db: Path, tmp_path: Path
+    ) -> None:
+        out_before = io.StringIO()
+        rc_before = run(
+            db, min_sessions=3, json_output=True, out=out_before, err=io.StringIO()
+        )
+        assert rc_before == 0
+        commands_before = [item["command"] for item in json.loads(out_before.getvalue())]
+        assert any("hostname" in cmd for cmd in commands_before)
+
+        exclude = tmp_path / "exclude.txt"
+        exclude.write_text(
+            "# (unclosed if this comment were compiled\n\nhostname\n",
+            encoding="utf-8",
+        )
+        out_after = io.StringIO()
+        rc_after = run(
+            db,
+            min_sessions=3,
+            json_output=True,
+            exclude_file=exclude,
+            out=out_after,
+            err=io.StringIO(),
+        )
+        assert rc_after == 0
+        commands_after = [item["command"] for item in json.loads(out_after.getvalue())]
+        assert not any("hostname" in cmd for cmd in commands_after)
+
+    def test_blank_lines_and_comments_are_ignored(
+        self, db: Path, tmp_path: Path
+    ) -> None:
+        comments_only = tmp_path / "comments.txt"
+        comments_only.write_text(
+            "# (unclosed if compiled\n\n\n# another comment\n",
+            encoding="utf-8",
+        )
+        out_sio = io.StringIO()
+        err_sio = io.StringIO()
+        rc = run(
+            db,
+            min_sessions=3,
+            json_output=True,
+            exclude_file=comments_only,
+            out=out_sio,
+            err=err_sio,
+        )
+        assert rc == 0
+        commands = [item["command"] for item in json.loads(out_sio.getvalue())]
+        assert any("hostname" in cmd for cmd in commands)
+
+    def test_missing_file_warns_and_still_runs(self, db: Path, tmp_path: Path) -> None:
+        missing = tmp_path / "no-such-exclude.txt"
+        out_sio = io.StringIO()
+        err_sio = io.StringIO()
+        rc = run(
+            db, min_sessions=3, exclude_file=missing, out=out_sio, err=err_sio
+        )
+        assert rc == 0
+        err = err_sio.getvalue()
+        assert "warning: exclude file not found:" in err
+        assert str(missing) in err
+
+    def test_invalid_regex_names_line_and_text(self, tmp_path: Path) -> None:
+        path = tmp_path / "bad.txt"
+        path.write_text("ok-pattern\n(unclosed\n", encoding="utf-8")
+        with pytest.raises(re.error) as excinfo:
+            _load_exclude_file(path)
+        message = str(excinfo.value)
+        assert "line 2" in message
+        assert "(unclosed" in message
+        assert excinfo.value.__cause__ is not None
+
+
+def test_unused_row_helpers_are_removed() -> None:
+    import ashiato.nominate as nominate_mod
+
+    assert not hasattr(nominate_mod, "_COLUMNS")
+    assert not hasattr(nominate_mod, "_candidate_to_row")
