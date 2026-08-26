@@ -29,6 +29,7 @@ from ashiato.grep import Hit, InvalidPattern
 from ashiato.grep import search as grep_search
 from ashiato.grep import visible as grep_visible
 from ashiato.grep import window as grep_window
+from ashiato.nominate import run as nominate_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import (
@@ -155,6 +156,52 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=_parse_since,
         metavar="TS",
         help="only consider evidence at or after this ISO-8601 timestamp",
+    )
+
+    nominate_parser = subparsers.add_parser(
+        "nominate", help="mine re-derived facts as kaiba nomination candidates"
+    )
+    nominate_parser.add_argument("--db", metavar="PATH", help="database path")
+    nominate_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only consider calls at or after this ISO-8601 timestamp",
+    )
+    nominate_parser.add_argument(
+        "--until",
+        type=_parse_since,
+        metavar="TS",
+        help="only consider calls at or before this ISO-8601 timestamp",
+    )
+    nominate_parser.add_argument(
+        "--min-sessions",
+        type=_row_limit,
+        default=3,
+        metavar="N",
+        help="minimum distinct sessions for a candidate (default 3)",
+    )
+    nominate_parser.add_argument(
+        "--min-stability",
+        type=float,
+        default=1.0,
+        metavar="F",
+        help="minimum modal output share for stable-output (default 1.0)",
+    )
+    nominate_parser.add_argument(
+        "--exclude-file",
+        metavar="PATH",
+        help="additional ritual exclusion patterns (one regex per line)",
+    )
+    nominate_parser.add_argument(
+        "--max-output-chars",
+        type=_row_limit,
+        default=2000,
+        metavar="N",
+        help="truncate result text to N chars before comparison (default 2000)",
+    )
+    nominate_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="output as JSON"
     )
 
     grep_parser = subparsers.add_parser(
@@ -551,6 +598,23 @@ def _run_salvage(args: argparse.Namespace, out: Any, err: Any) -> int:
     return 0
 
 
+def _run_nominate(args: argparse.Namespace, out: Any, err: Any) -> int:
+    db_path = _resolve_db(args.db)
+    exclude_file = Path(args.exclude_file) if args.exclude_file else None
+    return nominate_run(
+        db_path,
+        since=args.since,
+        until=args.until,
+        min_sessions=args.min_sessions,
+        min_stability=args.min_stability,
+        exclude_file=exclude_file,
+        max_output_chars=args.max_output_chars,
+        json_output=args.json_output,
+        out=out,
+        err=err,
+    )
+
+
 def _grep_header(hit: Hit) -> str:
     ts_text = hit.ts.isoformat() if hit.ts is not None else "NULL"
     label = f"role={hit.label}" if hit.source == "event" else f"tool={hit.label}"
@@ -678,6 +742,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_salvage(args, out, err)
     if args.command == "grep":
         return _run_grep(args, out, err)
+    if args.command == "nominate":
+        return _run_nominate(args, out, err)
     return _run_info(args, out, err)
 
 
