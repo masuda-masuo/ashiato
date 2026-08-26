@@ -35,6 +35,7 @@ ashiato info [--db PATH]
 ashiato schema [TABLE] [--db PATH]
 ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
+ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
@@ -109,6 +110,19 @@ ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistan
   caps hits with `0` meaning all (default 20). Exit codes: `0` when matches are printed, `1`
   when nothing matched (`notice: no matches` on stderr), and `2` on a bad pattern or a
   database that cannot be read — missing, out of date, or failing the query.
+
+- `nominate` mines re-derived facts as kaiba nomination candidates. It scans
+  non-sidechain `Bash` tool calls for two signals: *negative-fact* (the same
+  error text rediscovered by many sessions) and *stable-output* (a command
+  returning the same informative result across sessions). Ritual commands
+  (`--help`, `git pull`, bare `ls`, etc.) are excluded by default; an
+  `--exclude-file` supplies environment-specific patterns. This is
+  report-only: it never writes to kaiba or any file, mirroring the discipline
+  of `salvage` and `denials`. `--min-sessions N` sets the minimum distinct
+  sessions (default 3), `--min-stability F` the minimum modal output share for
+  `stable-output` (default 1.0), `--since TS` / `--until TS` bound the time
+  window, and `--json` outputs full records instead of the default one-line
+  table. Exit code `0` when candidates exist, `1` when none.
 
 - `schema` lists the tables and views in the ashiato schema, or shows the columns
   and types for a specific table or view. It works without a database -- the schema
