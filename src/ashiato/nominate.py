@@ -134,6 +134,23 @@ def _is_failure_result(result_text: str | None) -> bool:
     return any(p.search(result_text) for p in _FAILURE_PATTERNS)
 
 
+_OPERATIONAL_DEATH_EXIT_RE = re.compile(
+    r"Exit code (?:124|137|143|144)\b",
+    re.IGNORECASE,
+)
+_OPERATIONAL_DEATH_PHRASES = (
+    "Command timed out",
+    "temporarily unavailable, so auto mode cannot determine",
+)
+
+
+def _is_operational_death(normalized: str) -> bool:
+    """True if a classified failure is a watch-loop/dispatch death, not a durable fact."""
+    if _OPERATIONAL_DEATH_EXIT_RE.search(normalized):
+        return True
+    return any(phrase in normalized for phrase in _OPERATIONAL_DEATH_PHRASES)
+
+
 def _is_uninformative(output: str) -> bool:
     """True if the output is empty, whitespace-only, or the no-output marker."""
     stripped = output.strip()
@@ -143,11 +160,16 @@ def _is_uninformative(output: str) -> bool:
 def _load_exclude_file(path: Path) -> list[re.Pattern[str]]:
     """Load extra ritual exclusion patterns from a file (one regex per line)."""
     patterns: list[re.Pattern[str]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        patterns.append(re.compile(line))
+        try:
+            patterns.append(re.compile(line))
+        except re.error as exc:
+            raise re.error(
+                f"invalid regex on line {lineno}: {line}"
+            ) from exc
     return patterns
 
 
@@ -222,6 +244,8 @@ def mine_negative_facts(
         # normalized result text.
         is_failure = outcome == "error" or _is_failure_result(normalized)
         if not is_failure:
+            continue
+        if _is_operational_death(normalized):
             continue
         groups[normalized].append((session_id, tool_use_id, ts, input_summary))
 
@@ -391,19 +415,15 @@ def mine_stable_outputs(
 # Output rendering
 # ---------------------------------------------------------------------------
 
-_COLUMNS = ("signal", "sessions", "session_ids", "command", "stability", "sample_output", "draft")
 
-
-def _candidate_to_row(c: Candidate) -> list[Any]:
-    return [
-        c.signal,
-        c.sessions,
-        c.session_ids,
-        c.command,
-        c.stability,
-        c.sample_output,
-        c.draft,
-    ]
+def _seen_range(
+    timestamps: dict[str, datetime | None],
+) -> tuple[datetime | None, datetime | None]:
+    """Min/max of non-None session timestamps; (None, None) if none are dated."""
+    valid = [t for t in timestamps.values() if t is not None]
+    if not valid:
+        return None, None
+    return min(valid), max(valid)
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +506,7 @@ def run(
     if json_output:
         payload = []
         for c in all_candidates:
+            first_seen, last_seen = _seen_range(c.session_timestamps)
             payload.append(
                 {
                     "signal": c.signal,
@@ -495,6 +516,8 @@ def run(
                     "stability": c.stability,
                     "sample_output": c.sample_output,
                     "draft": c.draft,
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
                 }
             )
         print(json.dumps(payload, indent=2, ensure_ascii=False, default=str), file=out)
