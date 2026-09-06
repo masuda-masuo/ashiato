@@ -148,6 +148,7 @@ META_FORMAT_KEY = "format_version"
 META_SOURCES_KEY = "sources"
 META_OPENCODE_SOURCES_KEY = "opencode_sources"
 META_CURSOR_SOURCES_KEY = "cursor_sources"
+META_CODEX_SOURCES_KEY = "codex_sources"
 
 META_SCHEMA_SQL = (
     f'CREATE TABLE IF NOT EXISTS "{META_TABLE}" (key VARCHAR PRIMARY KEY, value VARCHAR)'

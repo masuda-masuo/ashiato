@@ -1,0 +1,21 @@
+Chain chain-mt3vuvhq867d: tiers=1, reworkTiers=1, maxRounds=4 (can reach top tier)
+Chain chain-mt3vuvhq867d accepted at round 1.
+
+**Verdict: approve**
+
+Solid, spec-faithful implementation: nomination logic (session + kaiba window checks) matches the issue's AND rule exactly, kaiba connection is genuinely read-only (verified by test), FORMAT_VERSION correctly stays at 4, and tool_calls is confirmed exclusively Claude-Code-sourced so the opencode non-goal holds without extra filtering. Tests build real DBs through the actual pipeline (honest, not mocked). One narrow, low-confidence robustness nit (local-time datetime.timestamp() on naive-UTC values) is the only defensible finding; not blocking.
+
+### 1. [low] Evidence sort uses local-time epoch conversion on naive UTC timestamps
+- src/ashiato/salvage.py:160-163 (confidence 0.55)
+
+`fetch_evidence_events` sorts events with `-event.ts.timestamp() if event.ts else 0`. `event.ts` is a naive datetime that the module's own convention (stated in its docstring and mirrored in `_parse_kaiba_ts`/`_parse_since`) treats as UTC. Python's `datetime.timestamp()` on a naive datetime interprets it as local time, not UTC, per the stdlib docs. On a host whose system timezone is not UTC, this can produce a non-monotonic transform of the true UTC order for events that straddle a DST transition (the local-time interpretation is ambiguous or skips forward across that boundary). Since `nominate()` walks `evidence_events` in this sort order and stops as soon as `limit` nominations are collected, a mis-ordering here can change which events actually make the cut under `--limit`, not just their display order.
+
+**Recommendation:** Sort directly on the naive datetime (`key=lambda e: (e.ts is None, e.ts), reverse=True`-style comparison) instead of routing through `.timestamp()`, so no local-timezone interpretation is introduced.
+
+**Next steps:**
+- Confirm the container/production ashiato host runs with TZ=UTC (or set it explicitly) to neutralize the sort-order finding in practice, independent of whether the code is changed.
+
+**Unverified:**
+- Could not exercise the behavior for evidence rows with ts=NULL end-to-end (decide() returns None/no-nominate for such rows, per parser.parse_timestamp's documented `datetime | None` return) -- no fixture in tests/test_salvage.py covers a malformed/missing-timestamp tool_calls row, so whether silently dropping such rows is acceptable for the abrupt-session-end scenario this feature targets is unconfirmed either way.
+
+review record: /home/masuda/.kusabi/406c0baee14d/chains/chain-mt3vuvhq867d/review-record.md

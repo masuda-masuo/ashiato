@@ -15,6 +15,7 @@ import duckdb
 
 from ashiato import __version__
 from ashiato.build import (
+    DEFAULT_CODEX_SOURCE,
     DEFAULT_SOURCE,
     SchemaOutOfDate,
     assert_readable,
@@ -78,6 +79,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="cursor_source",
         metavar="DIR",
         help="directory searched recursively for Cursor agent-transcript *.jsonl (repeatable)",
+    )
+    build_parser.add_argument(
+        "--codex-source",
+        action="append",
+        dest="codex_source",
+        metavar="DIR",
+        help=f"directory searched recursively for Codex session *.jsonl (repeatable; default {DEFAULT_CODEX_SOURCE})",
     )
     build_parser.add_argument(
         "--kaiba-db",
@@ -375,6 +383,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     sources = args.source or [str(DEFAULT_SOURCE)]
     opencode_sources = args.opencode_source or []
     cursor_sources = args.cursor_source or []
+    codex_sources = args.codex_source or [str(DEFAULT_CODEX_SOURCE)]
     kaiba_db_path = Path(args.kaiba_db).expanduser() if args.kaiba_db else None
     db_path = _resolve_db(args.db)
     try:
@@ -383,6 +392,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
             db_path,
             opencode_sources=opencode_sources,
             cursor_sources=cursor_sources,
+            codex_sources=codex_sources,
             kaiba_db_path=kaiba_db_path,
         )
     except SchemaOutOfDate as error:
