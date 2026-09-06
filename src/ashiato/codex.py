@@ -80,6 +80,41 @@ def _read_records(path: Path) -> tuple[list[tuple[int, dict]], int]:
     return records, n_errors
 
 
+def _append_codex_message_text(
+    message: dict,
+    text_chunks: list[CodexTextChunk],
+    *,
+    session_id: str | None,
+    file_path: str,
+    seq: int,
+    record_ts: datetime | None,
+) -> None:
+    """Join output_text/input_text parts from a message-shaped dict into one chunk."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in ("output_text", "input_text"):
+            continue
+        part_text = part.get("text")
+        if isinstance(part_text, str) and part_text.strip():
+            text_parts.append(part_text)
+    if not text_parts:
+        return
+    text_chunks.append(
+        CodexTextChunk(
+            session_id=session_id,
+            file_path=file_path,
+            seq=seq,
+            ts=record_ts,
+            text="".join(text_parts),
+        )
+    )
+
+
 def parse_file(path: str | Path) -> ParsedCodexFile:
     """Parse one Codex JSONL file into tool calls and text chunks."""
     path = Path(path)
@@ -168,6 +203,29 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                     text=txt,
                                 )
                             )
+                    elif item_type == "message":
+                        # Rare nested shape (item_completed.item.type == message).
+                        _append_codex_message_text(
+                            item,
+                            text_chunks,
+                            session_id=session_id,
+                            file_path=file_path,
+                            seq=seq,
+                            record_ts=record_ts,
+                        )
+
+        elif rec_type == "response_item":
+            # Live Codex text: top-level response_item with payload.type == "message"
+            # (measured 2026-09-06: 385 such rows; content parts output_text/input_text).
+            if payload.get("type") == "message":
+                _append_codex_message_text(
+                    payload,
+                    text_chunks,
+                    session_id=session_id,
+                    file_path=file_path,
+                    seq=seq,
+                    record_ts=record_ts,
+                )
 
         elif rec_type == "token_usage_record":
             tu = payload.get("thread_token_usage")
