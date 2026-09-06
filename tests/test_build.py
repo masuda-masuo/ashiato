@@ -1833,3 +1833,263 @@ def test_cli_build_reports_a_missing_kaiba_db(tmp_path: Path, capsys: pytest.Cap
     )
     err = capsys.readouterr().err
     assert "no kaiba db at" in err
+
+# ---------------------------------------------------------------- codex tool_calls
+
+def _write_codex_session(path: Path, session_id: str, tool_calls: list[dict]) -> None:
+    """Write a minimal Codex JSONL session file with the given tool calls."""
+    lines: list[dict] = [
+        {"type": "session_meta", "payload": {"id": session_id}},
+    ]
+    for tc in tool_calls:
+        lines.append({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": session_id,
+                "item": tc,
+            },
+        })
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+
+def test_codex_build_populates_tool_calls(tmp_path: Path):
+    """Building with a Codex source inserts one tool_calls row per parsed call."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "session.jsonl",
+        "codex-s1",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "exec-1",
+                "command": ["ls", "-la"],
+                "stdout": "total 0\n",
+            },
+            {
+                "type": "CommandExecution",
+                "id": "exec-2",
+                "command": ["echo", "hello"],
+                "stdout": "hello\n",
+            },
+            {
+                "type": "call_mcp_tool",
+                "id": "mcp-1",
+                "server": "sunaba",
+                "tool": "publish",
+                "arguments": {"files": ["foo.py"]},
+                "result": "ok",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_test.duckdb"
+    result = build([], db_path, codex_sources=[codex_dir])
+
+    assert result.n_tool_calls == 3
+
+    connection = connect(db_path, read_only=True)
+    try:
+        tc_count = scalar(connection, "SELECT count(*) FROM tool_calls")
+        assert tc_count == 3
+
+        # tool_names are preserved
+        names = connection.execute(
+            "SELECT tool_name FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert names == [("Bash",), ("Bash",), ("mcp__sunaba__publish",)]
+
+        # source_files.n_tool_calls matches
+        sf_count = scalar(
+            connection,
+            "SELECT n_tool_calls FROM source_files WHERE file_path LIKE '%session.jsonl'",
+        )
+        assert sf_count == 3
+
+        # source_files.n_events stays zero (no events inserted for codex)
+        sf_events = scalar(
+            connection,
+            "SELECT n_events FROM source_files WHERE file_path LIKE '%session.jsonl'",
+        )
+        assert sf_events == 0
+    finally:
+        connection.close()
+
+
+def test_codex_tool_call_input_summary_is_greppable(tmp_path: Path):
+    """A Bash command is findable via input_summary on tool_calls rows."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "sess.jsonl",
+        "codex-grep",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "exec-10",
+                "command": "git diff HEAD~3",
+                "stdout": "diff --git a/foo.py ...",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_grep.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        summary = scalar(
+            connection,
+            "SELECT input_summary FROM tool_calls WHERE tool_use_id = 'exec-10'",
+        )
+        assert summary is not None
+        assert "git diff HEAD~3" in summary
+
+        # Also findable via input JSON
+        input_json = scalar(
+            connection,
+            "SELECT input FROM tool_calls WHERE tool_use_id = 'exec-10'",
+        )
+        assert "git diff HEAD~3" in input_json
+    finally:
+        connection.close()
+
+
+def test_codex_tool_call_outcome(tmp_path: Path):
+    """Tool calls with output get outcome='ok'; pending without."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "outcome.jsonl",
+        "codex-out",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "ok-1",
+                "command": "echo ok",
+                "stdout": "ok\n",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_out.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        outcome = scalar(
+            connection,
+            "SELECT outcome FROM tool_calls WHERE tool_use_id = 'ok-1'",
+        )
+        assert outcome == "ok"
+
+        is_error = scalar(
+            connection,
+            "SELECT is_error FROM tool_calls WHERE tool_use_id = 'ok-1'",
+        )
+        assert is_error is False
+    finally:
+        connection.close()
+
+
+def test_codex_tool_call_tool_kind_and_mcp_server(tmp_path: Path):
+    """Bash calls get tool_kind='builtin'; MCP calls get tool_kind='mcp' with server."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "kinds.jsonl",
+        "codex-kinds",
+        [
+            {"type": "CommandExecution", "id": "c1", "command": "pwd", "stdout": "/work"},
+            {
+                "type": "McpToolCall",
+                "id": "m1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "test"},
+                "result": "[]",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_kinds.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_name, tool_kind, mcp_server FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert rows == [
+            ("Bash", "builtin", None),
+            ("mcp__kaiba__recall", "mcp", "kaiba"),
+        ]
+    finally:
+        connection.close()
+
+
+def test_codex_tool_calls_replaced_on_rebuild(tmp_path: Path):
+    """Rebuilding the same codex file replaces prior tool_calls (no orphans)."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "replace.jsonl",
+        "codex-rep",
+        [{"type": "CommandExecution", "id": "x1", "command": "pwd", "stdout": "/a"}],
+    )
+
+    db_path = tmp_path / "codex_rep.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+    finally:
+        connection.close()
+
+    # Rebuild: should still have exactly 1 row, not 2
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+    finally:
+        connection.close()
+
+
+def test_codex_tool_call_call_event_id_nonnull(tmp_path: Path):
+    """call_event_id and result_event_id are stable, non-NULL derived ids."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "evtids.jsonl",
+        "codex-evt",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "evt-1",
+                "command": "echo x",
+                "stdout": "x",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_evt.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT call_event_id, result_event_id FROM tool_calls WHERE tool_use_id = 'evt-1'"
+        ).fetchone()
+        assert row is not None
+        call_event_id, result_event_id = row
+        assert call_event_id is not None
+        assert call_event_id.startswith("codex:")
+        assert result_event_id is not None
+        assert result_event_id.startswith("codex:")
+    finally:
+        connection.close()

@@ -54,7 +54,10 @@ from ashiato.parser import (
     SESSION_COLUMNS,
     TOOL_CALL_COLUMNS,
     ParsedFile,
+    classify_outcome,
     parse_file,
+    split_tool_name,
+    summarize_input,
 )
 from ashiato.recall import (
     RECALL_CALL_COLUMNS,
@@ -703,6 +706,72 @@ def _insert_cursor_parsed(
     )
 
 
+def _codex_tool_call_to_row(call: object) -> list[object]:
+    """Map a ``CodexToolCall`` to a ``ToolCall``-shaped row for insertion.
+
+    Mirrors the mapping that :func:`_insert_parsed` does for Claude tool calls
+    but adapted to the simpler Codex payload (no event timeline, no timestamps,
+    no permission mode).
+    """
+    from ashiato.codex import CodexToolCall as _CTC
+
+    assert isinstance(call, _CTC)
+    tool_name: str | None = call.tool_name
+    tool_kind, mcp_server = split_tool_name(tool_name)
+    tool_input = call.input
+    input_json: str | None = (
+        None if tool_input is None
+        else json.dumps(tool_input, ensure_ascii=False, default=str)
+    )
+    output: str | None = call.output
+    has_result = output is not None and output != ""
+    is_error = False  # Codex parser doesn't surface explicit errors
+
+    # Stable synthetic event ids derived from call_id/seq so they are
+    # non-NULL and deterministic (Claude always has call_event_id).
+    call_event_id = f"codex:{call.call_id}"
+    result_event_id = f"codex:{call.call_id}:result" if has_result else None
+
+    outcome = classify_outcome(
+        has_result=has_result,
+        result_text=output or "",
+        is_error=is_error,
+    )
+
+    result_text: str | None = None
+    result_truncated = False
+    if output is not None:
+        if len(output) > DEFAULT_RESULT_TEXT_LIMIT:
+            result_text = output[:DEFAULT_RESULT_TEXT_LIMIT]
+            result_truncated = True
+        else:
+            result_text = output
+
+    return [
+        call.call_id,         # tool_use_id
+        call.session_id,
+        call.file_path,
+        call.seq,
+        None,                 # ts
+        call_event_id,
+        result_event_id,
+        tool_name,
+        tool_kind,
+        mcp_server,
+        input_json,
+        summarize_input(tool_name, tool_input),
+        outcome,
+        is_error,
+        result_text,
+        result_truncated,
+        None,                 # duration_ms
+        None,                 # permission_mode
+        None,                 # cwd
+        False,                # is_sidechain
+        None,                 # parent_tool_use_id
+    ]
+
+
 def _insert_codex_parsed(
     connection: duckdb.DuckDBPyConnection,
     parsed: ParsedCodexFile,
@@ -713,7 +782,19 @@ def _insert_codex_parsed(
     built_at: datetime,
     scratch: Path | None,
 ) -> None:
-    """The Codex counterpart of :func:`_insert_parsed`."""
+    """The Codex counterpart of :func:`_insert_parsed`.
+
+    Inserts ``tool_calls`` (one row per ``CodexToolCall``) so that analysis
+    tools that read the ``tool_calls`` table can see Codex sessions.  Events
+    and sessions are **not** populated — Codex has no event timeline — so
+    ``source_files.n_events`` stays honestly zero.
+    """
+    _insert_rows(
+        connection,
+        "tool_calls",
+        [_codex_tool_call_to_row(call) for call in parsed.tool_calls],
+        scratch=scratch,
+    )
     _insert_rows(
         connection,
         "recall_calls",
@@ -729,8 +810,8 @@ def _insert_codex_parsed(
                 stat.st_size,
                 stat.st_mtime,
                 content_hash,
-                0,
-                len(parsed.tool_calls),
+                0,                          # n_events (honest: no events inserted)
+                len(parsed.tool_calls),     # n_tool_calls (matches rows inserted above)
                 parsed.n_parse_errors,
                 built_at,
             )
@@ -1063,6 +1144,7 @@ def build(
 
                 result.n_processed += 1
                 result.n_recall_calls += len(recall_rows)
+                result.n_tool_calls += len(parsed_codex.tool_calls)
                 result.n_parse_errors += parsed_codex.n_parse_errors
     finally:
         connection.close()
