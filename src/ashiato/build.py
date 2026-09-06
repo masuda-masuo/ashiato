@@ -53,7 +53,9 @@ from ashiato.parser import (
     EVENT_COLUMNS,
     SESSION_COLUMNS,
     TOOL_CALL_COLUMNS,
+    Event,
     ParsedFile,
+    Session,
     classify_outcome,
     parse_file,
     split_tool_name,
@@ -710,8 +712,8 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
     """Map a ``CodexToolCall`` to a ``ToolCall``-shaped row for insertion.
 
     Mirrors the mapping that :func:`_insert_parsed` does for Claude tool calls
-    but adapted to the simpler Codex payload (no event timeline, no timestamps,
-    no permission mode).
+    but adapted to the simpler Codex payload (no permission mode).
+    ``ts`` is populated from the record's own ``timestamp`` field.
     """
     from ashiato.codex import CodexToolCall as _CTC
 
@@ -752,7 +754,7 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
         call.session_id,
         call.file_path,
         call.seq,
-        None,                 # ts
+        call.ts,               # ts
         call_event_id,
         result_event_id,
         tool_name,
@@ -772,6 +774,36 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
     ]
 
 
+def _codex_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
+    """Map a ``CodexTextChunk`` to an ``Event``-shaped row for insertion."""
+    from ashiato.codex import CodexTextChunk as _CTC
+
+    assert isinstance(chunk, _CTC)
+    event_id = f"codex:text:{chunk.seq}"
+    return _event_row(Event(
+        event_id=event_id,
+        session_id=chunk.session_id,
+        file_path=chunk.file_path,
+        seq=chunk.seq,
+        ts=chunk.ts,
+        type="text",
+        role="assistant",
+        parent_uuid=None,
+        depth=0,
+        is_sidechain=False,
+        is_meta=False,
+        permission_mode=None,
+        effort=None,
+        request_id=None,
+        message_id=None,
+        model=None,
+        cwd=None,
+        git_branch=None,
+        text=chunk.text,
+        raw=chunk.text,
+    ))
+
+
 def _insert_codex_parsed(
     connection: duckdb.DuckDBPyConnection,
     parsed: ParsedCodexFile,
@@ -784,11 +816,34 @@ def _insert_codex_parsed(
 ) -> None:
     """The Codex counterpart of :func:`_insert_parsed`.
 
-    Inserts ``tool_calls`` (one row per ``CodexToolCall``) so that analysis
-    tools that read the ``tool_calls`` table can see Codex sessions.  Events
-    and sessions are **not** populated — Codex has no event timeline — so
-    ``source_files.n_events`` stays honestly zero.
+    Inserts ``tool_calls`` (one row per ``CodexToolCall``), one ``sessions``
+    row per file, and ``events`` rows for text chunks with non-empty text.
+    ``source_files.n_events`` reflects the count of inserted events.
     """
+    # Session row
+    session = Session(
+        session_id=parsed.session_id,
+        file_path=parsed.file_path,
+        project_dir=None,
+        cwd=None,
+        git_branch=None,
+        cc_version=None,
+        entrypoint=None,
+        started_at=parsed.started_at,
+        ended_at=parsed.ended_at,
+        n_events=len(parsed.text_chunks),
+        n_tool_calls=len(parsed.tool_calls),
+        input_tokens=parsed.input_tokens,
+        output_tokens=parsed.output_tokens,
+        cache_read_tokens=parsed.cache_read_tokens,
+        cache_creation_tokens=0,
+    )
+    _insert_rows(connection, "sessions", [_session_row(session)], scratch=scratch)
+
+    # Event rows from text chunks
+    event_rows = [_codex_text_chunk_to_event(c) for c in parsed.text_chunks]
+    _insert_rows(connection, "events", event_rows, scratch=scratch)
+
     _insert_rows(
         connection,
         "tool_calls",
@@ -810,8 +865,8 @@ def _insert_codex_parsed(
                 stat.st_size,
                 stat.st_mtime,
                 content_hash,
-                0,                          # n_events (honest: no events inserted)
-                len(parsed.tool_calls),     # n_tool_calls (matches rows inserted above)
+                len(parsed.text_chunks),  # n_events
+                len(parsed.tool_calls),   # n_tool_calls
                 parsed.n_parse_errors,
                 built_at,
             )

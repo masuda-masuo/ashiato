@@ -2093,3 +2093,270 @@ def test_codex_tool_call_call_event_id_nonnull(tmp_path: Path):
         assert result_event_id.startswith("codex:")
     finally:
         connection.close()
+
+
+def _write_codex_session_with_timeline(
+    path: Path,
+    session_id: str,
+    *,
+    tool_calls: list[dict] | None = None,
+    text_chunks: list[dict] | None = None,
+    token_usage: dict | None = None,
+    timestamps: list[str] | None = None,
+) -> None:
+    """Write a Codex JSONL file with timestamps, text, and optional token usage."""
+    lines: list[dict] = []
+    ts_list = timestamps or []
+    tc_list = tool_calls or []
+    txt_list = text_chunks or []
+
+    # session_meta
+    meta_ts = ts_list[0] if ts_list else None
+    meta: dict = {"type": "session_meta", "payload": {"id": session_id}}
+    if meta_ts:
+        meta["timestamp"] = meta_ts
+    lines.append(meta)
+
+    # tool call events
+    for i, tc in enumerate(tc_list):
+        ts = ts_list[i + 1] if i + 1 < len(ts_list) else None
+        ev: dict = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": session_id,
+                "item": tc,
+            },
+        }
+        if ts:
+            ev["timestamp"] = ts
+        lines.append(ev)
+
+    # text chunk events
+    offset = 1 + len(tc_list)
+    for i, txt in enumerate(txt_list):
+        ts = ts_list[offset + i] if offset + i < len(ts_list) else None
+        ev = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": session_id,
+                "item": {
+                    "type": "AgentResponse",
+                    "id": f"text-{i}",
+                    "text": txt,
+                },
+            },
+        }
+        if ts:
+            ev["timestamp"] = ts
+        lines.append(ev)
+
+    # token_usage_record
+    if token_usage is not None:
+        tu_ts = ts_list[-1] if len(ts_list) > offset + len(txt_list) else None
+        tu: dict = {
+            "type": "token_usage_record",
+            "payload": {"thread_token_usage": token_usage},
+        }
+        if tu_ts:
+            tu["timestamp"] = tu_ts
+        lines.append(tu)
+
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+
+def test_codex_build_inserts_session_row(tmp_path: Path):
+    """Building with a Codex source inserts one sessions row with correct fields."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_timeline(
+        codex_dir / "sess.jsonl",
+        "codex-sess-1",
+        tool_calls=[
+            {"type": "CommandExecution", "id": "e1", "command": "pwd", "stdout": "/work"},
+        ],
+        timestamps=[
+            "2026-09-05T10:00:00Z",
+            "2026-09-05T10:00:01Z",
+            "2026-09-05T10:00:02Z",
+        ],
+        token_usage={"input_tokens": 500, "cached_input_tokens": 100, "output_tokens": 200},
+    )
+
+    db_path = tmp_path / "codex_sess.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        # Exactly one sessions row
+        sess_count = scalar(connection, "SELECT count(*) FROM sessions")
+        assert sess_count == 1
+
+        row = connection.execute("SELECT * FROM sessions").fetchone()
+        assert row is not None
+        # session_id, file_path, project_dir, cwd, git_branch, cc_version, entrypoint,
+        # started_at, ended_at, n_events, n_tool_calls, input_tokens, output_tokens,
+        # cache_read_tokens, cache_creation_tokens
+        assert row[0] == "codex-sess-1"  # session_id
+        assert row[7] is not None  # started_at
+        assert row[8] is not None  # ended_at
+        assert row[9] == 0  # n_events (no text chunks)
+        assert row[10] == 1  # n_tool_calls
+        assert row[11] == 500  # input_tokens
+        assert row[12] == 200  # output_tokens
+        assert row[13] == 100  # cache_read_tokens
+        assert row[14] == 0  # cache_creation_tokens (Codex has none)
+    finally:
+        connection.close()
+
+
+def test_codex_build_inserts_events_for_text_chunks(tmp_path: Path):
+    """Text chunks become events rows; source_files.n_events matches."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_timeline(
+        codex_dir / "events.jsonl",
+        "codex-ev-1",
+        tool_calls=[
+            {"type": "CommandExecution", "id": "e1", "command": "echo a", "stdout": "a"},
+        ],
+        text_chunks=["Hello world", "Second message"],
+        timestamps=[
+            "2026-09-05T10:00:00Z",
+            "2026-09-05T10:00:01Z",
+            "2026-09-05T10:00:02Z",
+            "2026-09-05T10:00:03Z",
+        ],
+    )
+
+    db_path = tmp_path / "codex_ev.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        # Two events from the two text chunks
+        ev_count = scalar(connection, "SELECT count(*) FROM events")
+        assert ev_count == 2
+
+        # source_files.n_events matches
+        sf_events = scalar(
+            connection,
+            "SELECT n_events FROM source_files WHERE file_path LIKE '%events.jsonl'",
+        )
+        assert sf_events == 2
+
+        # Events have correct text and timestamps
+        rows = connection.execute(
+            "SELECT text, ts, role FROM events ORDER BY seq"
+        ).fetchall()
+        assert rows[0][0] == "Hello world"
+        assert rows[0][2] == "assistant"
+        assert rows[1][0] == "Second message"
+    finally:
+        connection.close()
+
+
+def test_codex_build_tool_call_ts_populated(tmp_path: Path):
+    """tool_calls.ts is non-NULL when record timestamps are present."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_timeline(
+        codex_dir / "ts.jsonl",
+        "codex-ts-1",
+        tool_calls=[
+            {"type": "CommandExecution", "id": "e1", "command": "pwd", "stdout": "/"},
+        ],
+        timestamps=[
+            "2026-09-05T10:00:00Z",
+            "2026-09-05T10:00:05Z",
+        ],
+    )
+
+    db_path = tmp_path / "codex_ts.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        ts = scalar(
+            connection,
+            "SELECT ts FROM tool_calls WHERE tool_use_id = 'e1'",
+        )
+        assert ts is not None
+    finally:
+        connection.close()
+
+
+def test_codex_build_no_text_no_events(tmp_path: Path):
+    """A Codex file with no text chunks still yields zero events."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "notext.jsonl",
+        "codex-notext",
+        [{"type": "CommandExecution", "id": "e1", "command": "pwd", "stdout": "/"}],
+    )
+
+    db_path = tmp_path / "codex_notext.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        ev_count = scalar(connection, "SELECT count(*) FROM events")
+        assert ev_count == 0
+        sf_events = scalar(
+            connection,
+            "SELECT n_events FROM source_files WHERE file_path LIKE '%notext.jsonl'",
+        )
+        assert sf_events == 0
+    finally:
+        connection.close()
+
+
+def test_codex_build_rebuild_replaces_sessions_and_events(tmp_path: Path):
+    """Rebuilding a Codex file replaces old sessions/events (no orphans)."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+
+    _write_codex_session_with_timeline(
+        codex_dir / "rebuild.jsonl",
+        "codex-rb",
+        tool_calls=[{"type": "CommandExecution", "id": "e1", "command": "pwd", "stdout": "/a"}],
+        text_chunks=["first"],
+        timestamps=["2026-09-05T10:00:00Z", "2026-09-05T10:00:01Z", "2026-09-05T10:00:02Z"],
+    )
+
+    db_path = tmp_path / "codex_rb.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 1
+        assert scalar(connection, "SELECT count(*) FROM events") == 1
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+    finally:
+        connection.close()
+
+    # Rebuild with different data
+    _write_codex_session_with_timeline(
+        codex_dir / "rebuild.jsonl",
+        "codex-rb",
+        tool_calls=[
+            {"type": "CommandExecution", "id": "e1", "command": "pwd", "stdout": "/b"},
+            {"type": "CommandExecution", "id": "e2", "command": "ls", "stdout": "file"},
+        ],
+        text_chunks=["first", "second", "third"],
+        timestamps=["2026-09-05T10:00:00Z", "2026-09-05T10:00:01Z", "2026-09-05T10:00:02Z",
+                     "2026-09-05T10:00:03Z", "2026-09-05T10:00:04Z"],
+    )
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 1
+        assert scalar(connection, "SELECT count(*) FROM events") == 3
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 2
+    finally:
+        connection.close()
