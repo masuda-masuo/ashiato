@@ -41,6 +41,8 @@ from pathlib import Path
 
 import duckdb
 
+from ashiato.codex import ParsedCodexFile
+from ashiato.codex import parse_file as parse_codex_file
 from ashiato.cursor import ParsedCursorFile
 from ashiato.cursor import parse_file as parse_cursor_file
 from ashiato.opencode import ParsedOpenCodeFile
@@ -58,6 +60,7 @@ from ashiato.recall import (
     RECALL_CALL_COLUMNS,
     RecallCall,
     extract_from_claude,
+    extract_from_codex,
     extract_from_cursor,
     extract_from_opencode,
 )
@@ -66,6 +69,7 @@ from ashiato.schema import (
     DENIAL_FOLLOWUPS_SQL,
     FORMAT_VERSION,
     INFO_TABLES,
+    META_CODEX_SOURCES_KEY,
     META_CURSOR_SOURCES_KEY,
     META_FORMAT_KEY,
     META_OPENCODE_SOURCES_KEY,
@@ -83,6 +87,9 @@ from ashiato.schema import (
 
 #: Where Claude Code keeps its transcripts.
 DEFAULT_SOURCE = Path("~/.claude/projects")
+
+#: Where Codex keeps its sessions.
+DEFAULT_CODEX_SOURCE = Path("~/.codex/sessions")
 
 #: Below this many rows the temp file costs more than the row-by-row insert.
 BULK_INSERT_MIN_ROWS = 8
@@ -134,6 +141,7 @@ class DatabaseInfo:
     sources: list[tuple[str, int]] | None = None
     opencode_sources: list[tuple[str, int]] | None = None
     cursor_sources: list[tuple[str, int]] | None = None
+    codex_sources: list[tuple[str, int]] | None = None
     #: Number of files under the recorded roots that are not in source_files,
     #: or have a different size/mtime.  ``None`` when roots are unknown.
     freshness_gap: int | None = None
@@ -270,6 +278,7 @@ def create_schema(
     sources: Sequence[str | Path] | None = None,
     opencode_sources: Sequence[str | Path] | None = None,
     cursor_sources: Sequence[str | Path] | None = None,
+    codex_sources: Sequence[str | Path] | None = None,
 ) -> None:
     """Create the tables, format marker, views, and recorded roots on a fresh database.
 
@@ -332,6 +341,12 @@ def create_schema(
                 f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
                 [META_CURSOR_SOURCES_KEY, json.dumps(resolved)],
             )
+        if codex_sources is not None:
+            resolved = [str(Path(s).expanduser().resolve()) for s in codex_sources]
+            connection.execute(
+                f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
+                [META_CODEX_SOURCES_KEY, json.dumps(resolved)],
+            )
         connection.execute(DENIAL_FOLLOWUPS_SQL)
         connection.execute(RECALL_FOLLOWUPS_SQL)
         connection.execute("COMMIT")
@@ -389,6 +404,7 @@ def _compute_freshness_gap(
     sources: list[str],
     opencode_sources: list[str],
     cursor_sources: list[str],
+    codex_sources: list[str] = [],
 ) -> int:
     """Count files under roots that are not in source_files or have different size/mtime.
 
@@ -421,6 +437,16 @@ def _compute_freshness_gap(
 
     # Check Cursor sources (*.jsonl)
     for file_path in _iter_sources(cursor_sources, "*.jsonl")[0]:
+        key = str(file_path.resolve())
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if not _is_unchanged(known, key, stat):
+            gap += 1
+
+    # Check Codex sources (*.jsonl)
+    for file_path in _iter_sources(codex_sources, "*.jsonl")[0]:
         key = str(file_path.resolve())
         try:
             stat = file_path.stat()
@@ -478,6 +504,14 @@ def iter_cursor_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list
     extension Claude Code transcripts use, but Cursor keeps its own directory
     tree (``~/.cursor/projects/<project>/agent-transcripts/<id>/<id>.jsonl``),
     so the two source lists never see each other's files in practice.
+    """
+    return _iter_sources(sources, "*.jsonl")
+
+
+def iter_codex_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
+    """(Codex session JSONL files, sources that do not exist).
+
+    Directories are searched recursively for ``*.jsonl``.
     """
     return _iter_sources(sources, "*.jsonl")
 
@@ -669,6 +703,42 @@ def _insert_cursor_parsed(
     )
 
 
+def _insert_codex_parsed(
+    connection: duckdb.DuckDBPyConnection,
+    parsed: ParsedCodexFile,
+    recall_rows: Sequence[RecallCall],
+    *,
+    stat: os.stat_result,
+    content_hash: str,
+    built_at: datetime,
+    scratch: Path | None,
+) -> None:
+    """The Codex counterpart of :func:`_insert_parsed`."""
+    _insert_rows(
+        connection,
+        "recall_calls",
+        [_recall_call_row(row) for row in recall_rows],
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "source_files",
+        [
+            (
+                parsed.file_path,
+                stat.st_size,
+                stat.st_mtime,
+                content_hash,
+                0,
+                len(parsed.tool_calls),
+                parsed.n_parse_errors,
+                built_at,
+            )
+        ],
+        scratch=scratch,
+    )
+
+
 def _fetch_cursor_kaiba_recalls(
     connection: sqlite3.Connection,
 ) -> dict[str, list[tuple[datetime | None, str]]]:
@@ -750,28 +820,19 @@ def build(
     *,
     opencode_sources: Sequence[str | Path] = (),
     cursor_sources: Sequence[str | Path] = (),
+    codex_sources: Sequence[str | Path] = (),
     kaiba_db_path: str | Path | None = None,
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
 ) -> BuildResult:
-    """Parse every transcript under *sources* / *opencode_sources* / *cursor_sources*.
-
-    *kaiba_db_path* (default :func:`ashiato.salvage.default_kaiba_db_path`) is
-    only ever opened when *cursor_sources* actually resolves to at least one
-    file: a Cursor recall call's output/timestamp is reconstructed by joining
-    its query against kaiba's own ``recalls`` ledger (see
-    :func:`ashiato.recall.extract_from_cursor`), and a build with no Cursor
-    sources has no such join to perform.  A missing or unreadable kaiba db
-    does not fail the build -- rows are produced with NULL output/ts, and
-    :attr:`BuildResult.kaiba_db_unavailable` records the path so the CLI can
-    say so.
-    """
+    """Parse every transcript under *sources* / *opencode_sources* / *cursor_sources* / *codex_sources*."""
     result = BuildResult(db_path=str(Path(db_path).expanduser()))
     claude_files, claude_missing = iter_transcripts(sources)
     opencode_files, opencode_missing = iter_opencode_sources(opencode_sources)
     cursor_files, cursor_missing = iter_cursor_sources(cursor_sources)
-    result.missing_sources = claude_missing + opencode_missing + cursor_missing
-    result.n_files = len(claude_files) + len(opencode_files) + len(cursor_files)
+    codex_files, codex_missing = iter_codex_sources(codex_sources)
+    result.missing_sources = claude_missing + opencode_missing + cursor_missing + codex_missing
+    result.n_files = len(claude_files) + len(opencode_files) + len(cursor_files) + len(codex_files)
 
     kaiba_recalls_by_query: dict[str, list[tuple[datetime | None, str]]] = {}
     if cursor_files:
@@ -796,6 +857,7 @@ def build(
             sources=sources,
             opencode_sources=opencode_sources,
             cursor_sources=cursor_sources,
+            codex_sources=codex_sources,
         )
         known = _known_sources(connection)
         built_at = datetime.now(UTC).replace(tzinfo=None)
@@ -953,6 +1015,55 @@ def build(
                 result.n_processed += 1
                 result.n_recall_calls += len(recall_rows)
                 result.n_parse_errors += parsed_cur.n_parse_errors
+
+            for path in codex_files:
+                key = str(path.resolve())
+                try:
+                    stat = path.stat()
+                except OSError:
+                    result.unreadable_files.append(key)
+                    continue
+                if _is_unchanged(known, key, stat):
+                    result.n_skipped += 1
+                    continue
+
+                try:
+                    parsed_codex = parse_codex_file(path)
+                    recall_rows = extract_from_codex(
+                        parsed_codex,
+                        result_text_limit=result_text_limit,
+                    )
+                    content_hash = _content_hash(path)
+                except OSError:
+                    result.unreadable_files.append(key)
+                    continue
+
+                stored = _store_file(
+                    connection,
+                    key=key,
+                    replace=key in known,
+                    scratch=scratch,
+                    insert=lambda attempt,
+                    parsed_codex=parsed_codex,
+                    recall_rows=recall_rows,
+                    stat=stat,
+                    content_hash=content_hash: _insert_codex_parsed(
+                        connection,
+                        parsed_codex,
+                        recall_rows,
+                        stat=stat,
+                        content_hash=content_hash,
+                        built_at=built_at,
+                        scratch=attempt,
+                    ),
+                    result=result,
+                )
+                if not stored:
+                    continue
+
+                result.n_processed += 1
+                result.n_recall_calls += len(recall_rows)
+                result.n_parse_errors += parsed_codex.n_parse_errors
     finally:
         connection.close()
     return result
@@ -992,9 +1103,10 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
         sources = _read_meta_json_list(connection, META_SOURCES_KEY)
         opencode_sources = _read_meta_json_list(connection, META_OPENCODE_SOURCES_KEY)
         cursor_sources = _read_meta_json_list(connection, META_CURSOR_SOURCES_KEY)
+        codex_sources = _read_meta_json_list(connection, META_CODEX_SOURCES_KEY)
 
         # If no roots recorded, return early with None for roots and gap
-        if sources is None and opencode_sources is None and cursor_sources is None:
+        if sources is None and opencode_sources is None and cursor_sources is None and codex_sources is None:
             return DatabaseInfo(
                 db_path=str(path),
                 table_counts=counts,
@@ -1003,6 +1115,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
                 sources=None,
                 opencode_sources=None,
                 cursor_sources=None,
+                codex_sources=None,
                 freshness_gap=None,
             )
 
@@ -1011,10 +1124,11 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
         source_counts = _count_files_per_root(known, sources or [])
         opencode_counts = _count_files_per_root(known, opencode_sources or [])
         cursor_counts = _count_files_per_root(known, cursor_sources or [])
+        codex_counts = _count_files_per_root(known, codex_sources or [])
 
         # Compute freshness gap
         freshness_gap = _compute_freshness_gap(
-            connection, sources or [], opencode_sources or [], cursor_sources or []
+            connection, sources or [], opencode_sources or [], cursor_sources or [], codex_sources or []
         )
 
         return DatabaseInfo(
@@ -1025,6 +1139,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
             sources=source_counts,
             opencode_sources=opencode_counts,
             cursor_sources=cursor_counts,
+            codex_sources=codex_counts,
             freshness_gap=freshness_gap,
         )
     finally:

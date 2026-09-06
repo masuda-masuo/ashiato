@@ -1,0 +1,40 @@
+Chain chain-mt3x9mgj4c06: tiers=1, reworkTiers=1, maxRounds=4 (can reach top tier)
+Chain chain-mt3x9mgj4c06 accepted-with-followup at round 1.
+
+**Verdict: needs-attention**
+
+Implementation is solid, read-only, correctly reuses CLI helpers, and tests are honest (real build pipeline, no mocking). One real spec deviation: JSON/CSV output uses unified id/label columns instead of the spec's explicit event_id/tool_use_id and role/tool_name columns, undermining the stated re-fetch-via-ashiato-sql use case. --whole is shipped with zero test coverage.
+
+### 1. [medium] Structured output uses generic `id`/`label` columns instead of the spec's `event_id`/`tool_use_id`/`role`/`tool_name`
+- src/ashiato/cli.py:466-494 (confidence 0.75)
+
+Issue #18 spec section 4 (Output) states explicitly: "The JSON/CSV forms carry `event_id` (or `tool_use_id`), `session_id`, `ts`, `role`/`tool_name`, the match offset(s), and the window text, so a caller can re-fetch the whole row with `ashiato sql`." The implementation in cli.py's `_grep_structured_rows` instead emits a unified `id` column (holding either an event_id or a tool_use_id depending on `source`) and a unified `label` column (holding either role or tool_name). A caller writing a generic script against `ashiato grep --format json` to re-fetch rows via `ashiato sql` cannot do `SELECT * FROM events WHERE event_id = row.event_id` without first branching on the undocumented `source` field and knowing that `id` means something different per row. This is a real interop deviation from the literal, normative spec text for a new public CLI output format that would be a breaking change to fix later.
+
+**Recommendation:** Either emit both `event_id` and `tool_use_id` columns (null for the one that doesn't apply) and both `role` and `tool_name` columns, matching the literal column names the spec calls for, or explicitly document in --help / the report that the JSON/CSV schema intentionally unifies these under `id`/`label`+`source` and get that documented as the accepted schema.
+
+### 2. [low] `--whole` flag has zero test coverage
+- tests/test_grep.py:1-361 (confidence 0.9)
+
+The spec's Output section (#4) requires `--whole` to print the full text of the matched row instead of a window, and it is fully wired in both grep.py's `_grep_windows`/`_grep_structured_rows` code paths in cli.py. Searching tests/test_grep.py for "whole" (case-insensitive) returns zero matches -- no test exercises this flag through `search()`, the CLI table path, or the CLI JSON/CSV path. Nothing catches a regression here (e.g. if `--whole` combined with `--all-matches` or `--context` starts producing the wrong text) because the whole feature is currently unverified.
+
+**Recommendation:** Add at least one CLI-level test asserting `ashiato grep PATTERN --whole` prints the full row text rather than a windowed excerpt.
+
+
+**Unverified:**
+- Did not independently re-run the fixture-scale full-scan performance the non-goals section asks to be reported if slow; probe P2's 8.2s full suite run gives no isolated signal for grep specifically.
+
+## Follow-up issue draft (not posted — orchestrator judgement required)
+
+### Completed scope
+
+- Chain: chain-mt3x9mgj4c06
+- Brief: Orchestrator: claude-fable-5 | session 36fce60d-587e-469e-bc47-22275728771d | 2026-08-22
+
+### Remaining findings
+
+- [medium] Structured output uses generic `id`/`label` columns instead of the spec's `event_id`/`tool_use_id`/`role`/`tool_name` (src/ashiato/cli.py:466)
+- [low] `--whole` flag has zero test coverage (tests/test_grep.py:1)
+
+These findings were deferred by the accept-with-followup economic cutoff. The orchestrator should review and decide whether to handle them.
+
+review record: /home/masuda/.kusabi/406c0baee14d/chains/chain-mt3x9mgj4c06/review-record.md

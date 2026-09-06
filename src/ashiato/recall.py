@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
 
+from ashiato.codex import CodexToolCall, ParsedCodexFile
 from ashiato.cursor import CursorToolCall, ParsedCursorFile
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, ParsedFile
@@ -34,6 +35,7 @@ from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, ParsedFile
 #: Tool names that identify a kaiba recall call, one per source format.
 CLAUDE_RECALL_TOOL = "mcp__kaiba__recall"
 OPENCODE_RECALL_TOOL = "kaiba_recall"
+CODEX_RECALL_TOOL = "mcp__kaiba__recall"
 
 #: Cursor calls every MCP tool through one block name, ``CallMcpTool``; which
 #: MCP tool it is comes from ``input.server`` / ``input.toolName`` instead of
@@ -46,6 +48,7 @@ CURSOR_RECALL_TOOL = "recall"
 SOURCE_CLAUDE_CODE = "claude_code"
 SOURCE_OPENCODE = "opencode"
 SOURCE_CURSOR = "cursor"
+SOURCE_CODEX = "codex"
 
 #: How much of a session's post-recall activity is scanned for "was this
 #: used" evidence: whichever bound is hit first.  Generous on purpose --
@@ -439,6 +442,60 @@ def extract_from_cursor(
                 source=SOURCE_CURSOR,
                 seq=call.seq,
                 ts=ts,
+                call_id=call.call_id,
+                query=query,
+                output=output,
+                output_truncated=output_truncated,
+                followup_text=followup_text or None,
+                followup_truncated=followup_truncated,
+                overlap_tokens=json.dumps(overlap_tokens, ensure_ascii=False),
+                overlap_count=overlap_count,
+            )
+        )
+    return rows
+
+
+def extract_from_codex(
+    parsed: ParsedCodexFile, *, result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT
+) -> list[RecallCall]:
+    """Completed kaiba recall calls from Codex session files."""
+    activity: dict[str | None, list[_Activity]] = {}
+    for chunk in parsed.text_chunks:
+        activity.setdefault(chunk.session_id, []).append(_Activity(chunk.seq, chunk.text))
+    for call in parsed.tool_calls:
+        text = " ".join(
+            part for part in (call.tool_name, json.dumps(call.input) if call.input else None, call.output) if part
+        )
+        if text:
+            activity.setdefault(call.session_id, []).append(_Activity(call.seq, text))
+    for items in activity.values():
+        items.sort(key=lambda item: item.seq)
+
+    rows: list[RecallCall] = []
+    for call in parsed.tool_calls:
+        if call.tool_name != CODEX_RECALL_TOOL:
+            continue
+        query = None
+        if call.input:
+            v = call.input.get("query")
+            if isinstance(v, str):
+                query = v
+
+        output = call.output[:result_text_limit] if call.output else None
+        output_truncated = bool(call.output) and len(call.output) > result_text_limit
+
+        prefix, suffix = _split(activity.get(call.session_id, []), call.seq)
+        followup_text, followup_truncated = _bounded_suffix(suffix)
+        overlap_tokens, overlap_count = _overlap(output, prefix, suffix)
+
+        rows.append(
+            RecallCall(
+                recall_id=f"{call.file_path}:{call.call_id}",
+                session_id=call.session_id,
+                file_path=call.file_path,
+                source=SOURCE_CODEX,
+                seq=call.seq,
+                ts=None,
                 call_id=call.call_id,
                 query=query,
                 output=output,
