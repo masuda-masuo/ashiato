@@ -618,6 +618,7 @@ def test_info_on_database_without_root_keys_reports_unknown(
     # Remove the root-recording meta keys to simulate an old database
     from ashiato.build import connect
     from ashiato.schema import (
+        META_CODEX_SOURCES_KEY,
         META_CURSOR_SOURCES_KEY,
         META_OPENCODE_SOURCES_KEY,
         META_SOURCES_KEY,
@@ -627,8 +628,8 @@ def test_info_on_database_without_root_keys_reports_unknown(
     conn = connect(path)
     try:
         conn.execute(
-            f'DELETE FROM "{META_TABLE}" WHERE key IN (?, ?, ?)',
-            [META_SOURCES_KEY, META_OPENCODE_SOURCES_KEY, META_CURSOR_SOURCES_KEY],
+            f'DELETE FROM "{META_TABLE}" WHERE key IN (?, ?, ?, ?)',
+            [META_SOURCES_KEY, META_OPENCODE_SOURCES_KEY, META_CURSOR_SOURCES_KEY, META_CODEX_SOURCES_KEY],
         )
     finally:
         conn.close()

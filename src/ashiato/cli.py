@@ -383,7 +383,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     sources = args.source or [str(DEFAULT_SOURCE)]
     opencode_sources = args.opencode_source or []
     cursor_sources = args.cursor_source or []
-    codex_sources = args.codex_source or [str(DEFAULT_CODEX_SOURCE)]
+    codex_sources = args.codex_source or []
     kaiba_db_path = Path(args.kaiba_db).expanduser() if args.kaiba_db else None
     db_path = _resolve_db(args.db)
     try:
