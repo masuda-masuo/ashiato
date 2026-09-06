@@ -485,7 +485,12 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
     print(f"time window: {window}", file=out)
 
     # Ingested roots
-    if info.sources is None and info.opencode_sources is None and info.cursor_sources is None:
+    if (
+        info.sources is None
+        and info.opencode_sources is None
+        and info.cursor_sources is None
+        and info.codex_sources is None
+    ):
         print(
             "ingested roots: unknown (database built before root recording; "
             "rebuild to record them)",
@@ -496,6 +501,7 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
         _print_roots("  sources", info.sources or [], out)
         _print_roots("  opencode_sources", info.opencode_sources or [], out)
         _print_roots("  cursor_sources", info.cursor_sources or [], out)
+        _print_roots("  codex_sources", info.codex_sources or [], out)
 
     # Freshness gap
     if info.freshness_gap is None:

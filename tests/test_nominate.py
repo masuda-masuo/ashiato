@@ -394,7 +394,7 @@ class TestNormalizeCommand:
 
 class TestFormatVersion:
     def test_format_version_is_unchanged(self) -> None:
-        assert FORMAT_VERSION == 5
+        assert FORMAT_VERSION == 6
 
 
 # ---------------------------------------------------------------- negative-fact miner tests
