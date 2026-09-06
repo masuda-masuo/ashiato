@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from ashiato.parser import parse_timestamp
+
 
 @dataclass(slots=True)
 class CodexToolCall:
@@ -21,6 +23,7 @@ class CodexToolCall:
     session_id: str | None
     file_path: str
     seq: int
+    ts: datetime | None
     tool_name: str | None
     input: dict | None
     output: str | None
@@ -33,6 +36,7 @@ class CodexTextChunk:
     session_id: str | None
     file_path: str
     seq: int
+    ts: datetime | None
     text: str
 
 
@@ -45,6 +49,15 @@ class ParsedCodexFile:
     tool_calls: list[CodexToolCall]
     text_chunks: list[CodexTextChunk]
     n_parse_errors: int
+    #: Earliest timestamp across all records (min of record timestamps).
+    started_at: datetime | None
+    #: Latest timestamp across all records (max of record timestamps).
+    ended_at: datetime | None
+    #: Final ``thread_token_usage`` from the last ``token_usage_record``,
+    #: or zero when the file contains no such record.
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
 
 
 def _read_records(path: Path) -> tuple[list[tuple[int, dict]], int]:
@@ -77,11 +90,21 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
     tool_calls: list[CodexToolCall] = []
     text_chunks: list[CodexTextChunk] = []
 
+    timestamps: list[datetime] = []
+    # Accumulate thread_token_usage; last token_usage_record wins.
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_tokens = 0
+
     for seq, record in records:
         rec_type = record.get("type")
         payload = record.get("payload")
         if not isinstance(payload, dict):
             payload = {}
+
+        record_ts = parse_timestamp(record.get("timestamp"))
+        if record_ts is not None:
+            timestamps.append(record_ts)
 
         if rec_type == "session_meta":
             if not session_id:
@@ -109,6 +132,7 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                 session_id=session_id,
                                 file_path=file_path,
                                 seq=seq,
+                                ts=record_ts,
                                 tool_name="Bash",
                                 input={"command": cmd} if isinstance(cmd, (list, str)) else {},
                                 output=str(stdout) if stdout else None,
@@ -126,6 +150,7 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                 session_id=session_id,
                                 file_path=file_path,
                                 seq=seq,
+                                ts=record_ts,
                                 tool_name=str(tool_name),
                                 input=args if isinstance(args, dict) else {},
                                 output=str(res) if res else None,
@@ -139,12 +164,23 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                     session_id=session_id,
                                     file_path=file_path,
                                     seq=seq,
+                                    ts=record_ts,
                                     text=txt,
                                 )
                             )
 
+        elif rec_type == "token_usage_record":
+            tu = payload.get("thread_token_usage")
+            if isinstance(tu, dict):
+                input_tokens = int(tu.get("input_tokens") or 0)
+                output_tokens = int(tu.get("output_tokens") or 0)
+                cache_read_tokens = int(tu.get("cached_input_tokens") or 0)
+
     if not session_id:
         session_id = path.stem
+
+    started_at = min(timestamps) if timestamps else None
+    ended_at = max(timestamps) if timestamps else None
 
     return ParsedCodexFile(
         file_path=file_path,
@@ -152,4 +188,9 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
         tool_calls=tool_calls,
         text_chunks=text_chunks,
         n_parse_errors=n_parse_errors,
+        started_at=started_at,
+        ended_at=ended_at,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
     )
