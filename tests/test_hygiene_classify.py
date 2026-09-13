@@ -166,6 +166,77 @@ def test_argv_list_commands_decode_to_actual_argv() -> None:
     assert categories_for("Bash", ["echo", "kusabi-companion status"], "ok") == ()
 
 
+# ------------------------------------------------------- shell -c wrapper
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        # the exact persisted Codex shape: /bin/bash -lc SCRIPT
+        (["/bin/bash", "-lc", "kusabi-companion status"], {"companion_status_poll"}),
+        (["/bin/bash", "-lc", "cat /etc/hosts"], {"host_file_hunt"}),
+        (["/bin/bash", "-lc", "rg TODO /home/dev/proj"], {"host_file_hunt"}),
+        (["/bin/bash", "-lc", "curl -s http://127.0.0.1:8750/mcp"], {"raw_local_mcp_http"}),
+        # bash and sh, -c and -lc, with and without the /bin path prefix
+        (["bash", "-c", "kusabi-companion status"], {"companion_status_poll"}),
+        (["bash", "-lc", "cat /etc/hosts"], {"host_file_hunt"}),
+        (["sh", "-c", "kusabi-companion status"], {"companion_status_poll"}),
+        (["/bin/sh", "-lc", "cat /etc/hosts"], {"host_file_hunt"}),
+        (["/bin/bash", "-c", "curl http://localhost:8765/health"], {"raw_local_mcp_http"}),
+    ],
+)
+def test_shell_c_wrapper_unwraps_exact_forms(argv: list[str], expected: set[str]) -> None:
+    assert set(categories_for("Bash", argv, "ok")) == expected
+
+
+def test_shell_c_wrapper_string_commands_unwrap_too() -> None:
+    """The wrapper is recognized in the string command form too, where the
+    conservative tokenizer produces the same argv shape."""
+    assert categories_for("Bash", 'bash -lc "kusabi-companion status"', "ok") == ("companion_status_poll",)
+    assert categories_for("Bash", "sh -c 'cat /etc/hosts'", "ok") == ("host_file_hunt",)
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        # missing -c: not a wrapper, and bash is not a hunted/curl/poll program
+        (["bash", "kusabi-companion", "status"], set()),
+        # unsupported flags before the wrapper flag: the exact form is absent
+        (["bash", "-x", "-c", "kusabi-companion status"], set()),
+        (["bash", "--noprofile", "-lc", "cat /etc/hosts"], set()),
+        # quoted output: echo is still the executed command, not the signal
+        (["bash", "-c", "echo 'kusabi-companion status'"], set()),
+        (["bash", "-c", 'echo "cat /etc/hosts"'], set()),
+        # arbitrary and nested wrappers are not descended into
+        (["env", "bash", "-c", "kusabi-companion status"], set()),
+        (["bash", "-c", "sh", "-c", "kusabi-companion status"], set()),
+        # a wrapper program that is not bash/sh is not unwrapped
+        (["zsh", "-c", "kusabi-companion status"], set()),
+        (["python", "-c", "print('cat /etc/hosts')"], set()),
+        # a script split across argv elements is not the single-argument form
+        (["bash", "-c", "cat", "/etc/hosts"], set()),
+        (["bash", "-lc", "kusabi-companion", "status"], set()),
+    ],
+)
+def test_shell_c_wrapper_near_misses_do_not_classify(argv: list[str], expected: set[str]) -> None:
+    assert set(categories_for("Bash", argv, "ok")) == expected
+
+
+def test_shell_c_wrapper_script_still_first_command_only() -> None:
+    """Compound commands inside SCRIPT are not descended into: the first
+    command of the script is the executed command, exactly as for an
+    unwrapped command line."""
+    assert categories_for(
+        "Bash",
+        ["bash", "-c", "cat /etc/hosts && curl http://127.0.0.1:8750/mcp"],
+        "ok",
+    ) == ("host_file_hunt",)
+    assert categories_for("Bash", ["bash", "-c", "echo hi; kusabi-companion status"], "ok") == ()
+    assert categories_for("Bash", ["bash", "-c", "curl http://127.0.0.1:8750/mcp && cat /etc/hosts"], "ok") == (
+        "raw_local_mcp_http",
+    )
+
+
 def test_long_curl_url_beyond_summary_truncation_counts() -> None:
     """A loopback MCP URL that sits past the 200-char input_summary boundary
     must still classify from the full command (this fails against a summary
@@ -284,5 +355,31 @@ def test_argv_list_commands_classify_end_to_end(tmp_path: Path) -> None:
     counts = {cat["name"]: cat for cat in report["categories"]}
     assert counts["host_file_hunt"]["tool_calls"] == 1
     assert counts["companion_status_poll"]["tool_calls"] == 1
+    assert counts["raw_local_mcp_http"]["tool_calls"] == 1
+    assert report["coverage"]["tool_calls"] == 3
+
+
+def test_codex_shell_wrapper_argv_classify_end_to_end(tmp_path: Path) -> None:
+    """The exact persisted Codex shape -- ``input.command`` as a JSON argv
+    list wrapped in ``/bin/bash -lc`` -- classifies through the real build
+    pipeline and the audit report: one companion poll, one cat hunt, one
+    loopback curl."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _bash_call("ses-poll", ["/bin/bash", "-lc", "kusabi-companion status"], source)
+    _bash_call("ses-hunt", ["/bin/bash", "-lc", "cat /etc/hosts"], source)
+    _bash_call("ses-curl", ["/bin/bash", "-lc", "curl -s http://127.0.0.1:8750/mcp"], source)
+
+    db_path = tmp_path / "wrapper.duckdb"
+    assert main(["build", "--source", str(source), "--db", str(db_path)]) == 0
+    connection = connect(db_path, read_only=True)
+    try:
+        report = audit(connection)
+    finally:
+        connection.close()
+
+    counts = {cat["name"]: cat for cat in report["categories"]}
+    assert counts["companion_status_poll"]["tool_calls"] == 1
+    assert counts["host_file_hunt"]["tool_calls"] == 1
     assert counts["raw_local_mcp_http"]["tool_calls"] == 1
     assert report["coverage"]["tool_calls"] == 3

@@ -31,8 +31,14 @@ string (shell-tokenized by :func:`_shell_tokens`) or a JSON argv list -- the
 Codex ``input.command`` form -- which decodes to its actual argv without
 turning arbitrary prose or objects into commands.  :func:`_shell_tokens` is a
 deliberately small tokenizer that resolves quotes but not compound forms
-(``&&``, pipes, ``bash -c '...'``), so classification is conservative: only
-the first command of a line counts as the executed command.
+(``&&``, pipes), so classification is conservative: only the first command of
+a line counts as the executed command.  The one exception is the exact shell
+wrapper form ``bash -c SCRIPT`` / ``bash -lc SCRIPT`` (and the ``/bin/bash``
+/ ``sh`` / ``/bin/sh`` equivalents), which is unwrapped -- SCRIPT is
+re-tokenized with the same conservative tokenizer and then classified -- but
+no arbitrary wrapper, variable expansion, or nested command is descended
+into, so an argv element that merely mentions a signal never classifies
+unless it is the script argument of one of those exact forms.
 
 ``raw_local_mcp_http`` classifies the curl *request target*, not any
 URL-shaped option argument: common curl options that consume a following
@@ -183,6 +189,41 @@ def _shell_tokens(command: str | None) -> list[str]:
     return tokens
 
 
+#: Shell programs whose exact ``-c``/``-lc`` wrapper is unwrapped before the
+#: category rules run: ``bash -c SCRIPT``, ``bash -lc SCRIPT``, and the
+#: ``/bin/bash`` / ``sh`` / ``/bin/sh`` equivalents.  The wrapper is the
+#: executed program only in the mechanical sense; the script argument is the
+#: command being classified.
+_WRAPPER_PROGRAMS: frozenset[str] = frozenset({"bash", "sh"})
+
+#: The exact wrapper flags whose single following argument is the script.
+_WRAPPER_FLAGS: frozenset[str] = frozenset({"-c", "-lc"})
+
+
+def _unwrap_shell_wrapper(tokens: list[str]) -> list[str]:
+    """The executed command when *tokens* is a direct shell ``-c`` wrapper.
+
+    Only the exact three-argument forms ``bash -c SCRIPT``, ``bash -lc
+    SCRIPT`` (and the ``/bin/bash`` / ``sh`` / ``/bin/sh`` equivalents) are
+    unwrapped: the script argument is re-tokenized with the conservative
+    tokenizer, so compound commands inside SCRIPT still follow the
+    first-command-only boundary and quoted text stays inside one token.
+    Everything else -- a missing ``-c``, extra flags, a wrapper around a
+    wrapper, a non-``bash``/``sh`` program, an argv element that merely
+    mentions a command word -- is returned unchanged, so the ordinary
+    first-command rules apply and no signal is invented.
+    """
+    if len(tokens) != 3:
+        return tokens
+    if not all(isinstance(token, str) for token in tokens):
+        return tokens
+    if Path(tokens[0]).name not in _WRAPPER_PROGRAMS:
+        return tokens
+    if tokens[1] not in _WRAPPER_FLAGS:
+        return tokens
+    return _shell_tokens(tokens[2])
+
+
 def _program(tokens: list[str]) -> str:
     """Basename of the executed program, or ``""`` when there is no command."""
     if not tokens:
@@ -315,13 +356,16 @@ def categories_for(
     ``command`` is what to classify for shell rows: the full persisted
     ``input`` command text (tokenized here), its decoded argv list (the Codex
     JSON-array form), or the ``input_summary`` fallback (see
-    :func:`_command_tokens`).  The single classification point: the CLI never
-    re-implements a category rule, and a future thin MCP adapter can reuse
-    this function directly.
+    :func:`_command_tokens`).  An exact ``bash``/``sh`` ``-c``/``-lc``
+    wrapper is unwrapped before the rules run (see
+    :func:`_unwrap_shell_wrapper`).  The single classification point: the CLI
+    never re-implements a category rule, and a future thin MCP adapter can
+    reuse this function directly.
     """
     matched: list[str] = []
     if tool_name in _SHELL_TOOLS:
         tokens = _shell_tokens(command) if isinstance(command, str) else list(command or ())
+        tokens = _unwrap_shell_wrapper(tokens)
         if _is_companion_status_poll(tokens):
             matched.append("companion_status_poll")
         if _is_host_file_hunt(tokens):
