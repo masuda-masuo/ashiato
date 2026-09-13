@@ -724,3 +724,123 @@ def test_hygiene_accepts_db_and_window_flags(
         "undo_file_edit",
         "pending_tool_call",
     ]
+# ---------------------------------------------------------------- session-trace
+
+MAIN_SESSION = "11111111-1111-4111-8111-111111111111"
+
+
+def test_session_trace_help_exits_zero():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["session-trace", "--help"])
+    assert excinfo.value.code == 0
+
+
+def test_session_trace_accepts_db_format_limit_and_excerpt_flags(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """The command accepts the database plus --format/--limit/
+    --max-excerpt-chars together, and the JSON shape is the frozen one."""
+    assert (
+        main(
+            [
+                "session-trace",
+                MAIN_SESSION,
+                "--db",
+                str(db),
+                "--format",
+                "json",
+                "--limit",
+                "2",
+                "--max-excerpt-chars",
+                "10",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"session", "coverage", "timeline"}
+    assert payload["session"]["session_id"] == MAIN_SESSION
+    assert payload["coverage"]["returned"] == 2
+    assert len(payload["timeline"]) == 2
+
+
+def test_session_trace_resolves_a_unique_prefix(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert main(["session-trace", "11111111", "--db", str(db), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["session"]["session_id"] == MAIN_SESSION
+
+
+def test_session_trace_missing_prefix_exits_one(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    prefix = "99999999-9999-4999-8999-999999999999"
+    assert main(["session-trace", prefix, "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert prefix in err
+    assert "no session" in err
+
+
+def test_session_trace_on_a_missing_database_fails_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert (
+        main(["session-trace", MAIN_SESSION, "--db", str(tmp_path / "nope.duckdb")]) == 1
+    )
+    assert "no database at" in capsys.readouterr().err
+
+
+def test_session_trace_on_a_database_without_the_view_fails_cleanly(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """An older database has no view; that is an error message, not a traceback."""
+    connection = connect(db)
+    try:
+        connection.execute("DROP VIEW recall_followups")
+    finally:
+        connection.close()
+    assert main(["session-trace", MAIN_SESSION, "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    assert "recall_followups" in err
+    assert "delete the database file and build again" in err
+
+
+def test_session_trace_rejects_a_negative_limit(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["session-trace", "x", "--limit", "-1"])
+    assert excinfo.value.code == 2
+    assert "must be 0 or greater" in capsys.readouterr().err
+
+
+def test_session_trace_rejects_a_negative_excerpt_limit(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["session-trace", "x", "--max-excerpt-chars", "-1"])
+    assert excinfo.value.code == 2
+    assert "must be 0 or greater" in capsys.readouterr().err
+
+
+def test_session_trace_rejects_an_unknown_format(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["session-trace", "x", "--format", "csv"])
+    assert excinfo.value.code == 2
+    assert "invalid choice: 'csv'" in capsys.readouterr().err
+
+
+def test_session_trace_table_format_carries_the_essentials(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert main(["session-trace", MAIN_SESSION, "--db", str(db), "--format", "table"]) == 0
+
+
+def test_session_trace_does_not_modify_the_duckdb_file(db: Path):
+    before = db.stat().st_mtime_ns
+    main(["session-trace", MAIN_SESSION, "--db", str(db)])
+    assert db.stat().st_mtime_ns == before

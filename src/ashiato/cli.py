@@ -42,6 +42,14 @@ from ashiato.schema import (
     TABLES,
     VIEW_COLUMNS,
 )
+from ashiato.session_trace import (
+    DEFAULT_EXCERPT_CHARS as DEFAULT_SESSION_TRACE_EXCERPT,
+)
+from ashiato.session_trace import (
+    DEFAULT_LIMIT as DEFAULT_SESSION_TRACE_LIMIT,
+)
+from ashiato.session_trace import SessionResolutionError, resolve_session
+from ashiato.session_trace import trace as session_trace
 
 FORMATS = ("table", "json", "csv")
 
@@ -127,6 +135,38 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"maximum rows, 0 for all (default {DEFAULT_RECALL_LIMIT})",
     )
     recalls_parser.add_argument("--session", metavar="ID", help="restrict to one session")
+
+    session_trace_parser = subparsers.add_parser(
+        "session-trace",
+        help="one session's interleaved text and tool-call timeline",
+    )
+    session_trace_parser.add_argument(
+        "session_prefix",
+        metavar="SESSION_PREFIX",
+        help="session id, or a unique prefix of it",
+    )
+    session_trace_parser.add_argument("--db", metavar="PATH", help="database path")
+    session_trace_parser.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="output format (default table)",
+    )
+    session_trace_parser.add_argument(
+        "--limit",
+        type=_row_limit,
+        default=DEFAULT_SESSION_TRACE_LIMIT,
+        metavar="N",
+        help=f"maximum timeline rows, 0 for all (default {DEFAULT_SESSION_TRACE_LIMIT})",
+    )
+    session_trace_parser.add_argument(
+        "--max-excerpt-chars",
+        type=_row_limit,
+        default=DEFAULT_SESSION_TRACE_EXCERPT,
+        metavar="N",
+        help="maximum characters of each text/result excerpt, 0 for uncapped "
+        f"(default {DEFAULT_SESSION_TRACE_EXCERPT})",
+    )
 
     info_parser = subparsers.add_parser("info", help="describe the database")
     info_parser.add_argument("--db", metavar="PATH", help="database path")
@@ -483,6 +523,58 @@ def _run_recalls(args: argparse.Namespace, out: Any, err: Any) -> int:
     return _run_query(_resolve_db(args.db), query, params, args.format, out, err)
 
 
+def _print_session_trace_table(payload: dict[str, Any], out: Any) -> None:
+    columns = ("seq", "ts", "kind", "id", "role", "tool_name", "outcome", "excerpt")
+    rows = [
+        [
+            row["seq"],
+            row["ts"],
+            row["kind"],
+            row["id"],
+            row.get("role"),
+            row.get("tool_name"),
+            row.get("outcome"),
+            row.get("excerpt"),
+        ]
+        for row in payload["timeline"]
+    ]
+    _print_table(columns, rows, out)
+
+
+def _run_session_trace(args: argparse.Namespace, out: Any, err: Any) -> int:
+    db_path = _resolve_db(args.db)
+    if not db_path.exists():
+        print(f"error: no database at {db_path} (run 'ashiato build' first)", file=err)
+        return 1
+    connection = connect(db_path, read_only=True)
+    try:
+        assert_readable(connection)
+        session_id = resolve_session(connection, args.session_prefix)
+        payload = session_trace(
+            connection,
+            session_id,
+            limit=args.limit,
+            max_excerpt_chars=args.max_excerpt_chars,
+        )
+    except SessionResolutionError as error:
+        print(f"error: {error}", file=err)
+        return 1
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
+    except duckdb.Error as error:
+        print(f"error: {error}", file=err)
+        return 1
+    finally:
+        connection.close()
+
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False), file=out)
+    else:
+        _print_session_trace_table(payload, out)
+    return 0
+
+
 def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
     db_path = _resolve_db(args.db)
     if not db_path.exists():
@@ -812,6 +904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_denials(args, out, err)
     if args.command == "recalls":
         return _run_recalls(args, out, err)
+    if args.command == "session-trace":
+        return _run_session_trace(args, out, err)
     if args.command == "info":
         return _run_info(args, out, err)
     if args.command == "schema":
