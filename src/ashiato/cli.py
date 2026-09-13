@@ -30,6 +30,7 @@ from ashiato.grep import Hit, InvalidPattern
 from ashiato.grep import search as grep_search
 from ashiato.grep import visible as grep_visible
 from ashiato.grep import window as grep_window
+from ashiato.hygiene import audit as hygiene_audit
 from ashiato.nominate import run as nominate_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
@@ -210,6 +211,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     nominate_parser.add_argument(
         "--json", action="store_true", dest="json_output", help="output as JSON"
+    )
+
+    hygiene_parser = subparsers.add_parser(
+        "hygiene",
+        help="named session-hygiene audit: companion polls, host-file hunts, "
+        "raw MCP curl, undo calls, pending calls",
+    )
+    hygiene_parser.add_argument("--db", metavar="PATH", help="database path")
+    hygiene_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only count calls at or after this ISO-8601 timestamp",
+    )
+    hygiene_parser.add_argument(
+        "--until",
+        type=_parse_since,
+        metavar="TS",
+        help="only count calls at or before this ISO-8601 timestamp",
+    )
+    hygiene_parser.add_argument(
+        "--format", choices=("table", "json"), default="table", help="output format (default table)"
     )
 
     grep_parser = subparsers.add_parser(
@@ -631,6 +654,45 @@ def _run_nominate(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
 
 
+def _run_hygiene(args: argparse.Namespace, out: Any, err: Any) -> int:
+    db_path = _resolve_db(args.db)
+    if not db_path.exists():
+        print(f"error: no database at {db_path} (run 'ashiato build' first)", file=err)
+        return 1
+    connection = connect(db_path, read_only=True)
+    try:
+        assert_readable(connection)
+        report = hygiene_audit(connection, since=args.since, until=args.until)
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
+    except duckdb.Error as error:
+        print(f"error: {error}", file=err)
+        return 1
+    finally:
+        connection.close()
+
+    if args.format == "json":
+        print(json.dumps(report, indent=2, ensure_ascii=False, default=str), file=out)
+    else:
+        _print_hygiene_table(report, out)
+    return 0
+
+
+def _print_hygiene_table(report: dict[str, Any], out: Any) -> None:
+    """The table form of a hygiene report: the same counts as the JSON shape."""
+    coverage = report["coverage"]
+    since = _cell(coverage["since"]) if coverage["since"] is not None else "none"
+    until = _cell(coverage["until"]) if coverage["until"] is not None else "none"
+    print(
+        f"coverage: since {since} .. until {until}  "
+        f"{coverage['sessions']} sessions, {coverage['tool_calls']} tool calls",
+        file=out,
+    )
+    rows = [[cat["name"], cat["tool_calls"], cat["sessions"]] for cat in report["categories"]]
+    _print_table(("category", "tool_calls", "sessions"), rows, out)
+
+
 def _grep_header(hit: Hit) -> str:
     ts_text = hit.ts.isoformat() if hit.ts is not None else "NULL"
     label = f"role={hit.label}" if hit.source == "event" else f"tool={hit.label}"
@@ -760,6 +822,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_grep(args, out, err)
     if args.command == "nominate":
         return _run_nominate(args, out, err)
+    if args.command == "hygiene":
+        return _run_hygiene(args, out, err)
     return _run_info(args, out, err)
 
 

@@ -678,3 +678,49 @@ def test_freshness_gap_one_after_adding_file(tmp_path: Path, capsys: pytest.Capt
     assert main(["info", "--db", str(path)]) == 0
     out = capsys.readouterr().out
     assert "freshness: 1 new or changed file under recorded roots" in out
+# ---------------------------------------------------------------- hygiene
+
+
+def test_hygiene_help_exits_zero():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["hygiene", "--help"])
+    assert excinfo.value.code == 0
+
+
+def test_hygiene_on_a_missing_database_fails_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    assert main(["hygiene", "--db", str(tmp_path / "nope.duckdb")]) == 1
+    assert "no database at" in capsys.readouterr().err
+
+
+def test_hygiene_accepts_db_and_window_flags(
+    db: Path, capsys: pytest.CaptureFixture[str]
+):
+    """The command accepts the normal database plus --since/--until/--format
+    together, and the JSON shape is the frozen one."""
+    assert (
+        main(
+            [
+                "hygiene",
+                "--db",
+                str(db),
+                "--since",
+                "2026-08-01T00:00:00Z",
+                "--until",
+                "2026-08-31T00:00:00Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"coverage", "categories"}
+    assert [cat["name"] for cat in payload["categories"]] == [
+        "companion_status_poll",
+        "host_file_hunt",
+        "raw_local_mcp_http",
+        "undo_file_edit",
+        "pending_tool_call",
+    ]

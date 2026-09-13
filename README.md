@@ -36,6 +36,7 @@ ashiato schema [TABLE] [--db PATH]
 ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
+ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
@@ -123,6 +124,53 @@ ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min
   `stable-output` (default 1.0), `--since TS` / `--until TS` bound the time
   window, and `--json` outputs full records instead of the default one-line
   table. Exit code `0` when candidates exist, `1` when none.
+
+- `hygiene` is a named, read-only audit of session hygiene over `tool_calls`,
+  replacing the ad-hoc SQL that used to be rewritten for every such question.
+  It counts five stable signals, per category both the tool-call rows and the
+  distinct sessions they came from:
+  - `companion_status_poll` -- shell calls whose *executed command* invokes
+    `kusabi-companion status`. Other companion subcommands (`chain-show`,
+    `chain-wait`), the bare binary, and text that merely quotes the command (in
+    a tool result, in an `echo` argument, or in a `Read` of a doc) are not polls.
+  - `host_file_hunt` -- shell calls that run `rg`/`grep`/`sed`/`cat` against
+    host files. Dedicated file/search tools (`Grep`, `Read`, an MCP search
+    tool) are excluded, and hunt words that appear only in a tool result are
+    not a hunt.
+  - `raw_local_mcp_http` -- shell calls that `curl` loopback
+    (`127.0.0.1`/`localhost`) ports 8750/8765/8770. Other ports, remote hosts
+    (even on a matching port), and dedicated MCP tool calls are excluded.
+  - `undo_file_edit` -- calls whose persisted tool name is an MCP
+    `undo_file_edit` tool on any server (`mcp__<server>__undo_file_edit`);
+    prose that merely mentions the name is not a call.
+  - `pending_tool_call` -- every row with `outcome = 'pending'`, whatever its
+    tool name.
+  Categories may overlap (a pending loopback `curl` is both `raw_local_mcp_http`
+  and `pending_tool_call`). Classification reads only persisted fields --
+  `tool_name` and the command text, never `result_text` -- and the shell
+  categories tokenize the executed command, so quoted text in an argument does
+  not count as an invocation. `--since TS` / `--until TS` bound the window
+  inclusively (either bound excludes rows with a NULL timestamp; without bounds
+  they count); `--format table|json` chooses the output (default `table`, and
+  deliberately no CSV: this is a fixed structured report, not a dump). Shell
+  categories classify the full persisted `input` command when it is available:
+  a string command is shell-tokenized, and a Codex-style argv list
+  (`"command": ["cat", "/etc/hosts"]`) decodes to its actual argv -- never
+  turning arbitrary prose or objects into commands. The 200-character
+  `input_summary` is only the fallback when no usable full command can be
+  extracted, so a long command whose loopback MCP URL or
+  `kusabi-companion status` invocation sits past the summary truncation
+  boundary still counts. For `raw_local_mcp_http` only the curl *request
+  target* counts: common options that consume a following value
+  (`-H`/`--header`, `-d`/`--data*`, `-F`/`--form`, `--url`, ...) have their
+  value handled, so a loopback URL used only as a header or data value is not
+  a raw MCP call while the actual loopback target still is. The JSON
+  shape is stable: a top-level object with `coverage` (`since`/`until`
+  echoing the effective bounds, `null` when absent, plus pre-filter
+  `sessions`/`tool_calls`) and an ordered `categories` list whose objects each
+  carry exactly `name`/`tool_calls`/`sessions`. The table prints the same five
+  rows with the same counts. `hygiene` is the named audit for recurring
+  questions; arbitrary one-off investigation remains `ashiato sql`.
 
 - `schema` lists the tables and views in the ashiato schema, or shows the columns
   and types for a specific table or view. It works without a database -- the schema

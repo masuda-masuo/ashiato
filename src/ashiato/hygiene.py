@@ -1,0 +1,397 @@
+"""Named session-hygiene audit (issue #36).
+
+The five categories replace ad-hoc SQL that used to be rewritten by hand for
+every session-hygiene question:
+
+* ``companion_status_poll`` -- shell calls whose *executed command* invokes
+  ``kusabi-companion status``.  Other companion subcommands (``chain-show``,
+  ``chain-wait``), the bare binary, and text that merely *quotes* the command
+  -- in a tool result, in an ``echo`` argument, or in a ``Read`` of a doc --
+  are not polls.
+* ``host_file_hunt`` -- shell calls that run ``rg``/``grep``/``sed``/``cat``
+  against host files.  A call whose persisted tool name is a dedicated
+  file/search tool (``Grep``, ``Read``, an MCP search tool) is excluded, and
+  hunt words that appear only in a tool result are not a hunt.
+* ``raw_local_mcp_http`` -- shell calls that ``curl`` loopback
+  (``127.0.0.1``/``localhost``) ports 8750/8765/8770.  Other ports, remote
+  hosts (even on a matching port), and dedicated MCP tool calls are excluded.
+* ``undo_file_edit`` -- tool calls whose persisted ``tool_name`` is an MCP
+  ``undo_file_edit`` tool on any server (``mcp__<server>__undo_file_edit``).
+  Prose that merely mentions the name is not a call.
+* ``pending_tool_call`` -- every row with ``outcome = 'pending'``, whatever
+  its tool name.
+
+Every classification reads the *persisted* ``tool_name`` and the command only
+-- never ``result_text``: what a tool returned is evidence about the tool, not
+about what was asked for.  The command is the full persisted ``input`` command
+field when it can be used, with the 200-character ``input_summary`` kept only
+as a conservative fallback, so a long command whose signal sits past the
+summary truncation boundary still classifies.  A persisted command may be a
+string (shell-tokenized by :func:`_shell_tokens`) or a JSON argv list -- the
+Codex ``input.command`` form -- which decodes to its actual argv without
+turning arbitrary prose or objects into commands.  :func:`_shell_tokens` is a
+deliberately small tokenizer that resolves quotes but not compound forms
+(``&&``, pipes, ``bash -c '...'``), so classification is conservative: only
+the first command of a line counts as the executed command.
+
+``raw_local_mcp_http`` classifies the curl *request target*, not any
+URL-shaped option argument: common curl options that consume a following
+value (``-H``/``--header``, ``-d``/``--data*``, ``-F``/``--form``, ``--url``,
+...) have their value handled, so ``curl -H 'http://localhost:8750/'
+https://api.github.com`` is not a raw MCP call while the actual loopback
+target still is.  This is a conservative option-value skip, not a full curl
+parser.
+
+The report is computed by :func:`audit` over one bounded, read-only query and
+returned as plain data (the CLI renders it).  Categories may overlap, and the
+``coverage`` block counts every selected row and distinct session *before*
+category filtering.  This module never mutates the database.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import duckdb
+
+#: Report order; also the order of the ``categories`` list in the JSON output.
+CATEGORY_ORDER: tuple[str, ...] = (
+    "companion_status_poll",
+    "host_file_hunt",
+    "raw_local_mcp_http",
+    "undo_file_edit",
+    "pending_tool_call",
+)
+
+#: Persisted tool names whose ``input`` carries an executed shell command.
+_SHELL_TOOLS: frozenset[str] = frozenset({"Bash", "PowerShell"})
+
+_COMPANION_BIN = "kusabi-companion"
+_COMPANION_SUBCOMMAND = "status"
+
+#: Programs that inspect host files; the *executed* program must be one of these.
+_HUNT_PROGRAMS: frozenset[str] = frozenset({"rg", "grep", "sed", "cat"})
+
+_CURL_BIN = "curl"
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
+_MCP_PORTS: frozenset[int] = frozenset({8750, 8765, 8770})
+
+#: Common curl short options that consume a following value (or an attached
+#: one in the rest of the token).  A conservative list: missing an option here
+#: only means a URL-shaped value could be mistaken for a target; the listed
+#: ones cover the options most likely to carry a URL (headers, data, forms,
+#: output, proxies, auth, timing).  ``--url`` is handled separately because its
+#: value *is* the request target.
+_CURL_VALUE_OPTIONS_SHORT: frozenset[str] = frozenset(
+    {
+        "A", "b", "c", "C", "d", "D", "e", "E", "F", "H", "m",
+        "o", "r", "T", "u", "U", "w", "x", "X", "y", "Y", "z",
+    }
+)
+
+_CURL_VALUE_OPTIONS_LONG: frozenset[str] = frozenset(
+    {
+        "cacert",
+        "cert",
+        "connect-timeout",
+        "connect-to",
+        "continue-at",
+        "cookie",
+        "cookie-jar",
+        "data",
+        "data-ascii",
+        "data-binary",
+        "data-raw",
+        "data-urlencode",
+        "dump-header",
+        "form",
+        "header",
+        "key",
+        "limit-rate",
+        "max-time",
+        "output",
+        "pass",
+        "proxy",
+        "proxy-user",
+        "range",
+        "referer",
+        "request",
+        "resolve",
+        "retry",
+        "speed-limit",
+        "speed-time",
+        "time-cond",
+        "upload-file",
+        "url",
+        "user",
+        "user-agent",
+        "write-out",
+    }
+)
+
+#: An MCP undo call on any server, e.g. ``mcp__sunaba__undo_file_edit``.
+_UNDO_FILE_EDIT_RE = re.compile(r"^mcp__.+__undo_file_edit$")
+
+
+def _shell_tokens(command: str | None) -> list[str]:
+    """Split a shell command line into argv-like tokens.
+
+    Single and double quotes (with backslash escapes inside double quotes and
+    outside them) are resolved so that a hunt/poll word inside a quoted
+    argument -- ``echo "usage: kusabi-companion status"`` -- stays part of one
+    token instead of looking like an executed command.  Compound forms are not
+    resolved: only the first command of a line is considered executed, which
+    keeps the boundary honest where a full shell parser would be overkill.
+    """
+    if not command:
+        return []
+    tokens: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    length = len(command)
+    while index < length:
+        char = command[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif char == "\\" and index + 1 < length:
+                current.append(command[index + 1])
+                index += 1
+            else:
+                current.append(char)
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "\\" and index + 1 < length:
+            current.append(command[index + 1])
+            index += 1
+        elif char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _program(tokens: list[str]) -> str:
+    """Basename of the executed program, or ``""`` when there is no command."""
+    if not tokens:
+        return ""
+    return Path(tokens[0]).name
+
+
+def _is_companion_status_poll(tokens: list[str]) -> bool:
+    """The executed command is ``kusabi-companion status`` (flags allowed after)."""
+    if _program(tokens) != _COMPANION_BIN:
+        return False
+    for token in tokens[1:]:
+        if token.startswith("-"):
+            continue
+        return token == _COMPANION_SUBCOMMAND
+    return False
+
+
+def _is_host_file_hunt(tokens: list[str]) -> bool:
+    """The executed program is ``rg``, ``grep``, ``sed``, or ``cat``."""
+    return _program(tokens) in _HUNT_PROGRAMS
+
+
+def _curl_targets(argv: Sequence[str]) -> list[str]:
+    """The request targets of a curl invocation: the positional arguments.
+
+    Options and the values they consume are skipped; ``--url VALUE`` (and
+    ``--url=VALUE``) contribute VALUE as a target, since that option names the
+    request target explicitly.  The value-taking option list is a conservative
+    set of common curl options -- not a full curl parser -- and an unknown
+    option shape is left as a potential target, so a URL-shaped header or data
+    value is never the request target while the actual target still is.
+    """
+    targets: list[str] = []
+    index = 0
+    length = len(argv)
+    while index < length:
+        token = argv[index]
+        if token == "--":
+            targets.extend(argv[index + 1 :])
+            break
+        if token.startswith("--"):
+            name, sep, attached = token[2:].partition("=")
+            if name == "url":
+                if sep:
+                    targets.append(attached)
+                elif index + 1 < length:
+                    targets.append(argv[index + 1])
+                    index += 1
+            elif not sep and name in _CURL_VALUE_OPTIONS_LONG:
+                index += 1  # the next token is this option's value
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            # A short-option cluster: the first value-taking option consumes
+            # the rest of the token as its attached value, or -- when it is the
+            # last character -- the next token as its value.
+            for position, char in enumerate(token[1:]):
+                if char in _CURL_VALUE_OPTIONS_SHORT:
+                    if position == len(token) - 2 and index + 1 < length:
+                        index += 1
+                    break
+            index += 1
+            continue
+        targets.append(token)
+        index += 1
+    return targets
+
+
+def _is_raw_local_mcp_http(tokens: list[str]) -> bool:
+    """The executed program is ``curl`` and its request *target* is a loopback
+    MCP URL.  Only the target counts: a loopback URL used as an option value
+    (e.g. ``-H 'http://localhost:8750/'``) is not a raw MCP call."""
+    if _program(tokens) != _CURL_BIN:
+        return False
+    for target in _curl_targets(tokens[1:]):
+        if "://" not in target:
+            continue
+        try:
+            parsed = urlparse(target)
+            port = parsed.port
+        except ValueError:
+            continue
+        if parsed.hostname in _LOOPBACK_HOSTS and port in _MCP_PORTS:
+            return True
+    return False
+
+
+def _is_undo_file_edit(tool_name: str | None) -> bool:
+    return bool(tool_name) and _UNDO_FILE_EDIT_RE.match(tool_name) is not None
+
+
+def _command_tokens(
+    full_command: str | None,
+    command_type: str | None,
+    input_summary: str | None,
+) -> list[str]:
+    """The argv tokens to classify for one row.
+
+    The full persisted ``input`` command wins when usable: a JSON-array
+    command (DuckDB ``json_type`` ``'ARRAY'`` -- the Codex argv form) decodes
+    to its actual argv, and a string command (``'VARCHAR'``) is
+    shell-tokenized.  ``input_summary`` is the conservative fallback when no
+    usable full command can be extracted (missing, blank, an object, a number,
+    or a JSON array with non-string elements) -- arbitrary prose or objects
+    are never turned into commands.  Without the fallback a long command would
+    lose everything past the 200-character summary truncation.
+    """
+    if full_command and full_command.strip():
+        if command_type == "ARRAY":
+            try:
+                decoded = json.loads(full_command)
+            except ValueError:
+                decoded = None
+            if isinstance(decoded, list) and all(isinstance(item, str) for item in decoded):
+                return decoded
+        elif command_type == "VARCHAR":
+            return _shell_tokens(full_command)
+        # any other json_type (OBJECT, a number, ...) is not a command
+    return _shell_tokens(input_summary)
+
+
+def categories_for(
+    tool_name: str | None,
+    command: str | Sequence[str] | None,
+    outcome: str | None,
+) -> tuple[str, ...]:
+    """The categories one persisted row belongs to, in :data:`CATEGORY_ORDER`.
+
+    ``command`` is what to classify for shell rows: the full persisted
+    ``input`` command text (tokenized here), its decoded argv list (the Codex
+    JSON-array form), or the ``input_summary`` fallback (see
+    :func:`_command_tokens`).  The single classification point: the CLI never
+    re-implements a category rule, and a future thin MCP adapter can reuse
+    this function directly.
+    """
+    matched: list[str] = []
+    if tool_name in _SHELL_TOOLS:
+        tokens = _shell_tokens(command) if isinstance(command, str) else list(command or ())
+        if _is_companion_status_poll(tokens):
+            matched.append("companion_status_poll")
+        if _is_host_file_hunt(tokens):
+            matched.append("host_file_hunt")
+        if _is_raw_local_mcp_http(tokens):
+            matched.append("raw_local_mcp_http")
+    if _is_undo_file_edit(tool_name):
+        matched.append("undo_file_edit")
+    if outcome == "pending":
+        matched.append("pending_tool_call")
+    return tuple(matched)
+
+
+def audit(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> dict[str, Any]:
+    """One hygiene report over *connection* (read-only).
+
+    *since*/*until* are inclusive bounds on the persisted ``ts`` column.
+    Without either bound every row counts, including NULL timestamps; with
+    either bound, NULL timestamps are excluded.  The ``coverage`` block counts
+    the selected rows and distinct sessions *before* category filtering;
+    categories may overlap, so their ``tool_calls`` do not sum to coverage.
+    """
+    query = """
+        SELECT
+            session_id,
+            tool_name,
+            input_summary,
+            outcome,
+            input->>'command' AS input_command,
+            json_type(input->'command') AS input_command_type
+        FROM tool_calls
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+    if since is not None:
+        conditions.append("ts >= ?")
+        params.append(since)
+    if until is not None:
+        conditions.append("ts <= ?")
+        params.append(until)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    rows = connection.execute(query, params).fetchall()
+
+    coverage_sessions: set[str] = set()
+    calls: dict[str, int] = {name: 0 for name in CATEGORY_ORDER}
+    sessions: dict[str, set[str]] = {name: set() for name in CATEGORY_ORDER}
+    for session_id, tool_name, input_summary, outcome, input_command, input_command_type in rows:
+        if session_id is not None:
+            coverage_sessions.add(session_id)
+        tokens = _command_tokens(input_command, input_command_type, input_summary)
+        for name in categories_for(tool_name, tokens, outcome):
+            calls[name] += 1
+            if session_id is not None:
+                sessions[name].add(session_id)
+
+    return {
+        "coverage": {
+            "since": since,
+            "until": until,
+            "sessions": len(coverage_sessions),
+            "tool_calls": len(rows),
+        },
+        "categories": [
+            {"name": name, "tool_calls": calls[name], "sessions": len(sessions[name])}
+            for name in CATEGORY_ORDER
+        ],
+    }
