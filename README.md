@@ -38,6 +38,7 @@ ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistan
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
+ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
