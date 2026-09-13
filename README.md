@@ -37,6 +37,7 @@ ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
+ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
@@ -177,6 +178,32 @@ ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
   carry exactly `name`/`tool_calls`/`sessions`. The table prints the same five
   rows with the same counts. `hygiene` is the named audit for recurring
   questions; arbitrary one-off investigation remains `ashiato sql`.
+
+- `session-trace` renders one session as a single interleaved timeline: its
+  text events and tool calls ordered by transcript line (`seq`), text rows
+  before tool rows on the same line, then the row's own id ascending — the
+  stable ordering two builds of the same bytes always agree on. The
+  `SESSION_PREFIX` argument is a session id or a unique prefix of it,
+  resolved against the union of ids in `sessions` and `tool_calls` (so a
+  session persisted only as tool calls, the older Codex shape, still
+  resolves); an exact id wins, and a missing or ambiguous prefix is a clean
+  error on stderr with exit code 1. `--format table|json` picks the output
+  (default `table`); the JSON shape is a stable top-level object with
+  `session`, `coverage` (pre/post-limit counts and which persisted tables
+  have rows for the session: `has_sessions` / `has_events` /
+  `has_tool_calls` / `has_recall_calls`) and an ordered `timeline` whose
+  rows are `kind`-specific (`text` rows carry `role` / `excerpt`; `tool`
+  rows carry `tool_name` / `input_summary` / `outcome` / `is_recall`, plus
+  `recall` annotation with the stored query and overlap signal, and
+  `followup` evidence when the call was denied). `--limit N` caps rows
+  after ordering with `0` meaning all (default 200); `--max-excerpt-chars
+  N` bounds each text/result excerpt to N characters plus a one-character
+  marker, with `0` meaning uncapped (default 500); negative values are
+  rejected. Meta events (harness noise) are excluded from the timeline, and
+  a recall row's follow-up text is assembled from the trace's own rows on
+  strictly later lines — never the build-time `recall_calls.followup_text`,
+  which may contain harness noise the trace does not display. The command
+  is read-only: it opens the database with `read_only` and writes nothing.
 
 - `schema` lists the tables and views in the ashiato schema, or shows the columns
   and types for a specific table or view. It works without a database -- the schema
