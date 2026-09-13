@@ -24,6 +24,7 @@ from ashiato.build import (
     database_info,
     default_db_path,
 )
+from ashiato.compare import compare_periods as compare_periods_fn
 from ashiato.grep import DEFAULT_CONTEXT as DEFAULT_GREP_CONTEXT
 from ashiato.grep import DEFAULT_LIMIT as DEFAULT_GREP_LIMIT
 from ashiato.grep import Hit, InvalidPattern
@@ -273,6 +274,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     hygiene_parser.add_argument(
         "--format", choices=("table", "json"), default="table", help="output format (default table)"
+    )
+
+    compare_periods_parser = subparsers.add_parser(
+        "compare-periods",
+        help="compare hygiene metrics across two time periods (baseline vs current)",
+    )
+    compare_periods_parser.add_argument("--db", metavar="PATH", help="database path")
+    compare_periods_parser.add_argument(
+        "--format", choices=("json", "table"), default="table",
+        help="output format (default table)",
+    )
+    compare_periods_parser.add_argument(
+        "--period",
+        action="append",
+        required=True,
+        metavar="START..END",
+        help="period as START..END ISO-8601 (baseline first, current second)",
     )
 
     grep_parser = subparsers.add_parser(
@@ -785,6 +803,177 @@ def _print_hygiene_table(report: dict[str, Any], out: Any) -> None:
     _print_table(("category", "tool_calls", "sessions"), rows, out)
 
 
+def _parse_period(value: str) -> tuple[datetime, datetime]:
+    """Parse a ``START..END`` pair of ISO-8601 timestamps."""
+    parts = value.split("..")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"invalid period: {value!r} (expected START..END)"
+        )
+    if not parts[0] or not parts[1]:
+        raise argparse.ArgumentTypeError(
+            f"invalid period: {value!r} (empty timestamp in START..END)"
+        )
+    return _parse_since(parts[0]), _parse_since(parts[1])
+
+
+def _validate_periods(
+    baseline_since: datetime,
+    baseline_until: datetime,
+    current_since: datetime,
+    current_until: datetime,
+    err: Any,
+) -> int:
+    """Validate period ordering constraints.  Returns 0 on success, 2 on error."""
+    if baseline_since > baseline_until:
+        print(
+            f"error: baseline start {baseline_since} is after end {baseline_until}",
+            file=err,
+        )
+        return 2
+    if current_since > current_until:
+        print(
+            f"error: current start {current_since} is after end {current_until}",
+            file=err,
+        )
+        return 2
+    if baseline_until >= current_since:
+        print(
+            "error: baseline must end before current starts ("
+            f"baseline ends {baseline_until}, current starts {current_since}); "
+            "periods must not overlap or touch",
+            file=err,
+        )
+        return 2
+    return 0
+
+
+def _run_compare_periods(args: argparse.Namespace, out: Any, err: Any) -> int:
+    periods = getattr(args, "period", None)
+    if not periods or len(periods) != 2:
+        print("error: exactly two --period arguments required", file=err)
+        return 2
+    try:
+        baseline_since, baseline_until = _parse_period(periods[0])
+        current_since, current_until = _parse_period(periods[1])
+    except argparse.ArgumentTypeError as error:
+        print(f"error: {error}", file=err)
+        return 2
+    rc = _validate_periods(
+        baseline_since, baseline_until,
+        current_since, current_until,
+        err,
+    )
+    if rc:
+        return rc
+    db_path = _resolve_db(args.db)
+    if not db_path.exists():
+        print(f"error: no database at {db_path} (run 'ashiato build' first)", file=err)
+        return 1
+    connection = connect(db_path, read_only=True)
+    try:
+        assert_readable(connection)
+        report = compare_periods_fn(
+            connection,
+            baseline_since=baseline_since,
+            baseline_until=baseline_until,
+            current_since=current_since,
+            current_until=current_until,
+        )
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
+    except duckdb.Error as error:
+        print(f"error: {error}", file=err)
+        return 1
+    finally:
+        connection.close()
+
+    if args.format == "json":
+        print(json.dumps(report, indent=2, ensure_ascii=False, default=str), file=out)
+    else:
+        _print_compare_table(report, out)
+    return 0
+
+
+def _cell_compare(value: Any) -> str:
+    """Format a cell for compare-periods table: None -> n/a."""
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value)
+
+
+def _print_compare_table(report: dict[str, Any], out: Any) -> None:
+    """Table rendering for compare-periods."""
+    periods = report["periods"]
+    b = periods["baseline"]
+    c = periods["current"]
+    print(
+        f"baseline: {b['since']} .. {b['until']}",
+        file=out,
+    )
+    print(
+        f"current:  {c['since']} .. {c['until']}",
+        file=out,
+    )
+    # Use coverage totals from the report (unique sessions, total calls)
+    b_tc = b.get("tool_calls", 0)
+    b_sess = b.get("sessions", 0)
+    c_tc = c.get("tool_calls", 0)
+    c_sess = c.get("sessions", 0)
+    b_cps_val = round(b_tc / b_sess, 2) if b_sess else None
+    c_cps_val = round(c_tc / c_sess, 2) if c_sess else None
+    b_cps_str = f"{b_cps_val:.2f}" if b_cps_val is not None else "n/a"
+    c_cps_str = f"{c_cps_val:.2f}" if c_cps_val is not None else "n/a"
+    b_sess_label = "sessions" if b_sess != 1 else "session"
+    c_sess_label = "sessions" if c_sess != 1 else "session"
+    print(
+        f"baseline: {b_tc} tool calls, {b_sess} {b_sess_label}, "
+        f"{b_cps_str} calls/session",
+        file=out,
+    )
+    print(
+        f"current:  {c_tc} tool calls, {c_sess} {c_sess_label}, "
+        f"{c_cps_str} calls/session",
+        file=out,
+    )
+    columns = (
+        "category",
+        "b_calls", "b_calls/session",
+        "b_sessions",
+        "c_calls", "c_calls/session",
+        "c_sessions",
+        "delta", "percent",
+    )
+    rows: list[list[Any]] = []
+    for cat in report["categories"]:
+        rows.append([
+            cat["name"],
+            cat["baseline_tool_calls"],
+            cat["baseline_calls_per_session"],
+            cat["baseline_sessions"],
+            cat["current_tool_calls"],
+            cat["current_calls_per_session"],
+            cat["current_sessions"],
+            cat["tool_calls_change"],
+            cat["tool_calls_percent_change"],
+        ])
+    # Print header
+    widths = [len(name) for name in columns]
+    cells = [[_cell_compare(value) for value in row] for row in rows]
+    for row in cells:
+        for index, text in enumerate(row):
+            if index < len(widths):
+                widths[index] = max(widths[index], len(text))
+    print("  ".join(name.ljust(widths[i]) for i, name in enumerate(columns)).rstrip(), file=out)
+    print("  ".join("-" * width for width in widths), file=out)
+    for row in cells:
+        print("  ".join(text.ljust(widths[i]) for i, text in enumerate(row)).rstrip(), file=out)
+    print(f"({len(cells)} row{'' if len(cells) == 1 else 's'})", file=out)
+
+
 def _grep_header(hit: Hit) -> str:
     ts_text = hit.ts.isoformat() if hit.ts is not None else "NULL"
     label = f"role={hit.label}" if hit.source == "event" else f"tool={hit.label}"
@@ -918,6 +1107,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_nominate(args, out, err)
     if args.command == "hygiene":
         return _run_hygiene(args, out, err)
+    if args.command == "compare-periods":
+        return _run_compare_periods(args, out, err)
     return _run_info(args, out, err)
 
 
