@@ -156,7 +156,13 @@ ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
   categories classify the full persisted `input` command when it is available:
   a string command is shell-tokenized, and a Codex-style argv list
   (`"command": ["cat", "/etc/hosts"]`) decodes to its actual argv -- never
-  turning arbitrary prose or objects into commands. The 200-character
+  turning arbitrary prose or objects into commands. The exact shell `-c`
+  wrapper is unwrapped: `bash -c SCRIPT`, `bash -lc SCRIPT`, and the
+  `/bin/bash` / `sh` / `/bin/sh` equivalents are transparent, and SCRIPT is
+  tokenized and classified like any other command line -- but compound
+  commands inside SCRIPT still follow the same first-command-only boundary,
+  and no arbitrary wrapper, variable expansion, or nested command is descended
+  into. The 200-character
   `input_summary` is only the fallback when no usable full command can be
   extracted, so a long command whose loopback MCP URL or
   `kusabi-companion status` invocation sits past the summary truncation
