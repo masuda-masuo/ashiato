@@ -18,6 +18,8 @@ parse time instead.  ``recall_id`` follows the same rule for ``recall_calls``.
 
 from __future__ import annotations
 
+from typing import Any
+
 Column = tuple[str, str]
 
 SESSION_TABLE: tuple[Column, ...] = (
@@ -273,6 +275,26 @@ WHERE denied.outcome = 'denied';
 
 #: Every ``followup_kind`` the view can produce.
 FOLLOWUP_KINDS: tuple[str, ...] = ("verbatim-retry", "same-tool", "other-tool", "none")
+
+
+def denial_followups_query(session: str | None = None, limit: int = 0) -> tuple[str, list[Any]]:
+    """The query (and its parameters) behind ``ashiato denials``.
+
+    Newest first, as asked for -- but timestamps tie (and can be NULL), so the
+    session and the line number settle the rest and two runs agree.  *limit*
+    ``0`` means every row.
+    """
+    query = f'SELECT * FROM "{DENIAL_FOLLOWUPS_VIEW}"'
+    params: list[Any] = []
+    if session:
+        query += " WHERE session_id = ?"
+        params.append(session)
+    query += " ORDER BY ts DESC NULLS LAST, session_id, seq DESC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    return query, params
+
 
 #: One row per completed kaiba ``recall`` call, joined to same-session
 #: followup evidence.  Unlike ``denial_followups`` this is a thin view over a
