@@ -1995,6 +1995,404 @@ def test_codex_tool_call_outcome(tmp_path: Path):
         connection.close()
 
 
+def test_codex_failed_command_is_error(tmp_path: Path):
+    """A failed command with nonzero exit code is_error=True / outcome='error'."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "failed.jsonl",
+        "codex-failed",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "fail-1",
+                "command": "false",
+                "status": "failed",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "boom\n",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_failed.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT is_error, outcome FROM tool_calls WHERE tool_use_id = 'fail-1'"
+        ).fetchone()
+        assert row == (True, "error")
+    finally:
+        connection.close()
+
+
+def test_codex_completed_command_zero_exit_is_ok(tmp_path: Path):
+    """A completed command with exit code 0 stays is_error=False / outcome='ok'."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "completed.jsonl",
+        "codex-completed",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "ok-exit-1",
+                "command": "true",
+                "status": "completed",
+                "exit_code": 0,
+                "stdout": "done\n",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_completed.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT is_error, outcome FROM tool_calls WHERE tool_use_id = 'ok-exit-1'"
+        ).fetchone()
+        assert row == (False, "ok")
+    finally:
+        connection.close()
+
+
+def test_codex_failed_mcp_error_is_reachable_in_result_text(tmp_path: Path):
+    """A failed MCP call classifies as error and keeps its error message."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "mcp-failed.jsonl",
+        "codex-mcp-failed",
+        [
+            {
+                "type": "McpToolCall",
+                "id": "mcp-fail-1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "x"},
+                "status": "failed",
+                "error": "Server error: connection refused",
+                "result": None,
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_mcp_failed.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT is_error, outcome, result_text FROM tool_calls WHERE tool_use_id = 'mcp-fail-1'"
+        ).fetchone()
+        assert row is not None
+        is_error, outcome, result_text = row
+        assert is_error is True
+        assert outcome == "error"
+        assert result_text == "Server error: connection refused"
+    finally:
+        connection.close()
+
+
+def test_codex_mcp_error_without_status_is_error(tmp_path: Path):
+    """An older-shape MCP call with a non-empty error but no status is an error.
+
+    The parser deliberately tolerates items that omit ``status``; without the
+    error-evidence rule, the absent status would fall back to output-only
+    classification and this failure would be recorded as 'ok' with the error
+    message sitting in ``result_text``.
+    """
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "mcp-no-status.jsonl",
+        "codex-mcp-no-status",
+        [
+            {
+                "type": "McpToolCall",
+                "id": "mcp-no-status-1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "z"},
+                "error": "Server error: connection refused",
+                "result": None,
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_mcp_no_status.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT is_error, outcome, result_text FROM tool_calls WHERE tool_use_id = 'mcp-no-status-1'"
+        ).fetchone()
+        assert row is not None
+        is_error, outcome, result_text = row
+        assert is_error is True
+        assert outcome == "error"
+        assert result_text == "Server error: connection refused"
+    finally:
+        connection.close()
+
+
+def test_codex_completed_status_wins_over_error_inference(tmp_path: Path):
+    """An explicit status of 'completed' overrides the error-message inference.
+
+    A non-empty ``error`` is failure evidence only while the status is absent:
+    when the source explicitly says the call completed, that explicit status
+    wins and the call is recorded as 'ok'.
+    """
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "mcp-completed.jsonl",
+        "codex-mcp-completed",
+        [
+            {
+                "type": "McpToolCall",
+                "id": "mcp-completed-1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "z"},
+                "status": "completed",
+                "error": "Server error: connection refused",
+                "result": None,
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_mcp_completed.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT is_error, outcome FROM tool_calls WHERE tool_use_id = 'mcp-completed-1'"
+        ).fetchone()
+        assert row is not None
+        is_error, outcome = row
+        assert is_error is False
+        assert outcome == "ok"
+    finally:
+        connection.close()
+
+
+def test_codex_mcp_empty_or_nonstring_error_is_not_error_evidence(tmp_path: Path):
+    """Empty or non-string error fields do not flip the classification alone.
+
+    Only a non-empty string ``error`` is failure evidence; an empty string is
+    indistinguishable from an absent field and a non-string value keeps today's
+    behaviour (the parser does not even surface it as ``error``).
+    """
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "mcp-no-evidence.jsonl",
+        "codex-mcp-no-evidence",
+        [
+            {
+                "type": "McpToolCall",
+                "id": "mcp-empty-err-1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "a"},
+                "error": "",
+                "result": None,
+            },
+            {
+                "type": "McpToolCall",
+                "id": "mcp-num-err-1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "b"},
+                "error": 42,
+                "result": None,
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_mcp_no_evidence.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, is_error, outcome FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert rows == [
+            ("mcp-empty-err-1", False, "pending"),
+            ("mcp-num-err-1", False, "ok"),
+        ]
+    finally:
+        connection.close()
+
+
+def test_codex_failed_with_no_output_is_error_not_pending(tmp_path: Path):
+    """A failed call with no stdout/result at all still classifies as 'error'."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "silent-failed.jsonl",
+        "codex-silent-failed",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "silent-fail-1",
+                "command": "crashed",
+                "status": "failed",
+                "exit_code": 2,
+                "stdout": "",
+            },
+            {
+                "type": "McpToolCall",
+                "id": "mcp-silent-fail-1",
+                "server": "kaiba",
+                "tool": "recall",
+                "arguments": {"query": "y"},
+                "status": "failed",
+                "error": None,
+                "result": None,
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_silent_failed.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        outcomes = connection.execute(
+            "SELECT tool_use_id, outcome FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert outcomes == [
+            ("silent-fail-1", "error"),
+            ("mcp-silent-fail-1", "error"),
+        ]
+    finally:
+        connection.close()
+
+
+def test_codex_old_shape_without_output_stays_pending(tmp_path: Path):
+    """An item with no status/exit_code and no output keeps today's 'pending'."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "pending.jsonl",
+        "codex-pending",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "pend-1",
+                "command": "long-running",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_pending.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT is_error, outcome FROM tool_calls WHERE tool_use_id = 'pend-1'"
+        ).fetchone()
+        assert row == (False, "pending")
+    finally:
+        connection.close()
+
+
+def test_codex_command_cwd_and_duration_ms_columns(tmp_path: Path):
+    """cwd and duration_ms are filled from the item when present."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "meta.jsonl",
+        "codex-meta",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "cwd-1",
+                "command": "pwd",
+                "status": "completed",
+                "exit_code": 0,
+                "cwd": "/work/project",
+                "duration": 0.25,
+                "stdout": "/work/project\n",
+            },
+            {
+                "type": "CommandExecution",
+                "id": "nocwd-1",
+                "command": "pwd",
+                "status": "completed",
+                "exit_code": 0,
+                "stdout": "/work/project\n",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_meta.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, cwd, duration_ms FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert rows == [
+            ("cwd-1", "/work/project", 250),
+            ("nocwd-1", None, None),
+        ]
+    finally:
+        connection.close()
+
+
+def test_codex_malformed_status_does_not_claim_success(tmp_path: Path):
+    """Non-string status / non-int exit_code parse and never become 'ok'."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "weird.jsonl",
+        "codex-weird",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "weird-status-1",
+                "command": "ls",
+                "status": 42,
+                "stdout": "x\n",
+            },
+            {
+                "type": "CommandExecution",
+                "id": "weird-exit-1",
+                "command": "ls",
+                "exit_code": "0",
+                "stdout": "x\n",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_weird.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, is_error, outcome FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert rows == [
+            ("weird-status-1", True, "error"),
+            ("weird-exit-1", True, "error"),
+        ]
+    finally:
+        connection.close()
+
+
 def test_codex_tool_call_tool_kind_and_mcp_server(tmp_path: Path):
     """Bash calls get tool_kind='builtin'; MCP calls get tool_kind='mcp' with server."""
     codex_dir = tmp_path / "codex"

@@ -730,15 +730,36 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
     )
     output: str | None = call.output
     has_result = output is not None and output != ""
-    is_error = False  # Codex parser doesn't surface explicit errors
+
+    # A call is an error when Codex's own status says so ('failed'), when a
+    # command exit code is present and nonzero, or when a non-empty error
+    # message is present (older MCP shape that folds the failure text into
+    # output but carries no status).  A status/exit_code that is present but
+    # malformed must not be treated as a clean success either.  An explicit
+    # status of 'completed' wins over the error-message inference -- the
+    # source states the call completed, so the message is not treated as
+    # failure evidence; an empty or non-string error changes nothing.
+    status = call.status
+    exit_code = call.exit_code
+    status_ok = status is None or (isinstance(status, str) and status == "completed")
+    exit_code_ok = (
+        exit_code is None
+        or (isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code == 0)
+    )
+    status_completed = isinstance(status, str) and status == "completed"
+    error_ok = status_completed or not (isinstance(call.error, str) and call.error != "")
+    is_error = not (status_ok and exit_code_ok and error_ok)
 
     # Stable synthetic event ids derived from call_id/seq so they are
     # non-NULL and deterministic (Claude always has call_event_id).
     call_event_id = f"codex:{call.call_id}"
     result_event_id = f"codex:{call.call_id}:result" if has_result else None
 
+    # A failed call is a terminal state, never 'pending' -- even when it has
+    # no output at all.  result_event_id above stays output-based, so event id
+    # synthesis is unchanged.
     outcome = classify_outcome(
-        has_result=has_result,
+        has_result=has_result or is_error,
         result_text=output or "",
         is_error=is_error,
     )
@@ -769,11 +790,11 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
         is_error,
         result_text,
         result_truncated,
-        None,                 # duration_ms
-        None,                 # permission_mode
-        None,                 # cwd
-        False,                # is_sidechain
-        None,                 # parent_tool_use_id
+        call.duration_ms,      # duration_ms
+        None,                  # permission_mode
+        call.cwd,              # cwd
+        False,                 # is_sidechain
+        None,                  # parent_tool_use_id
     ]
 
 

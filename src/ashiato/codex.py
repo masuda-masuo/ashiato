@@ -8,6 +8,7 @@ no model calls, no clock reads.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,18 @@ class CodexToolCall:
     tool_name: str | None
     input: dict | None
     output: str | None
+    #: Codex's own completion status ('completed' / 'failed') when the item
+    #: carries one; the raw value when present but malformed.
+    status: str | None = None
+    #: Process exit code for CommandExecution items when the item carries one;
+    #: the raw value when present but malformed.
+    exit_code: int | None = None
+    #: MCP failure message when the item carries one.
+    error: str | None = None
+    #: Command execution duration in milliseconds (Codex stores it in seconds).
+    duration_ms: int | None = None
+    #: Working directory for CommandExecution items when the item carries one.
+    cwd: str | None = None
 
 
 @dataclass(slots=True)
@@ -78,6 +91,34 @@ def _read_records(path: Path) -> tuple[list[tuple[int, dict]], int]:
                 continue
             records.append((seq, record))
     return records, n_errors
+
+
+def _duration_to_ms(value: object) -> int | None:
+    """Convert a Codex item's ``duration`` to integer milliseconds.
+
+    Codex CLI stores duration in *seconds*: recent versions write it as a
+    floating-point number, while some versions (measured 0.146.1) serialize a
+    Rust-style ``{"secs": ..., "nanos": ...}`` object.  Both are seconds, so
+    both convert confidently; anything else (strings, booleans, unknown
+    shapes) is left as ``None`` rather than guessed at.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return None
+        return int(value * 1000)
+    if isinstance(value, dict):
+        secs = value.get("secs")
+        nanos = value.get("nanos", 0)
+        if isinstance(secs, bool) or not isinstance(secs, (int, float)):
+            return None
+        if isinstance(nanos, bool) or not isinstance(nanos, (int, float)):
+            nanos = 0
+        if not math.isfinite(secs) or not math.isfinite(nanos):
+            return None
+        return int(secs * 1000 + nanos / 1_000_000)
+    return None
 
 
 def _append_codex_message_text(
@@ -171,13 +212,22 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                 tool_name="Bash",
                                 input={"command": cmd} if isinstance(cmd, (list, str)) else {},
                                 output=str(stdout) if stdout else None,
+                                status=item.get("status"),
+                                exit_code=item.get("exit_code"),
+                                duration_ms=_duration_to_ms(item.get("duration")),
+                                cwd=item.get("cwd") if isinstance(item.get("cwd"), str) else None,
                             )
                         )
                     elif item_type in ("McpToolCall", "call_mcp_tool"):
                         server = item.get("server") or item.get("server_name")
                         tool_n = item.get("tool") or item.get("tool_name")
                         args = item.get("arguments") or item.get("args") or item.get("input")
+                        error = item.get("error")
                         res = item.get("result") or item.get("output")
+                        if not res and error:
+                            # A failed call with no result: its error message is
+                            # the only output it has.
+                            res = error
                         tool_name = f"mcp__{server}__{tool_n}" if server and tool_n else (tool_n or "McpTool")
                         tool_calls.append(
                             CodexToolCall(
@@ -189,6 +239,9 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                 tool_name=str(tool_name),
                                 input=args if isinstance(args, dict) else {},
                                 output=str(res) if res else None,
+                                status=item.get("status"),
+                                error=error if isinstance(error, str) else None,
+                                duration_ms=_duration_to_ms(item.get("duration")),
                             )
                         )
                     elif item_type in ("AgentResponse", "assistant_message"):
