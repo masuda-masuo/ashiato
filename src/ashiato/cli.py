@@ -37,6 +37,7 @@ from ashiato.nominate import run as nominate_run
 from ashiato.orphans import DEFAULT_LIMIT as DEFAULT_ORPHANS_LIMIT
 from ashiato.orphans import DEFAULT_MIN_HUMAN_CHARS, DEFAULT_MIN_ORPHANS, DEFAULT_MIN_TF
 from ashiato.orphans import run as orphans_run
+from ashiato.pending import run as pending_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import (
@@ -395,6 +396,57 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", dest="json_output", help="output as JSON"
     )
 
+    pending_parser = subparsers.add_parser(
+        "pending",
+        help="open items left in compaction summaries, checked against GitHub",
+    )
+    pending_parser.add_argument("--db", metavar="PATH", help="database path")
+    pending_parser.add_argument(
+        "--gh",
+        action="store_true",
+        help="check each issue/PR reference with the gh CLI (read-only; lists "
+        "the owner's repositories once and sends only owner/repo/number plus "
+        "the owner name, never transcript text)",
+    )
+    pending_parser.add_argument(
+        "--repo",
+        type=_parse_repo,
+        metavar="OWNER/NAME",
+        help="owner/repo used to resolve bare #N references when the summary "
+        "names no repo",
+    )
+    pending_parser.add_argument(
+        "--owner",
+        metavar="NAME",
+        help="owner short-form references resolve to (default: the owner most "
+        "often named by explicit references in the DB)",
+    )
+    pending_parser.add_argument(
+        "--all-summaries",
+        action="store_true",
+        help="process every compaction summary of a session instead of only the latest",
+    )
+    pending_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only summaries at or after this ISO-8601 timestamp",
+    )
+    pending_parser.add_argument(
+        "--until",
+        type=_parse_since,
+        metavar="TS",
+        help="only summaries at or before this ISO-8601 timestamp",
+    )
+    pending_parser.add_argument(
+        "--show-resolved",
+        action="store_true",
+        help="also show items whose references are all closed/merged",
+    )
+    pending_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="output as JSON"
+    )
+
     hygiene_parser = subparsers.add_parser(
         "hygiene",
         help="named session-hygiene audit: companion polls, host-file hunts, "
@@ -568,6 +620,14 @@ def _port(value: str) -> int:
 
 def _resolve_db(value: str | None) -> Path:
     return Path(value).expanduser() if value else default_db_path()
+
+
+def _parse_repo(value: str) -> tuple[str, str]:
+    """An ``OWNER/NAME`` pair for --repo, or an argparse error."""
+    parts = value.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise argparse.ArgumentTypeError(f"invalid repo: {value!r} (expected OWNER/NAME)")
+    return parts[0], parts[1]
 
 
 def _parse_since(value: str) -> datetime:
@@ -992,6 +1052,22 @@ def _run_memory_authors(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
 
 
+def _run_pending(args: argparse.Namespace, out: Any, err: Any) -> int:
+    return pending_run(
+        _resolve_db(args.db),
+        since=args.since,
+        until=args.until,
+        repo=args.repo,
+        owner=args.owner,
+        all_summaries=args.all_summaries,
+        use_gh=args.gh,
+        show_resolved=args.show_resolved,
+        json_output=args.json_output,
+        out=out,
+        err=err,
+    )
+
+
 def _run_serve(args: argparse.Namespace, out: Any, err: Any) -> int:
     return serve_run(
         _resolve_db(args.db),
@@ -1352,6 +1428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_orphans(args, out, err)
     if args.command == "memory-authors":
         return _run_memory_authors(args, out, err)
+    if args.command == "pending":
+        return _run_pending(args, out, err)
     if args.command == "hygiene":
         return _run_hygiene(args, out, err)
     if args.command == "compare-periods":

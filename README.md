@@ -11,10 +11,13 @@ is a single query.
 
 - **No LLM, anywhere.** Extraction is plain parsing; the same input files always produce the
   same tables.
-- **No network call, ever.** Transcripts contain secrets and never leave the machine. DuckDB
+- **No network call by default.** Transcripts contain secrets and never leave the machine. DuckDB
   extension autoinstall is switched off explicitly. (`ashiato serve` listens on loopback
   only; accepting a connection from this machine is not an outbound call, and it fetches
-  nothing.)
+nothing.) The single exception is `pending --gh`, which lists the owner's
+  repositories once (`gh repo list <owner> --limit 200 --json name`) and checks
+  issue/PR references through the `gh` CLI; the only data that leaves the
+  machine is the owner name and `owner/repo/number` — never transcript text.
 - **Nothing is dropped.** Every parsed line keeps its verbatim JSON in `events.raw`, so
   anything this schema does not model is still there to query.
 
@@ -40,6 +43,7 @@ ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistan
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
 ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--json]
 ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]... [--model NAME] [--json]
+ashiato pending [--db PATH] [--gh] [--owner NAME] [--repo OWNER/NAME] [--all-summaries] [--since TS] [--until TS] [--show-resolved] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato topics SESSION_PREFIX [--db PATH] [--window N] [--terms N] [--json]
@@ -196,6 +200,37 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   (recorded as `Bash`), so their memory edits appear as `bash_mentions` at best, and memory
   writes made from Cursor sessions are not visible in the database at all. Exit code `0` on
   success and `1` when the database cannot be read.
+
+- `pending` reports open items left in compaction summaries. When a Claude Code session runs
+  out of context it writes a compaction summary with a numbered "Pending Tasks" section — the
+  agent's own list of what is left, often with "Discussed-but-not-started (do NOT begin
+  without user confirmation)" items and issue numbers. `pending` finds every session's latest
+  compaction summary (`--all-summaries` also processes earlier, superseded ones), extracts
+  the Pending Tasks section (a summary without one is counted in `no_section`, not listed),
+  and lists each item with its references and a status. References resolve in this order: a
+  GitHub URL (`https://github.com/<o>/<r>/(issues|pull)/<n>`); an explicit `<o>/<r>#<n>`
+  (the owner must start with a letter, so `454/PR#466` is not one); a short form
+  (`<name>#<n>`, `<name> PR #<n>`, `<name> PR#<n>`, `<name> issue #<n>`) where `<name>` is a
+  known repository name; and a bare `#<n>` (including `PR #<n>` / `Issue #<n>` with no repo
+  name before them). A bare reference resolves to the nearest preceding repository in the
+  same item, else the repository named most often in the same summary, else
+  `--repo OWNER/NAME`, else it is reported as `unresolved` and never checked. Known repository
+  names come from the explicit references found anywhere in the database's summaries, or with
+  `--gh` from the owner's repositories (`gh repo list <owner> --limit 200 --json name`, one
+  call per run); `--owner NAME` sets the owner those short forms resolve to, defaulting to the
+  owner named most often by the explicit references. Without `--gh` every reference state is
+  `unchecked` — no subprocess, no network. `--gh` checks each unique `owner/repo/number` once
+  with `gh api repos/<o>/<r>/issues/<n>` (read-only GET; a PR counts as `merged` when
+  `merged_at` is set) and records `open` / `closed` / `merged` / `unknown` per reference, an
+  `unknown` carrying the gh error message. An item is `open` when any reference is open,
+  `resolved` when all references are closed/merged, `unreferenced` when it has no references,
+  and `unknown`/`unchecked` otherwise. By default only items that are not `resolved` are
+  shown; `--show-resolved` shows all. `--since TS` / `--until TS` filter by summary
+  timestamp, and `--json` prints one document with `sessions` (session id, summary timestamp,
+  project, latest `ai-title`/`custom-title`, items) and `counts` — counts by status plus the
+  number of summaries with no Pending Tasks section. Item text is truncated to 300
+  characters. This is report-only: it writes nothing. Exit code `0` on success and `1` when
+  the database cannot be read.
 
 - `hygiene` is a named, read-only audit of session hygiene over `tool_calls`,
   replacing the ad-hoc SQL that used to be rewritten for every such question.
