@@ -1431,3 +1431,234 @@ def test_repo_flag_applies_even_when_the_summary_resolves_something(
     ]
     assert items[1]["references"][0]["bare"] is True
     assert items[1]["references"][0]["via"] == "repo_flag"
+# ------------------------------------------------------- issue #63: same-number rule
+
+#: The PR #391 shape from the live DB (issue #63): a bare ``PR #391`` before
+#: the same-number explicit URL, both inside one item.
+PR_391_SUMMARY = """\
+7. Pending Tasks:
+   - PR #391 (https://github.com/masuda-masuo/code-sandbox-mcp/pull/391) awaits merge.
+8. Current Work:
+"""
+
+
+def test_bare_ref_takes_same_number_explicit_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare #n takes the (owner, repo) of a same-number explicit ref in the
+    same item, wherever the bare ref sits in the text."""
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(PR_391_SUMMARY, compact=True)])])
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+    assert len(items) == 1
+    refs = items[0]["references"]
+    # Exactly one reference: the bare #391 came first in text order, so it
+    # survives dedup and the URL collapses into it -- no unresolved leftover.
+    # The same-number rule is not an inference: the ref is recorded non-bare,
+    # exactly like the explicit ref it matches.
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "code-sandbox-mcp", 391)
+    ]
+    assert all(r["state"] != "unresolved" for r in refs)
+    assert refs[0]["bare"] is False
+    assert refs[0].get("via") is None
+
+
+def test_bare_ref_takes_same_number_short_form(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare #n takes the repo of a same-number known short form too."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sagasu#1 is the anchor.\n"
+        "   - merge PR #33 (sagasu#33).\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+    payload = _run_cli_json(db, capsys=capsys)
+    refs = payload["sessions"][0]["items"][1]["references"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "sagasu", 33)
+    ]
+    # Same-number resolution is not an inference: the ref is non-bare, like
+    # the explicit ref it matches.
+    assert refs[0]["bare"] is False
+    assert refs[0].get("via") is None
+
+
+def test_explicit_first_bare_later_dedupes_to_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Explicit first, bare later: the same-number key collapses them into the
+    one reference that came first in text order."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sagasu#1 is the anchor.\n"
+        "   - sagasu#33 merged; after #33, deploy.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+    payload = _run_cli_json(db, capsys=capsys)
+    refs = payload["sessions"][0]["items"][1]["references"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "sagasu", 33)
+    ]
+    assert refs[0]["bare"] is False
+    assert refs[0].get("via") is None
+
+
+def test_same_number_different_repos_falls_back_to_timeline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same-number refs naming different repos never trigger rule 1: the bare
+    #12 follows the normal timeline (nearest preceding = shiori) and is
+    deduped into shiori#12."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sunaba#1 and masuda-masuo/shiori#1 are the anchors.\n"
+        "   - sunaba#12 and shiori#12, see #12.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+    payload = _run_cli_json(db, capsys=capsys)
+    refs = payload["sessions"][0]["items"][1]["references"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "sunaba", 12),
+        ("masuda-masuo", "shiori", 12),
+    ]
+    assert all(r["bare"] is False for r in refs)
+
+
+def test_same_number_rule_is_item_scoped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Numbers in other items of the summary never count: item 2's bare #33
+    has no same-number ref in its own item and no --repo, so it is unresolved."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sagasu#1 is the anchor.\n"
+        "   - sagasu#33.\n"
+        "   - #33 pending.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+    ref = items[2]["references"][0]
+    assert (ref["owner"], ref["repo"], ref["number"]) == (None, None, 33)
+    assert ref["state"] == "unresolved"
+    assert ref["bare"] is True
+    assert ref.get("via") is None
+
+
+def test_same_number_beats_a_closer_mention(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Rule 1 wins over a nearer preceding name mention: the bare #33 is
+    sagasu, not the shiori mention right before it."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sagasu#1 and masuda-masuo/shiori#1 are the anchors.\n"
+        "   - shiori open issues: #33 (sagasu#33).\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+    payload = _run_cli_json(db, capsys=capsys)
+    refs = payload["sessions"][0]["items"][1]["references"]
+    # The bare #33 came first in text order, so it survives dedup carrying
+    # the sagasu resolution -- recorded non-bare, since same-number
+    # resolution is not an inference.
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "sagasu", 33)
+    ]
+    assert refs[0]["bare"] is False
+    assert refs[0].get("via") is None
+
+
+def test_same_number_duplicate_is_looked_up_once(tmp_path: Path) -> None:
+    """The collapsed 391 reference is one unique key, so the gh fake sees
+    exactly one api call for it."""
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(PR_391_SUMMARY, compact=True)])])
+    api_calls: list[list[str]] = []
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "code-sandbox-mcp"}], ""
+        api_calls.append(list(argv))
+        return True, {"state": "open", "pull_request": {"merged_at": None}}, ""
+
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake, show_resolved=True)
+    refs = payload["sessions"][0]["items"][0]["references"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "code-sandbox-mcp", 391)
+    ]
+    assert refs[0]["state"] == "open"
+    assert len(api_calls) == 1
+    assert api_calls[0] == [
+        "gh",
+        "api",
+        "repos/masuda-masuo/code-sandbox-mcp/issues/391",
+    ]
+
+
+# ------------------------------------------------- issue #63 repair: a same-number
+# ref is not an inference -- the 404 must not depend on text order
+
+
+def test_same_number_404_is_unknown_bare_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Bare #391 first, explicit URL second, gh 404s: the same-number rule is
+    not an inference, so the 404 is 'unknown' -- never the 'inferred repo'
+    demotion, however the text is ordered."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - PR #391 (https://github.com/masuda-masuo/code-sandbox-mcp/pull/391) awaits merge.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "code-sandbox-mcp"}], ""
+        return False, None, "gh: Not Found (HTTP 404)"
+
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake)
+    refs = payload["sessions"][0]["items"][0]["references"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "code-sandbox-mcp", 391)
+    ]
+    assert refs[0]["state"] == "unknown"
+    assert refs[0]["bare"] is False
+    assert refs[0].get("via") is None
+    assert "HTTP 404" in refs[0]["error"]
+    assert "inferred repo" not in refs[0]["error"]
+
+
+def test_same_number_404_is_unknown_explicit_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Explicit URL first, bare #391 second, gh 404s: exactly the same output
+    as the reversed order -- one reference, 'unknown', no 'inferred repo'."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - https://github.com/masuda-masuo/code-sandbox-mcp/pull/391 awaits merge; also PR #391.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "code-sandbox-mcp"}], ""
+        return False, None, "gh: Not Found (HTTP 404)"
+
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake)
+    refs = payload["sessions"][0]["items"][0]["references"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
+        ("masuda-masuo", "code-sandbox-mcp", 391)
+    ]
+    assert refs[0]["state"] == "unknown"
+    assert refs[0]["bare"] is False
+    assert refs[0].get("via") is None
+    assert "HTTP 404" in refs[0]["error"]
+    assert "inferred repo" not in refs[0]["error"]

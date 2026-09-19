@@ -25,9 +25,14 @@ References resolve in this precedence: a GitHub URL
 form (``<name>#<n>``, ``<name> #<n>``, ``<name> PR #<n>``, ``<name> PR#<n>``,
 ``<name> issue #<n>``) where ``<name>`` is a known repository name; and a bare
 ``#<n>`` (including ``PR #<n>`` / ``Issue #<n>`` with no repo name before
-them).  A bare reference resolves to the nearest preceding resolved
-repository in the same item, else a bare whole word that is exactly a known
-repository name (case-sensitive) in the same item (``via: "name"``), else
+them).  A bare reference resolves, in this order: to the ``(owner, repo)`` of
+a same-number resolved reference in the same item -- only when every
+same-number resolved reference in that item names the same repository
+(a same-number resolution is not an inference: the ref is recorded as
+non-bare, exactly like the explicit ref it matches, so it takes no ``via``
+and a 404 on it stays ``unknown``); to the nearest preceding resolved
+repository in the same item; else a bare whole word that is exactly a known
+repository name (case-sensitive) in the same item (``via: "name"``); else
 ``--repo OWNER/NAME``, else it is reported as ``unresolved`` and never
 checked.  A bare word that is
 a known repository name (not part of a path, URL, ``owner/repo``,
@@ -307,7 +312,9 @@ class Reference:
     carries the gh failure message for ``unknown``.  ``via`` (bare refs only)
     indicates how the repo was resolved: ``"nearest"`` (preceding resolved
     ref), ``"name"`` (preceding bare name mention), ``"repo_flag"``
-    (``--repo``), or ``None`` (unresolved).
+    (``--repo``), or ``None`` (unresolved).  A bare ``#n`` resolved by the
+    same-number rule is recorded as non-bare (``via`` None), exactly like the
+    explicit ref it matches -- the repo is not inferred.
     """
 
     owner: str | None
@@ -518,12 +525,18 @@ def _analyze_summary(
     References resolve per item, in text order: explicit refs (GitHub URLs and
     ``owner/repo#n`` with a letter-starting owner) and known short forms
     resolve directly; a bare ``#n`` (including ``PR #<n>`` / ``Issue #<n>`` and
-    short forms whose name is not a known repository) resolves to the nearest
+    short forms whose name is not a known repository) first takes the
+    ``(owner, repo)`` of a same-number resolved reference in the same item
+    when every such reference names the same repository.  That is not an
+    inference -- the ref is recorded as non-bare with no ``via``, exactly
+    like the explicit ref it matches, so a 404 on it stays ``unknown`` --
+    else it resolves to the nearest
     preceding entry in the same item -- a resolved ref or a bare name mention,
     whichever is closest in text order -- else ``--repo``, else it is reported
     as ``unresolved`` and never checked.  A bare name mention is a whole word
     exactly equal to a known repository name (case-sensitive).  Bare refs
-    resolved via the closest preceding resolved ref carry ``via: "nearest"``;
+    resolved via the
+    closest preceding resolved ref carry ``via: "nearest"``;
     via the closest preceding name mention ``via: "name"``; via ``--repo``
     ``via: "repo_flag"``.
     """
@@ -554,6 +567,19 @@ def _analyze_summary(
                     mentions.append((m.group("name"), m.start()))
         mention_index = 0  # first mention not yet before the current ref
 
+        # Rule 1 needs the whole item's resolved references before any bare
+        # ref is resolved: one pass collects, per number, every (owner, repo)
+        # named by a non-bare reference anywhere in the item.  A bare ``#n``
+        # takes that (owner, repo) when every same-number resolved reference
+        # in the item names the same one -- regardless of whether the bare
+        # ref comes before or after them.
+        same_number: dict[int, set[tuple[str, str]]] = {}
+        for ref_owner, ref_repo, number, is_bare in _scan_refs(text, known_repos, owner):
+            # A non-bare ref always carries its (owner, repo) -- the None
+            # check narrows the scan's static type, nothing more.
+            if not is_bare and ref_owner is not None and ref_repo is not None:
+                same_number.setdefault(number, set()).add((ref_owner, ref_repo))
+
         ref_positions = [m.start() for m in _REF_TOKEN_RE.finditer(text)]
         for (ref_owner, ref_repo, number, bare), ref_pos in zip(
             _scan_refs(text, known_repos, owner), ref_positions, strict=True
@@ -566,10 +592,20 @@ def _analyze_summary(
             )
             via: str | None = None
             if bare:
-                # Whichever of the two kinds is closest before the ref wins;
-                # a mention at the same position as a resolved ref is the
-                # short form's own name, so the resolved ref wins (>=).
-                if last_resolved is not None and (
+                # Rule 1: every same-number resolved reference in the item
+                # names the same repository -- take it, whatever the bare ref's
+                # own position.  Same-number refs naming different repos fall
+                # through to the nearest preceding entry below.
+                same = same_number.get(number)
+                if same is not None and len(same) == 1:
+                    (ref_owner, ref_repo), = same
+                    # Not an inference: the repo comes from an explicit
+                    # reference in the same item, so the ref is as good as a
+                    # non-bare one -- it is not bare and takes no via.  A 404
+                    # on it is a genuinely missing number (``unknown``), never
+                    # the "inferred repo" demotion, whatever the text order.
+                    bare = False
+                elif last_resolved is not None and (
                     prev_mention is None or last_resolved_pos >= prev_mention[1]
                 ):
                     ref_owner, ref_repo = last_resolved

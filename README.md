@@ -236,7 +236,12 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   (the owner must start with a letter, so `454/PR#466` is not one); a short form
   (`<name>#<n>`, `<name> #<n>`, `<name> PR #<n>`, `<name> PR#<n>`, `<name> issue #<n>`)
   where `<name>` is a known repository name; and a bare `#<n>` (including `PR #<n>` /
-  `Issue #<n>` with no repo name before them). A bare reference resolves to the nearest
+  `Issue #<n>` with no repo name before them). A bare reference resolves in this order:
+  first to the `(owner, repo)` of a same-number resolved reference in the same item,
+  when every same-number resolved reference in that item names the same repository.
+  That is not an inference: the reference is recorded as non-bare (no `via`), exactly
+  like the explicit ref it matches, so a 404 on it is `unknown`, not `unresolved`.
+  Then to the nearest
   preceding entry in the same item -- a resolved repository or a bare name mention,
   whichever is closest before it -- else `--repo OWNER/NAME`, else it is reported as
   `unresolved` and never checked. A bare word that is a known repository name (not part of
