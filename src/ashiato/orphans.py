@@ -414,6 +414,42 @@ def find_orphans(
 # ---------------------------------------------------------------------------
 
 
+def resolve_sink_paths(sinks: Sequence[Path], default_sinks: bool) -> list[Path]:
+    """The sink paths to load: the caller's, else every default memory dir."""
+    paths = list(sinks)
+    if not paths and default_sinks:
+        paths = default_sink_dirs()
+    return paths
+
+
+def payload_header(
+    n_sessions: int,
+    n_sink_files: int,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    min_tf: int,
+    min_human_chars: int,
+    min_orphans: int,
+    include_headless: bool,
+    limit: int,
+) -> dict[str, Any]:
+    """The corpus and threshold block that opens the ``--json`` document."""
+    return {
+        "sessions_with_prose": n_sessions,
+        "sink_files": n_sink_files,
+        "thresholds": {
+            "min_tf": min_tf,
+            "min_human_chars": min_human_chars,
+            "min_orphans": min_orphans,
+            "include_headless": include_headless,
+            "limit": limit,
+            "since": since.isoformat() if since else None,
+            "until": until.isoformat() if until else None,
+        },
+    }
+
+
 def _header(
     n_sessions: int,
     n_sink_files: int,
@@ -478,10 +514,7 @@ def run(
     finally:
         connection.close()
 
-    sink_paths = list(sinks)
-    if not sink_paths and default_sinks:
-        sink_paths = default_sink_dirs()
-    loaded = load_sinks(sink_paths)
+    loaded = load_sinks(resolve_sink_paths(sinks, default_sinks))
     for path in loaded.missing:
         print(f"warning: sink not found: {path}", file=err)
     if not loaded.text.strip():
@@ -501,19 +534,17 @@ def run(
         include_headless=include_headless,
         limit=limit,
     )
-    header = {
-        "sessions_with_prose": len(sessions),
-        "sink_files": loaded.n_files,
-        "thresholds": {
-            "min_tf": min_tf,
-            "min_human_chars": min_human_chars,
-            "min_orphans": min_orphans,
-            "include_headless": include_headless,
-            "limit": limit,
-            "since": since.isoformat() if since else None,
-            "until": until.isoformat() if until else None,
-        },
-    }
+    header = payload_header(
+        len(sessions),
+        loaded.n_files,
+        since=since,
+        until=until,
+        min_tf=min_tf,
+        min_human_chars=min_human_chars,
+        min_orphans=min_orphans,
+        include_headless=include_headless,
+        limit=limit,
+    )
 
     if json_output:
         payload = {**header, "candidates": [c.to_dict() for c in candidates]}

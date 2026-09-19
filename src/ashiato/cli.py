@@ -40,13 +40,16 @@ from ashiato.orphans import run as orphans_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import (
-    DENIAL_FOLLOWUPS_VIEW,
     RECALL_FOLLOWUPS_VIEW,
     REQUIRED_VIEWS,
     TABLE_COLUMNS,
     TABLES,
     VIEW_COLUMNS,
+    denial_followups_query,
 )
+from ashiato.serve import DEFAULT_HOST as DEFAULT_SERVE_HOST
+from ashiato.serve import DEFAULT_PORT as DEFAULT_SERVE_PORT
+from ashiato.serve import run as serve_run
 from ashiato.session_trace import (
     DEFAULT_EXCERPT_CHARS as DEFAULT_SESSION_TRACE_EXCERPT,
 )
@@ -382,6 +385,45 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--format", choices=("table", "json"), default="table", help="output format (default table)"
     )
 
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="read-only local dashboard over the database (loopback only)",
+    )
+    serve_parser.add_argument("--db", metavar="PATH", help="database path")
+    serve_parser.add_argument(
+        "--host",
+        default=DEFAULT_SERVE_HOST,
+        metavar="HOST",
+        help="loopback address to listen on: 127.0.0.1, ::1 or localhost "
+        f"(default {DEFAULT_SERVE_HOST}); anything else is refused",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=_port,
+        default=DEFAULT_SERVE_PORT,
+        metavar="N",
+        help=f"port to listen on, 0 for any free port (default {DEFAULT_SERVE_PORT})",
+    )
+    serve_parser.add_argument(
+        "--sink",
+        action="append",
+        metavar="PATH",
+        help="sink passed to the orphans page, exactly as 'ashiato orphans --sink' "
+        "(repeatable; default every ~/.claude/projects/*/memory dir)",
+    )
+    serve_parser.add_argument(
+        "--no-default-sinks",
+        action="store_true",
+        help="do not fall back to ~/.claude/projects/*/memory when no --sink is given",
+    )
+    serve_parser.add_argument(
+        "--memory-dir",
+        action="append",
+        metavar="PATH",
+        help="memory directory scanned for unattributed *.md files on the memory page "
+        "(repeatable; default every existing ~/.claude/projects/*/memory dir)",
+    )
+
     compare_periods_parser = subparsers.add_parser(
         "compare-periods",
         help="compare hygiene metrics across two time periods (baseline vs current)",
@@ -475,6 +517,13 @@ def _row_limit(value: str) -> int:
     number = int(value)
     if number < 0:
         raise argparse.ArgumentTypeError("must be 0 or greater")
+    return number
+
+
+def _port(value: str) -> int:
+    number = int(value)
+    if not 0 <= number <= 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
     return number
 
 
@@ -619,17 +668,7 @@ def _run_sql(args: argparse.Namespace, out: Any, err: Any) -> int:
 
 
 def _run_denials(args: argparse.Namespace, out: Any, err: Any) -> int:
-    query = f'SELECT * FROM "{DENIAL_FOLLOWUPS_VIEW}"'
-    params: list[Any] = []
-    if args.session:
-        query += " WHERE session_id = ?"
-        params.append(args.session)
-    # Newest first, as asked for -- but timestamps tie (and can be NULL), so the
-    # session and the line number settle the rest and two runs agree.
-    query += " ORDER BY ts DESC NULLS LAST, session_id, seq DESC"
-    if args.limit:
-        query += " LIMIT ?"
-        params.append(args.limit)
+    query, params = denial_followups_query(args.session, args.limit)
     return _run_query(_resolve_db(args.db), query, params, args.format, out, err)
 
 
@@ -897,6 +936,19 @@ def _run_memory_authors(args: argparse.Namespace, out: Any, err: Any) -> int:
         default_dirs=args.memory_dir is None,
         model=args.model,
         json_output=args.json_output,
+        out=out,
+        err=err,
+    )
+
+
+def _run_serve(args: argparse.Namespace, out: Any, err: Any) -> int:
+    return serve_run(
+        _resolve_db(args.db),
+        host=args.host,
+        port=args.port,
+        sinks=[Path(sink).expanduser() for sink in args.sink or []],
+        default_sinks=not args.no_default_sinks,
+        memory_dirs=[Path(path).expanduser() for path in args.memory_dir or []],
         out=out,
         err=err,
     )
@@ -1251,6 +1303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_hygiene(args, out, err)
     if args.command == "compare-periods":
         return _run_compare_periods(args, out, err)
+    if args.command == "serve":
+        return _run_serve(args, out, err)
     return _run_info(args, out, err)
 
 

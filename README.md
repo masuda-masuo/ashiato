@@ -12,7 +12,9 @@ is a single query.
 - **No LLM, anywhere.** Extraction is plain parsing; the same input files always produce the
   same tables.
 - **No network call, ever.** Transcripts contain secrets and never leave the machine. DuckDB
-  extension autoinstall is switched off explicitly.
+  extension autoinstall is switched off explicitly. (`ashiato serve` listens on loopback
+  only; accepting a connection from this machine is not an outbound call, and it fetches
+  nothing.)
 - **Nothing is dropped.** Every parsed line keeps its verbatim JSON in `events.raw`, so
   anything this schema does not model is still there to query.
 
@@ -41,6 +43,7 @@ ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
+ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-default-sinks] [--memory-dir PATH]...
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
@@ -268,6 +271,47 @@ ashiato compare-periods --period START..END --period START..END [--db PATH] [--f
   strictly later lines — never the build-time `recall_calls.followup_text`,
   which may contain harness noise the trace does not display. The command
   is read-only: it opens the database with `read_only` and writes nothing.
+
+- `serve` runs a read-only local dashboard so the analyses can be glanced at in a browser
+  instead of run one by one. It is a stdlib HTTP server (no new dependency) rendering
+  `info`, `orphans`, `memory-authors`, `denials`, `hygiene` and `session-trace` as HTML:
+  `/` (overview: table counts, time window, ingested roots, a prominent `STALE` banner when
+  files under the recorded roots are newer than the database, and one tile each for orphan
+  candidates, unattributed memory files and denied calls), `/orphans` (the top 30
+  candidates by density), `/memory` (`?model=NAME` filters like `memory-authors --model`),
+  `/denials` (the 50 most recent denials with what the session did next, then the `hygiene`
+  categories) and `/session/<id-or-prefix>` (the `session-trace` timeline; an unknown or
+  ambiguous prefix is a 404 naming the problem). `/api/orphans.json`, `/api/memory.json` and
+  `/api/denials.json` return the same data as JSON, in the shape of the matching command's
+  `--json` / `--format json` output. `/api/overview.json` (also `/api/info.json`) has no
+  command to mirror, since `info` prints no JSON: it is one object with `db_path`,
+  `db_modified`, `table_counts`, `started_at` / `ended_at`, `roots` (`null` when the database
+  recorded none), `freshness` (`{"state": "current" | "stale" | "unknown", "gap": N}`), `tiles`
+  (`orphan_candidates`, `memory_unattributed`, `denied_calls`) and `top_orphans` (the three
+  densest candidates, as `orphans --json` prints them). A memo written into a sink
+  directory retires an orphan candidate on the next reload, and a memory file that appears
+  or disappears shows up as such on the next reload, without waiting for a rebuild. Long
+  text is truncated behind a `<details>` element; the only script on the pages filters
+  tables client-side, and nothing is loaded from outside (CSS and script are inline).
+  It is **loopback-only**: the default `--host` is `127.0.0.1`, `--host` accepts only
+  `127.0.0.1`, `::1` or `localhost` (anything else exits `2` before binding, because
+  transcripts contain secrets), and requests whose `Host` header names anything but the
+  loopback are refused with `403`. It is **read-only**: it writes nothing and every database
+  value shown is HTML-escaped. It uses **per-request connections**: each request opens the
+  database read-only and closes it before responding, so a nightly `ashiato build` (which
+  needs to write) is never blocked by the dashboard. **During a rebuild** -- or when the
+  database is missing or out of date -- pages answer `503` (`Retry-After: 30`) saying the
+  database is being rebuilt, and the server keeps running; an unexpected error in a page is
+  a `500` naming the error, and the server keeps running too. The slow analyses
+  (`orphans`, `memory-authors`) are cached per page, keyed by the database file's
+  modification time and size, and recomputed when either changes; the freshness banner is
+  not cached, since it compares the transcript directories against the database. `--port`
+  defaults to `8772` (`0` picks a free port); the URL is printed on start. `--sink PATH`
+  (repeatable) and `--no-default-sinks` are passed to the orphans page exactly as
+  `ashiato orphans` takes them, and `--memory-dir PATH` (repeatable) as
+  `ashiato memory-authors` takes it; by default both use every existing
+  `~/.claude/projects/*/memory` directory. There is no authentication and no TLS: the
+  loopback bind is the boundary.
 
 - `schema` lists the tables and views in the ashiato schema, or shows the columns
   and types for a specific table or view. It works without a database -- the schema

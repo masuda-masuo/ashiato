@@ -339,6 +339,40 @@ def _matches_model(file: MemoryFile, model: str) -> bool:
     return any(edit_model == model for edit_model, _ in file.edits)
 
 
+def build_report(
+    files: Sequence[MemoryFile],
+    keys_with_writes: set[str],
+    scanned: dict[str, Path],
+    model: str | None = None,
+) -> tuple[list[MemoryFile], list[ModelSummary], list[str]]:
+    """``(files, summary, unattributed)`` as the report shows them.
+
+    *model* keeps only the files it created or edited, newest write first;
+    the summary covers exactly those files.  ``unattributed`` is judged
+    against *keys_with_writes* (every write in the DB), never against the
+    filtered *files*.
+    """
+    shown = list(files)
+    if model is not None:
+        shown = [file for file in shown if _matches_model(file, model)]
+    shown.sort(key=lambda file: (file.last_ts or datetime.min, file.key), reverse=True)
+    unattributed = sorted(key for key in scanned if key not in keys_with_writes)
+    return shown, summarize(shown), unattributed
+
+
+def report_payload(
+    files: Sequence[MemoryFile],
+    summary: Sequence[ModelSummary],
+    unattributed: Sequence[str],
+) -> dict[str, Any]:
+    """The ``--json`` document."""
+    return {
+        "summary": [s.to_dict() for s in summary],
+        "files": [f.to_dict() for f in files],
+        "unattributed": list(unattributed),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -450,19 +484,10 @@ def run(
             print(f"warning: memory dir not found: {path}", file=err)
     scanned = scan_memory_dirs(dir_paths)
 
-    if model is not None:
-        files = [file for file in files if _matches_model(file, model)]
-    files.sort(key=lambda file: (file.last_ts or datetime.min, file.key), reverse=True)
-
-    unattributed = sorted(key for key in scanned if key not in keys_with_writes)
-    summary = summarize(files)
+    files, summary, unattributed = build_report(files, keys_with_writes, scanned, model)
 
     if json_output:
-        payload = {
-            "summary": [s.to_dict() for s in summary],
-            "files": [f.to_dict() for f in files],
-            "unattributed": unattributed,
-        }
+        payload = report_payload(files, summary, unattributed)
         print(json.dumps(payload, indent=2, ensure_ascii=False), file=out)
         return 0
 
