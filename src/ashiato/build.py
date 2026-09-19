@@ -163,13 +163,16 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> duckdb.DuckDBPyC
     """Open the database, creating parent directories when writing.
 
     Extension autoinstall is disabled: this tool reads local transcripts that
-    contain secrets and must never reach the network.
+    contain secrets and must never reach the network.  The progress bar is
+    disabled too: DuckDB draws it on stdout once a query runs long enough, and
+    on a real corpus that prepends a bar line to every ``--json`` document.
     """
     path = Path(db_path).expanduser()
     if not read_only:
         path.parent.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(path), read_only=read_only)
     connection.execute("SET autoinstall_known_extensions=false")
+    connection.execute("SET enable_progress_bar=false")
     return connection
 
 

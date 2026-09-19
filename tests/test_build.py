@@ -2360,3 +2360,33 @@ def test_codex_build_rebuild_replaces_sessions_and_events(tmp_path: Path):
         assert scalar(connection, "SELECT count(*) FROM tool_calls") == 2
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_connect_disables_progress_bar(
+    tmp_path: Path, read_only: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DuckDB's progress bar goes to stdout and would corrupt ``--json`` output (#58).
+
+    DuckDB already defaults the bar to off under pytest, but to on in a plain
+    process (the CLI): the raw connection is forced to ``true`` here so the test
+    fails unless ``connect`` itself turns it off.
+    """
+    db_path = tmp_path / "progress.duckdb"
+    build_module.connect(db_path).close()
+    real_connect = duckdb.connect
+
+    def connect_with_bar_on(*args: object, **kwargs: object) -> duckdb.DuckDBPyConnection:
+        raw = real_connect(*args, **kwargs)
+        raw.execute("SET enable_progress_bar=true")
+        return raw
+
+    monkeypatch.setattr(build_module.duckdb, "connect", connect_with_bar_on)
+    connection = build_module.connect(db_path, read_only=read_only)
+    try:
+        setting = connection.execute(
+            "SELECT current_setting('enable_progress_bar')"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert setting == (False,)
