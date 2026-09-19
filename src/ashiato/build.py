@@ -828,6 +828,42 @@ def _codex_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     ))
 
 
+def _codex_event_to_row(event: object) -> tuple[object, ...]:
+    """Map a ``CodexEvent`` (e.g. a context compaction) to an ``Event``-shaped row.
+
+    Unlike :func:`_codex_text_chunk_to_event` the row keeps the event's own
+    ``type`` (``context_compaction``, never ``text``) and carries no role, so
+    it is distinguishable from assistant text and never joins the exchange
+    stream that ``topics`` and friends read.
+    """
+    from ashiato.codex import CodexEvent as _CE
+
+    assert isinstance(event, _CE)
+    event_id = f"codex:{event.event_id}"
+    return _event_row(Event(
+        event_id=event_id,
+        session_id=event.session_id,
+        file_path=event.file_path,
+        seq=event.seq,
+        ts=event.ts,
+        type=event.type,
+        role=None,
+        parent_uuid=None,
+        depth=0,
+        is_sidechain=False,
+        is_meta=False,
+        permission_mode=None,
+        effort=None,
+        request_id=None,
+        message_id=None,
+        model=None,
+        cwd=None,
+        git_branch=None,
+        text=event.text or "",
+        raw=event.raw,
+    ))
+
+
 def _insert_codex_parsed(
     connection: duckdb.DuckDBPyConnection,
     parsed: ParsedCodexFile,
@@ -841,10 +877,12 @@ def _insert_codex_parsed(
     """The Codex counterpart of :func:`_insert_parsed`.
 
     Inserts ``tool_calls`` (one row per ``CodexToolCall``), one ``sessions``
-    row per file, and ``events`` rows for text chunks with non-empty text.
+    row per file, and ``events`` rows for text chunks with non-empty text plus
+    non-text ``CodexEvent`` rows (context compactions).
     ``source_files.n_events`` reflects the count of inserted events.
     """
     # Session row
+    n_events = len(parsed.text_chunks) + len(parsed.events)
     session = Session(
         session_id=parsed.session_id,
         file_path=parsed.file_path,
@@ -855,7 +893,7 @@ def _insert_codex_parsed(
         entrypoint=None,
         started_at=parsed.started_at,
         ended_at=parsed.ended_at,
-        n_events=len(parsed.text_chunks),
+        n_events=n_events,
         n_tool_calls=len(parsed.tool_calls),
         input_tokens=parsed.input_tokens,
         output_tokens=parsed.output_tokens,
@@ -864,8 +902,9 @@ def _insert_codex_parsed(
     )
     _insert_rows(connection, "sessions", [_session_row(session)], scratch=scratch)
 
-    # Event rows from text chunks
+    # Event rows from text chunks, plus non-text events (compactions)
     event_rows = [_codex_text_chunk_to_event(c) for c in parsed.text_chunks]
+    event_rows += [_codex_event_to_row(e) for e in parsed.events]
     _insert_rows(connection, "events", event_rows, scratch=scratch)
 
     _insert_rows(
@@ -889,7 +928,7 @@ def _insert_codex_parsed(
                 stat.st_size,
                 stat.st_mtime,
                 content_hash,
-                len(parsed.text_chunks),  # n_events
+                n_events,                  # n_events
                 len(parsed.tool_calls),   # n_tool_calls
                 parsed.n_parse_errors,
                 built_at,

@@ -290,9 +290,9 @@ def test_since_excludes_earlier_evidence(db: Path):
 
 
 def test_format_version_is_unchanged():
-    # Bumped to 5 by issue #20: recall overlap now counts only distinctive
-    # tokens, so the same source bytes yield different overlap_* rows.
-    assert FORMAT_VERSION == 6
+    # Bumped to 7 by issue #68: Codex parser now ingests collab/delegation
+    # item types and the response_item path for messages.
+    assert FORMAT_VERSION == 7
 
 
 # ---------------------------------------------------------------- read-only discipline

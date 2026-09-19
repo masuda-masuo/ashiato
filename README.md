@@ -71,11 +71,17 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   ledger instead (see `recall_calls` below). A kaiba db that does not exist or cannot be
   read does not fail the build -- affected rows simply get `NULL` `output` / `ts`, and
   `build` prints one line saying so.
+- `--codex-source` is repeatable and is searched recursively for `*.jsonl` Codex
+  session files (`~/.codex/sessions` on a machine that has them). A separate list
+  for the same reason as the others: Codex keeps its own directory tree, so a
+  second explicit list means it never gets swept into the plain `--source` scan
+  even though both use the `*.jsonl` extension. Nothing is scanned for Codex
+  sessions by default -- pass `--codex-source` to opt in.
 - `--db` defaults to `$XDG_DATA_HOME/ashiato/ashiato.duckdb`, falling back to
   `~/.local/share/ashiato/ashiato.duckdb`. Parent directories are created as needed.
 - `build` is incremental: a file whose path, size and mtime are unchanged since the last
   build is skipped. A changed file has its old rows deleted and is re-inserted whole, so
-  rebuilding never duplicates. This applies uniformly to both source formats.
+  rebuilding never duplicates. This applies uniformly to all four source formats.
 - `denials` prints the `denial_followups` view — every denied tool call and what the
   session did next — newest first, 50 rows by default (`--limit 0` for all).
 - `recalls` prints the `recall_followups` view — every completed kaiba `recall` call, from
@@ -500,6 +506,55 @@ freshness: 3 new or changed files under recorded roots (run 'ashiato build' to u
 $ ashiato schema
 $ ashiato schema tool_calls
 ```
+
+## Codex item types
+
+Codex session transcripts are parsed the same deterministic way as the other
+sources: pure parsing, same bytes always produce the same rows. Of the item
+types a session can record, these become rows:
+
+| item type | row |
+| --- | --- |
+| `CommandExecution` | `tool_calls`, `tool_name` `Bash` |
+| `McpToolCall` | `tool_calls`, `tool_name` `mcp__<server>__<tool>` |
+| `FileChange` | `tool_calls`, `tool_name` `FileChange`; the touched paths are the `files` key of `input` (and the keys of its `changes`), so `input LIKE '%path%'` finds them |
+| `CollabAgentToolCall` | `tool_calls`, `tool_name` `collab__<tool>` (e.g. `collab__wait`); `receiver_agents` / `receiver_thread_ids` / `agents_states` ride in `input` when the item carries them |
+| `SubAgentActivity` | `tool_calls`, `tool_name` `collab__subagent`; `kind`, `agent_thread_id`, `agent_path` ride in `input` |
+| `AgentResponse` / `message` | `events`, `type` `text` |
+| `ContextCompaction` | `events`, its own `type` `context_compaction` (never `text`), so a session's compaction points are queryable and never read as assistant speech |
+
+`Reasoning`, `Extension`, `AgentMessage`, and `UserMessage` are deliberately not
+matched on the `item_completed` path.  `Reasoning` (4624 items across the real
+corpus) is the model's private scratchpad, not an action; `Extension` items
+(web search, on the real sessions read) record a query and its results but no
+delegation or state change, so they are left out of the current model.  The
+deliberate drops are documented here so the missing rows read as a decision,
+not a bug -- and an item type this parser does not know is always dropped
+silently, never raised on, so a future Codex version's new item type cannot
+break a build.
+
+`AgentMessage` and `UserMessage` are additionally skipped on the
+`item_completed` path because Codex records each message **twice**: once as an
+`item_completed` item and once as a top-level `response_item`.  The
+`response_item` path already ingests all message rows, so matching both would
+duplicate them.  Measured over all 55 sessions in the real corpus:
+
+```
+item_completed AgentMessage : 1719      response_item message role=assistant : 1735
+item_completed UserMessage  :  448      response_item message role=user      :  554
+                                        response_item message role=developer :  220
+```
+
+The `response_item` path produces all 2509 Codex event rows (1735 + 554 + 220 =
+2509 exactly); ingesting `AgentMessage` as well would double-count every
+assistant message.
+
+Delegation rows (`CollabAgentToolCall`, `SubAgentActivity`) currently carry
+`outcome='pending'` regardless of their `status`, because they set `output=None`
+and the classifier treats no output as pending.  All 17 collab items in the
+evidence file carry `status="completed"`, but the outcome field does not reflect
+that.  This is a known limitation: a future delegation-query surface should
+classify these rows by `status` instead.
 
 ## Tables
 

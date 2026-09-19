@@ -376,3 +376,171 @@ def test_parse_codex_live_message_items(tmp_path: Path):
     # All have timestamps
     for chunk in parsed.text_chunks:
         assert chunk.ts is not None
+def _write_items(tmp_path: Path, name: str, items: list[dict]) -> Path:
+    """Write one Codex session file whose item_completed payloads are *items*."""
+    jsonl_file = tmp_path / name
+    lines = [
+        {"type": "session_meta", "payload": {"id": "codex-newtypes"}},
+    ]
+    for item in items:
+        lines.append({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "codex-newtypes",
+                "item": item,
+            },
+        })
+    with open(jsonl_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+    return jsonl_file
+
+
+def test_parse_codex_file_change_item(tmp_path: Path):
+    """A FileChange item becomes a tool call naming the files it touched."""
+    jsonl_file = _write_items(tmp_path, "file-change.jsonl", [
+        {
+            "type": "FileChange",
+            "id": "exec-fc-1",
+            "changes": {
+                "/work/src/foo.py": {"type": "edit", "content": "x"},
+                "/work/src/bar.py": {"type": "delete"},
+            },
+            "status": "completed",
+            "stdout": "Success. Updated the following files:\nM /work/src/foo.py\n",
+            "stderr": "",
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.tool_calls) == 1
+    call = parsed.tool_calls[0]
+    assert call.tool_name == "FileChange"
+    assert call.input == {
+        "files": ["/work/src/foo.py", "/work/src/bar.py"],
+        "changes": {
+            "/work/src/foo.py": {"type": "edit", "content": "x"},
+            "/work/src/bar.py": {"type": "delete"},
+        },
+    }
+    assert call.output and "/work/src/foo.py" in call.output
+    assert call.status == "completed"
+    # A FileChange is a tool call, never an event.
+    assert len(parsed.events) == 0
+
+
+def test_parse_codex_collab_agent_tool_call_item(tmp_path: Path):
+    """A CollabAgentToolCall item becomes a collab__<tool> tool call."""
+    jsonl_file = _write_items(tmp_path, "collab.jsonl", [
+        {
+            "type": "CollabAgentToolCall",
+            "id": "call-wait-1",
+            "tool": "wait",
+            "status": "completed",
+            "sender_thread_id": "thread-parent",
+            "receiver_thread_ids": ["thread-child"],
+            "receiver_agents": ["sol"],
+            "agents_states": {"sol": "working"},
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.tool_calls) == 1
+    call = parsed.tool_calls[0]
+    assert call.tool_name == "collab__wait"
+    assert call.input == {
+        "sender_thread_id": "thread-parent",
+        "receiver_thread_ids": ["thread-child"],
+        "receiver_agents": ["sol"],
+        "agents_states": {"sol": "working"},
+    }
+    assert call.status == "completed"
+    assert call.output is None
+
+
+def test_parse_codex_sub_agent_activity_item(tmp_path: Path):
+    """A SubAgentActivity item becomes a collab__subagent tool call."""
+    jsonl_file = _write_items(tmp_path, "subagent.jsonl", [
+        {
+            "type": "SubAgentActivity",
+            "id": "call-sa-1",
+            "kind": "started",
+            "agent_thread_id": "01a07aa0-56fa-78a1-ad92-9c129b72e239",
+            "agent_path": "/root/kusabi_484_luna",
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.tool_calls) == 1
+    call = parsed.tool_calls[0]
+    assert call.tool_name == "collab__subagent"
+    assert call.input == {
+        "kind": "started",
+        "agent_thread_id": "01a07aa0-56fa-78a1-ad92-9c129b72e239",
+        "agent_path": "/root/kusabi_484_luna",
+    }
+
+
+def test_parse_codex_context_compaction_is_an_event(tmp_path: Path):
+    """A ContextCompaction item becomes an events entry, never a tool call."""
+    jsonl_file = _write_items(tmp_path, "compaction.jsonl", [
+        {"type": "ContextCompaction", "id": "compaction-1"},
+    ])
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.tool_calls) == 0
+    assert len(parsed.text_chunks) == 0
+    assert len(parsed.events) == 1
+    event = parsed.events[0]
+    assert event.type == "context_compaction"
+    assert event.event_id == "compaction-1"
+    assert event.text is None
+    # The verbatim item JSON survives in raw.
+    assert '"type": "ContextCompaction"' in event.raw
+    assert '"id": "compaction-1"' in event.raw
+
+
+def test_parse_codex_new_item_types_tolerate_malformed_instances(tmp_path: Path):
+    """Missing keys and wrong value types never raise for the new item types."""
+    jsonl_file = _write_items(tmp_path, "malformed.jsonl", [
+        # FileChange with a non-dict changes field and no stdout.
+        {"type": "FileChange", "id": "fc-1", "changes": ["/work/x.py"], "status": 42},
+        # FileChange with no changes at all.
+        {"type": "FileChange", "id": "fc-2"},
+        # CollabAgentToolCall with a non-string tool and no receivers.
+        {"type": "CollabAgentToolCall", "id": "ca-1", "tool": 42, "status": "completed"},
+        # SubAgentActivity with nothing but a kind of the wrong type.
+        {"type": "SubAgentActivity", "id": "sa-1", "kind": ["started"]},
+        # ContextCompaction with no id.
+        {"type": "ContextCompaction"},
+    ])
+    parsed = parse_file(jsonl_file)
+    # No raise above; every item still yields a row.
+    assert len(parsed.tool_calls) == 4
+    file_changes = [c for c in parsed.tool_calls if c.tool_name == "FileChange"]
+    assert len(file_changes) == 2
+    # Non-dict changes -> empty files list; missing stdout -> None output.
+    assert file_changes[0].input == {"files": [], "changes": {}}
+    assert file_changes[0].output is None
+    assert file_changes[0].status == 42
+    # Non-string tool -> the item type names the row.
+    collab = [c for c in parsed.tool_calls if c.tool_name == "CollabAgentToolCall"]
+    assert len(collab) == 1
+    assert collab[0].input == {}
+    assert collab[0].status == "completed"
+    subagents = [c for c in parsed.tool_calls if c.tool_name == "collab__subagent"]
+    assert len(subagents) == 1
+    # A wrong-typed field is preserved as-is (never raising), exactly like the
+    # existing branches keep a malformed status/exit_code.
+    assert subagents[0].input == {"kind": ["started"]}
+    assert len(parsed.events) == 1
+    assert parsed.events[0].type == "context_compaction"
+
+
+def test_parse_codex_unknown_item_type_is_dropped_silently(tmp_path: Path):
+    """An item type ashiato does not know is dropped without raising."""
+    jsonl_file = _write_items(tmp_path, "unknown.jsonl", [
+        {"type": "SomeFutureItemType", "id": "future-1", "payload": "whatever"},
+    ])
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.tool_calls) == 0
+    assert len(parsed.text_chunks) == 0
+    assert len(parsed.events) == 0
+    assert parsed.n_parse_errors == 0

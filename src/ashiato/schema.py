@@ -132,7 +132,10 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: (issue #20): ordinary English words and bare dates are excluded, so
 #: ``overlap_count`` / ``overlap_tokens`` reflect identifiers, paths, issue
 #: refs and hashes rather than chance matches.
-FORMAT_VERSION = 6
+#: Version 7 = Codex parser now ingests collab/delegation item types
+#: (CollabAgentToolCall, SubAgentActivity) and the response_item path for
+#: messages; 348 rows from a real Codex session where version 6 produced 304.
+FORMAT_VERSION = 7
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
