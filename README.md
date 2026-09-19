@@ -37,6 +37,7 @@ ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
 ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--json]
+ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]... [--model NAME] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
@@ -164,6 +165,30 @@ ashiato compare-periods --period START..END --period START..END [--db PATH] [--f
   topic whose words happen to appear in a sink is missed. It is a nomination only; judging
   whether a candidate is worth keeping is for the reader. Exit code `0` on success (including
   no candidates) and `1` when the database cannot be read.
+
+- `memory-authors` attributes each Claude Code memory file
+  (`~/.claude/projects/<project>/memory/*.md`) to the models that wrote it. Claude Code
+  writes these files automatically, and a project shared by several models (fable, opus,
+  sonnet, ...) makes session-level attribution wrong: a session switches models mid-way.
+  The report instead reads the model off the *write call's own event* (`events.model`
+  joined to the `Write` / `Edit` / `MultiEdit` call), so `created_by` is the model of the
+  earliest successful `Write` -- or `unknown` when an `Edit`/`MultiEdit` came first (the
+  file predates the corpus) or the model is NULL/`<synthetic>`. Per file it reports the
+  edit counts per model, first/last write time, total successful writes, whether the most
+  recent path still exists on disk, and how many `Bash` calls mentioned the file inside
+  `/memory/` (`bash_mentions`). `--since TS` / `--until TS` restrict the calls considered
+  (inclusive, same semantics as `orphans`); `--model NAME` lists only files whose creator
+  or any editor is that model; `--memory-dir PATH` (repeatable; default every existing
+  `~/.claude/projects/*/memory` directory) names the directories whose `*.md` files with
+  no recorded write appear under `unattributed`; `--json` prints one document with
+  `summary` (per model: files created, writes, files touched), `files` and `unattributed`.
+  This is report-only: it never writes anything. Known limit: attribution covers Claude
+  Code's `Write` / `Edit` / `MultiEdit` tool calls only -- edits made through Bash or
+  scripts are not attributed, so they only surface as `bash_mentions` and a file rewritten
+  entirely through the shell has no creator. Codex sessions write through their shell tool
+  (recorded as `Bash`), so their memory edits appear as `bash_mentions` at best, and memory
+  writes made from Cursor sessions are not visible in the database at all. Exit code `0` on
+  success and `1` when the database cannot be read.
 
 - `hygiene` is a named, read-only audit of session hygiene over `tool_calls`,
   replacing the ad-hoc SQL that used to be rewritten for every such question.

@@ -32,6 +32,7 @@ from ashiato.grep import search as grep_search
 from ashiato.grep import visible as grep_visible
 from ashiato.grep import window as grep_window
 from ashiato.hygiene import audit as hygiene_audit
+from ashiato.memory_authors import run as memory_authors_run
 from ashiato.nominate import run as nominate_run
 from ashiato.orphans import DEFAULT_LIMIT as DEFAULT_ORPHANS_LIMIT
 from ashiato.orphans import DEFAULT_MIN_HUMAN_CHARS, DEFAULT_MIN_ORPHANS, DEFAULT_MIN_TF
@@ -323,6 +324,39 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"maximum candidates, 0 for all (default {DEFAULT_ORPHANS_LIMIT})",
     )
     orphans_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="output as JSON"
+    )
+
+    memory_authors_parser = subparsers.add_parser(
+        "memory-authors",
+        help="attribute each Claude Code memory file to the models that wrote it",
+    )
+    memory_authors_parser.add_argument("--db", metavar="PATH", help="database path")
+    memory_authors_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only consider calls at or after this ISO-8601 timestamp",
+    )
+    memory_authors_parser.add_argument(
+        "--until",
+        type=_parse_since,
+        metavar="TS",
+        help="only consider calls at or before this ISO-8601 timestamp",
+    )
+    memory_authors_parser.add_argument(
+        "--memory-dir",
+        action="append",
+        metavar="PATH",
+        help="memory directory scanned for unattributed *.md files "
+        "(repeatable; default every existing ~/.claude/projects/*/memory dir)",
+    )
+    memory_authors_parser.add_argument(
+        "--model",
+        metavar="NAME",
+        help="only list files whose creator or any editor is this model",
+    )
+    memory_authors_parser.add_argument(
         "--json", action="store_true", dest="json_output", help="output as JSON"
     )
 
@@ -854,6 +888,20 @@ def _run_orphans(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
 
 
+def _run_memory_authors(args: argparse.Namespace, out: Any, err: Any) -> int:
+    return memory_authors_run(
+        _resolve_db(args.db),
+        since=args.since,
+        until=args.until,
+        memory_dirs=[Path(path).expanduser() for path in args.memory_dir or []],
+        default_dirs=args.memory_dir is None,
+        model=args.model,
+        json_output=args.json_output,
+        out=out,
+        err=err,
+    )
+
+
 def _run_hygiene(args: argparse.Namespace, out: Any, err: Any) -> int:
     db_path = _resolve_db(args.db)
     if not db_path.exists():
@@ -1197,6 +1245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_nominate(args, out, err)
     if args.command == "orphans":
         return _run_orphans(args, out, err)
+    if args.command == "memory-authors":
+        return _run_memory_authors(args, out, err)
     if args.command == "hygiene":
         return _run_hygiene(args, out, err)
     if args.command == "compare-periods":
