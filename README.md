@@ -238,14 +238,13 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   where `<name>` is a known repository name; and a bare `#<n>` (including `PR #<n>` /
   `Issue #<n>` with no repo name before them). A bare reference resolves to the nearest
   preceding entry in the same item -- a resolved repository or a bare name mention,
-  whichever is closest before it -- else the repository named most
-  often in the same summary, else `--repo OWNER/NAME`, else it is reported as `unresolved`
-  and never checked. A bare word that is a known repository name (not part of a path, URL,
-  `owner/repo`, identifier, or longer word such as `shiori-demo`) sets the nearest preceding
-  repository for later bare refs in the same item. Bare references carry a `via` key
-  indicating how they were resolved: `"nearest"` (preceding resolved ref), `"name"`
-  (preceding bare name mention), `"summary"` (summary fallback), or `"repo_flag"`
-  (`--repo`). Non-bare refs omit `via`. Known repository
+  whichever is closest before it -- else `--repo OWNER/NAME`, else it is reported as
+  `unresolved` and never checked. A bare word that is a known repository name (not part of
+  a path, URL, `owner/repo`, identifier, or longer word such as `shiori-demo`) sets the
+  nearest preceding repository for later bare refs in the same item. Bare references carry
+  a `via` key indicating how they were resolved: `"nearest"` (preceding resolved ref),
+  `"name"` (preceding bare name mention), or `"repo_flag"` (`--repo`). Non-bare refs omit
+  `via`. Known repository
   names come from the explicit references found anywhere in the database's summaries, or with
   `--gh` from the owner's repositories (`gh repo list <owner> --limit 200 --json name`, one
   call per run); `--owner NAME` sets the owner those short forms resolve to, defaulting to the

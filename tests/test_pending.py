@@ -34,7 +34,7 @@ from ashiato.pending import (
 )
 
 #: The example from the brief: three bullets, the third deferred with bare
-#: references that must resolve to the summary's most frequent explicit repo.
+#: references that have no repository in their own item.
 EXAMPLE_SUMMARY = """\
 7. Pending Tasks:
    - PR https://github.com/masuda-masuo/sunaba/pull/416 (`sandbox_issue_write`) is CI-green and approved, but not yet reported as merged.
@@ -317,12 +317,12 @@ def test_example_summary_yields_three_items_and_resolves_bare_refs(
 
     assert keys(items[0]) == [("masuda-masuo", "sunaba", 416)]
     assert keys(items[1]) == [("masuda-masuo", "sunaba", 415)]
-    # The bare #356/#360 resolve to the summary's most frequent explicit repo.
-    assert keys(items[2]) == [
-        ("masuda-masuo", "sunaba", 356),
-        ("masuda-masuo", "sunaba", 360),
-    ]
+    # The bare #356/#360 have no repo in their own item (and no --repo),
+    # so they are unresolved and never checked.
+    assert keys(items[2]) == [(None, None, 356), (None, None, 360)]
     assert all(r["bare"] for r in items[2]["references"])
+    assert all(r["state"] == "unresolved" for r in items[2]["references"])
+    assert all(r.get("via") is None for r in items[2]["references"])
     assert payload["counts"]["unchecked"] == 3
     assert payload["counts"]["no_section"] == 0
 
@@ -645,7 +645,7 @@ def test_text_output_shape_and_latest_title(
     assert "summary 2026-08-01 10:00:00" in out
     assert "title: The real title" in out
     assert "[deferred]" in out
-    assert "masuda-masuo/sunaba#356=unchecked" in out
+    assert "#356=unresolved" in out
     assert "no_section: 0" in out
 
 
@@ -757,8 +757,7 @@ def test_cli_rejects_malformed_repo(tmp_path: Path, capsys: pytest.CaptureFixtur
 
 
 #: The four real item texts from the live DB (repair 2), as fixture items, with
-#: explicit anchors naming kusabi and sunaba and extra kusabi mentions so kusabi
-#: stays the summary's most frequent resolved repository.
+#: explicit anchors naming kusabi and sunaba and extra kusabi mentions.
 REAL_ITEMS_SUMMARY = """\
 7. Pending Tasks:
    - masuda-masuo/kusabi#10 and masuda-masuo/sunaba#20 are the explicit anchors.
@@ -795,10 +794,11 @@ def test_real_item_texts_resolve_with_known_repos(
         ("masuda-masuo", "sunaba", 848),
     ]
     assert items[3]["references"][1]["bare"] is True
-    # Item 4: a bare #243 with no repo in its own text resolves to the summary's
-    # most frequent resolved repository -- kusabi, thanks to the extra mentions.
-    assert keys(items[4]) == [("masuda-masuo", "kusabi", 243)]
+    # Item 4: a bare #243 with no repo in its own text and no --repo is
+    # unresolved.
+    assert keys(items[4]) == [(None, None, 243)]
     assert items[4]["references"][0]["bare"] is True
+    assert items[4]["references"][0]["state"] == "unresolved"
 
 
 def test_pr_number_forms_are_bare_and_never_owner_454(
@@ -814,12 +814,14 @@ def test_pr_number_forms_are_bare_and_never_owner_454(
     payload = _run_cli_json(db, capsys=capsys)
     items = payload["sessions"][0]["items"]
     refs = items[1]["references"]
-    # Both numbers are bare refs that resolve to the summary's known repo.
+    # Both numbers are bare refs with no repo in their own item, so they are
+    # unresolved.
     assert [(r["owner"], r["repo"], r["number"]) for r in refs] == [
-        ("masuda-masuo", "sunaba", 454),
-        ("masuda-masuo", "sunaba", 466),
+        (None, None, 454),
+        (None, None, 466),
     ]
     assert all(r["bare"] for r in refs)
+    assert all(r["state"] == "unresolved" for r in refs)
     # Never an owner 454 or a repo named PR anywhere.
     for item in items:
         for reference in item["references"]:
@@ -842,9 +844,11 @@ def test_unknown_short_name_is_a_bare_ref_not_a_repo(
     payload = _run_cli_json(db, capsys=capsys)
     items = payload["sessions"][0]["items"]
     ref = items[1]["references"][0]
-    # `of` is not a known repository, so of#3 is a bare #3.
-    assert (ref["owner"], ref["repo"], ref["number"]) == ("masuda-masuo", "sunaba", 3)
+    # `of` is not a known repository, so of#3 is a bare #3; with no repo in
+    # its own item it is unresolved.
+    assert (ref["owner"], ref["repo"], ref["number"]) == (None, None, 3)
     assert ref["bare"] is True
+    assert ref["state"] == "unresolved"
     assert all(reference["repo"] != "of" for item in items for reference in item["references"])
 
 
@@ -940,10 +944,10 @@ def test_known_name_with_space_before_hash(tmp_path: Path, capsys: pytest.Captur
     # Item 1: sagasu #12 → known name with space, non-bare
     assert keys(items[1]) == [("masuda-masuo", "sagasu", 12)]
     assert items[1]["references"][0]["bare"] is False
-    # Item 2: see #34 → bare (no known name)
-    assert keys(items[2]) == [("masuda-masuo", "sagasu", 34)]
+    # Item 2: see #34 → bare with no repo in its own item, unresolved
+    assert keys(items[2]) == [(None, None, 34)]
     assert items[2]["references"][0]["bare"] is True
-    assert items[2]["references"][0]["via"] == "summary"
+    assert items[2]["references"][0]["state"] == "unresolved"
 
 
 # ---------------------------------------------------------------- issue #55: bare repo-name word
@@ -1001,11 +1005,12 @@ def test_shiori_case_insensitive_does_not_count(
     items = payload["sessions"][0]["items"]
     ref = items[1]["references"][0]
     # 'Shiori' is not a known name (case-sensitive), so #288 is a bare ref
-    # resolved via the summary fallback, not via a name mention.
-    assert ref["owner"] == "masuda-masuo"
-    assert ref["repo"] == "shiori"
+    # with no preceding repository in its own item: unresolved.
+    assert ref["owner"] is None
+    assert ref["repo"] is None
     assert ref["bare"] is True
-    assert ref["via"] == "summary"
+    assert ref["state"] == "unresolved"
+    assert ref["via"] is None
 
 
 def test_shiori_hyphenated_does_not_count(
@@ -1027,8 +1032,9 @@ def test_shiori_hyphenated_does_not_count(
     ref = items[1]["references"][0]
     assert ref["number"] == 99
     assert ref["bare"] is True
-    # shiori-demo is not a known name, so #99 resolves via summary fallback
-    assert ref["via"] == "summary"
+    # shiori-demo is not a known name, so #99 has no repo in its own item
+    assert ref["state"] == "unresolved"
+    assert ref["via"] is None
 
 
 def test_shiori_underscore_does_not_count(
@@ -1050,7 +1056,8 @@ def test_shiori_underscore_does_not_count(
     ref = items[1]["references"][0]
     assert ref["number"] == 50
     assert ref["bare"] is True
-    assert ref["via"] == "summary"
+    assert ref["state"] == "unresolved"
+    assert ref["via"] is None
 
 
 def test_path_shiori_x_does_not_count(
@@ -1072,7 +1079,8 @@ def test_path_shiori_x_does_not_count(
     ref = items[1]["references"][0]
     assert ref["number"] == 77
     assert ref["bare"] is True
-    assert ref["via"] == "summary"
+    assert ref["state"] == "unresolved"
+    assert ref["via"] is None
 
 
 def test_name_mention_after_bare_ref_does_not_apply(
@@ -1093,11 +1101,13 @@ def test_name_mention_after_bare_ref_does_not_apply(
     items = payload["sessions"][0]["items"]
 
     refs = items[1]["references"]
-    # #12 comes before the shiori name mention, so it uses summary fallback
-    # (via "summary"); #34 comes after, so it uses the name mention (via "name")
+    # #12 comes before the shiori name mention and has no other preceding
+    # entry, so it is unresolved; #34 comes after the mention, so it uses the
+    # name mention (via "name").
     assert refs[0]["number"] == 12
     assert refs[0]["bare"] is True
-    assert refs[0]["via"] == "summary"
+    assert refs[0]["state"] == "unresolved"
+    assert refs[0]["via"] is None
     assert refs[1]["number"] == 34
     assert refs[1]["bare"] is True
     assert refs[1]["via"] == "name"
@@ -1269,7 +1279,7 @@ def test_non_404_failure_on_bare_ref_is_unknown(
     summary = (
         "7. Pending Tasks:\n"
         "   - masuda-masuo/sunaba#10 is the anchor.\n"
-        "   - fix #888 after the merge.\n"
+        "   - sunaba#100 is open; fix #888 after the merge.\n"
         "8. Current Work:\n"
     )
     db = make_db(
@@ -1284,13 +1294,14 @@ def test_non_404_failure_on_bare_ref_is_unknown(
         number = int(parts[-1])
         if number == 888:
             return False, None, "graphql: Not Found"
-        return True, {"state": "open"}, ""
+        return True, {"state": "closed"}, ""
 
-    payload = _run_direct_json(db, use_gh=True, gh_call=fake)
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake, show_resolved=True)
     items = payload["sessions"][0]["items"]
-    ref = items[1]["references"][0]
+    ref = items[1]["references"][1]
     assert ref["number"] == 888
-    # #888 is bare, inferred to sunaba via summary fallback
+    # #888 is bare, inferred to sunaba via the nearest preceding ref
+    assert ref["via"] == "nearest"
     assert ref["bare"] is True
     # Non-404 failure → unknown (not unresolved)
     assert ref["state"] == "unknown"
@@ -1307,7 +1318,7 @@ def test_via_key_on_bare_refs(tmp_path: Path, capsys: pytest.CaptureFixture[str]
         "   - masuda-masuo/sunaba#10 is the anchor and also #20.\n"
         "   - masuda-masuo/shiori#1 is the other anchor.\n"
         "   - shiori has issues #30/#40.\n"
-        "   - #50 via summary fallback.\n"
+        "   - #50 unresolved.\n"
         "8. Current Work:\n"
     )
     db = make_db(
@@ -1329,8 +1340,9 @@ def test_via_key_on_bare_refs(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     assert items[2]["references"][0]["via"] == "name"
     assert items[2]["references"][1]["via"] == "name"
 
-    # Item 3: #50 resolved via summary fallback
-    assert items[3]["references"][0]["via"] == "summary"
+    # Item 3: #50 has no preceding repo in its own item → unresolved
+    assert items[3]["references"][0]["state"] == "unresolved"
+    assert items[3]["references"][0]["via"] is None
 
 
 def test_via_repo_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1348,3 +1360,74 @@ def test_via_repo_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     ref = payload["sessions"][0]["items"][0]["references"][0]
     assert ref["via"] == "repo_flag"
     assert ref["bare"] is True
+
+
+# ------------------------------------------------- issue #61: no summary-wide fallback
+
+
+def test_bare_ref_without_in_item_repo_is_unresolved_and_not_checked(
+    tmp_path: Path,
+) -> None:
+    """A bare #n with no repo in its own item stays unresolved even when the
+    summary resolves other items, and the gh fake is never called for it."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - shiori#10 done.\n"
+        "   - #17 untouched.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+    calls: list[list[str]] = []
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        calls.append(list(argv))
+        if argv[1] == "repo":
+            return True, [{"name": "shiori"}, {"name": "sagasu"}], ""
+        return True, {"state": "closed"}, ""
+
+    payload = _run_direct_json(
+        db, use_gh=True, gh_call=fake, owner="masuda-masuo", show_resolved=True
+    )
+    items = payload["sessions"][0]["items"]
+    # Item 2 (#17) has no repo in its own item: unresolved, never checked.
+    assert [(r["owner"], r["repo"], r["number"]) for r in items[1]["references"]] == [
+        (None, None, 17)
+    ]
+    assert items[1]["references"][0]["state"] == "unresolved"
+    assert items[1]["references"][0]["via"] is None
+    api_calls = [argv for argv in calls if argv[1] == "api"]
+    assert all("17" not in " ".join(argv) for argv in api_calls)
+
+
+def test_repo_flag_applies_even_when_the_summary_resolves_something(
+    tmp_path: Path,
+) -> None:
+    """--repo applies to every bare ref with no in-item repository, not only
+    when the summary resolves nothing."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - shiori#10 done.\n"
+        "   - #17 untouched.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(tmp_path, [("ses-a", "2026-08-01", [user(summary, compact=True)])])
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "shiori"}, {"name": "sagasu"}], ""
+        return True, {"state": "closed"}, ""
+
+    payload = _run_direct_json(
+        db,
+        use_gh=True,
+        gh_call=fake,
+        owner="masuda-masuo",
+        repo=("masuda-masuo", "sagasu"),
+        show_resolved=True,
+    )
+    items = payload["sessions"][0]["items"]
+    assert [(r["owner"], r["repo"], r["number"]) for r in items[1]["references"]] == [
+        ("masuda-masuo", "sagasu", 17)
+    ]
+    assert items[1]["references"][0]["bare"] is True
+    assert items[1]["references"][0]["via"] == "repo_flag"

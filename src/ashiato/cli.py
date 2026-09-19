@@ -446,8 +446,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--repo",
         type=_parse_repo,
         metavar="OWNER/NAME",
-        help="owner/repo used to resolve bare #N references when the summary "
-        "names no repo",
+        help="owner/repo used to resolve bare #N references that have no "
+        "repository in their own item",
     )
     pending_parser.add_argument(
         "--owner",

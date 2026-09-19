@@ -27,16 +27,16 @@ form (``<name>#<n>``, ``<name> #<n>``, ``<name> PR #<n>``, ``<name> PR#<n>``,
 ``#<n>`` (including ``PR #<n>`` / ``Issue #<n>`` with no repo name before
 them).  A bare reference resolves to the nearest preceding resolved
 repository in the same item, else a bare whole word that is exactly a known
-repository name (case-sensitive) in the same item (``via: "name"``), else the
-repository named most often in the same summary, else ``--repo OWNER/NAME``,
-else it is reported as ``unresolved`` and never checked.  A bare word that is
+repository name (case-sensitive) in the same item (``via: "name"``), else
+``--repo OWNER/NAME``, else it is reported as ``unresolved`` and never
+checked.  A bare word that is
 a known repository name (not part of a path, URL, ``owner/repo``,
 identifier, or longer word such as ``shiori-demo``) sets the nearest
 preceding repository for later bare refs in the same item, the same way a
 resolved explicit/short ref does.  Bare references carry a ``via`` key
 indicating how they were resolved: ``"nearest"`` (preceding resolved ref),
-``"name"`` (preceding bare name mention), ``"summary"`` (summary fallback),
-or ``"repo_flag"`` (``--repo``).  Non-bare refs omit ``via``.  Known
+``"name"`` (preceding bare name mention), or ``"repo_flag"`` (``--repo``).
+Non-bare refs omit ``via``.  Known
 repository names come from the explicit references found anywhere in the
 database's summaries, or with ``--gh`` from
 ``gh repo list <owner> --limit 200 --json name`` (one call per run, only the
@@ -303,11 +303,11 @@ class Reference:
 
     ``state`` is ``open`` / ``closed`` / ``merged`` / ``unknown`` after
     ``--gh``, ``unchecked`` without it, or ``unresolved`` for a bare ``#n``
-    that no summary repo and no ``--repo`` could resolve.  ``error`` carries
-    the gh failure message for ``unknown``.  ``via`` (bare refs only)
+    that no in-item repository and no ``--repo`` could resolve.  ``error``
+    carries the gh failure message for ``unknown``.  ``via`` (bare refs only)
     indicates how the repo was resolved: ``"nearest"`` (preceding resolved
-    ref), ``"name"`` (preceding bare name mention), ``"summary"`` (summary
-    fallback), ``"repo_flag"`` (``--repo``), or ``None`` (unresolved).
+    ref), ``"name"`` (preceding bare name mention), ``"repo_flag"``
+    (``--repo``), or ``None`` (unresolved).
     """
 
     owner: str | None
@@ -520,30 +520,17 @@ def _analyze_summary(
     resolve directly; a bare ``#n`` (including ``PR #<n>`` / ``Issue #<n>`` and
     short forms whose name is not a known repository) resolves to the nearest
     preceding entry in the same item -- a resolved ref or a bare name mention,
-    whichever is closest in text order -- else the most frequent resolved
-    repository in this summary, else ``--repo``, else it is reported as
-    ``unresolved`` and never checked.  A bare name mention is a whole word
+    whichever is closest in text order -- else ``--repo``, else it is reported
+    as ``unresolved`` and never checked.  A bare name mention is a whole word
     exactly equal to a known repository name (case-sensitive).  Bare refs
     resolved via the closest preceding resolved ref carry ``via: "nearest"``;
-    via the closest preceding name mention ``via: "name"``; via the summary
-    fallback ``via: "summary"``; via ``--repo`` ``via: "repo_flag"``.
+    via the closest preceding name mention ``via: "name"``; via ``--repo``
+    ``via: "repo_flag"``.
     """
     section = extract_section(summary.text)
     if section is None:
         return None
     texts = extract_items(section)
-
-    # The summary fallback for bare refs: the most frequent resolved
-    # repository (explicit refs and known short forms).  When the summary
-    # resolves nothing, --repo is the fallback but carries a distinct via.
-    resolved: Counter[tuple[str, str]] = Counter()
-    for text in texts:
-        for ref_owner, ref_repo, _number, bare in _scan_refs(text, known_repos, owner):
-            if not bare and ref_owner is not None and ref_repo is not None:
-                resolved[(ref_owner, ref_repo)] += 1
-    summary_fallback: tuple[str, str] | None = (
-        max(resolved, key=lambda key: (resolved[key], key)) if resolved else None
-    )
 
     items: list[PendingItem] = []
     for text in texts:
@@ -591,9 +578,6 @@ def _analyze_summary(
                     ref_owner = owner
                     ref_repo = prev_mention[0]
                     via = "name"
-                elif summary_fallback is not None:
-                    ref_owner, ref_repo = summary_fallback
-                    via = "summary"
                 elif repo is not None:
                     ref_owner, ref_repo = repo
                     via = "repo_flag"
