@@ -25,9 +25,11 @@ from ashiato.orphans import (
     find_orphans,
     is_headless,
     load_sinks,
+    read_reviewed,
     run,
     strip_harness,
     tokenize,
+    update_reviewed,
 )
 
 #: Shared filler so a session clears the human-chars threshold.  Every session
@@ -1057,3 +1059,517 @@ def test_total_terms_is_the_sum_of_filtered_term_counts(tmp_path: Path) -> None:
     assert session.terms["realtopic"] == 3
     assert "bk7tgrw6i" not in session.terms
     assert "urllib3" not in session.terms
+# ---------------------------------------------------------------- issue #56: reviewed marks
+
+
+def _reviewed_path(db: Path) -> Path:
+    return db.parent / "orphans-reviewed.txt"
+
+
+def test_mark_reviewed_by_unique_prefix_hides_and_show_reviewed_reveals(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("sess-1234", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("sess-5678", "2026-08-02", [human(LONG)]),
+            ("sess-9999", "2026-08-03", [human(LONG)]),
+        ],
+    )
+
+    assert set(_by_id(_run_json(db, "--min-orphans", "1", capsys=capsys))) == {"sess-1234"}
+
+    code = main(["orphans", "--db", str(db), "--mark-reviewed", "sess-12"])
+    assert code == 0
+    assert capsys.readouterr().out == "reviewed: sess-1234\n"
+    assert _reviewed_path(db).read_text(encoding="utf-8") == "sess-1234\n"
+
+    hidden = _run_json(db, "--min-orphans", "1", capsys=capsys)
+    assert hidden["candidates"] == []
+    assert hidden["reviewed_hidden"] == 1
+
+    shown = _run_json(db, "--min-orphans", "1", "--show-reviewed", capsys=capsys)
+    assert shown["reviewed_hidden"] == 0
+    (candidate,) = shown["candidates"]
+    assert candidate["session_id"] == "sess-1234"
+    assert candidate["reviewed"] is True
+
+    code = main(["orphans", "--db", str(db), "--unmark-reviewed", "sess-12"])
+    assert code == 0
+    assert capsys.readouterr().out == "unmarked: sess-1234\n"
+    assert set(_by_id(_run_json(db, "--min-orphans", "1", capsys=capsys))) == {"sess-1234"}
+
+
+def test_marking_an_already_marked_id_is_idempotent_and_quiet(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+            ("ses-c", "2026-08-03", [human(LONG)]),
+        ],
+    )
+
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "ses-a"]) == 0
+    assert capsys.readouterr().out == "reviewed: ses-a\n"
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "ses-a"]) == 0
+    assert capsys.readouterr().out == "already reviewed: ses-a\n"
+    assert _reviewed_path(db).read_text(encoding="utf-8") == "ses-a\n"
+
+    assert main(["orphans", "--db", str(db), "--unmark-reviewed", "ses-a"]) == 0
+    assert capsys.readouterr().out == "unmarked: ses-a\n"
+    assert main(["orphans", "--db", str(db), "--unmark-reviewed", "ses-a"]) == 0
+    assert capsys.readouterr().out == "not reviewed: ses-a\n"
+
+
+def test_reviewed_hidden_and_reviewed_file_in_the_json_header(
+    corpus: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = _run_json(corpus, "--min-orphans", "1", capsys=capsys)
+    assert payload["reviewed_hidden"] == 0
+    assert payload["reviewed_file"] == str(_reviewed_path(corpus))
+
+    assert main(["orphans", "--db", str(corpus), "--mark-reviewed", "ses-a"]) == 0
+    capsys.readouterr()
+    payload = _run_json(corpus, "--min-orphans", "1", capsys=capsys)
+    assert payload["reviewed_hidden"] == 1
+    assert payload["reviewed_file"] == str(_reviewed_path(corpus))
+    # The threshold block is untouched by the reviewed keys.
+    assert payload["thresholds"] == {
+        "min_tf": 3,
+        "min_human_chars": 800,
+        "min_orphans": 1,
+        "include_headless": False,
+        "limit": 20,
+        "since": None,
+        "until": None,
+    }
+
+
+def test_text_output_marks_reviewed_and_counts_hidden(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+            ("ses-c", "2026-08-03", [human(LONG)]),
+        ],
+    )
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "ses-a"]) == 0
+    capsys.readouterr()
+
+    code = main(
+        ["orphans", "--db", str(db), "--no-default-sinks", "--min-orphans", "1",
+         "--show-reviewed"]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    header, *_ = out.splitlines()
+    assert "reviewed-hidden=0" in header
+    assert "session ses-a [reviewed]" in out
+    assert "(1 candidate)" in out
+
+    code = main(["orphans", "--db", str(db), "--no-default-sinks", "--min-orphans", "1"])
+    out = capsys.readouterr().out
+    assert code == 0
+    header, *_ = out.splitlines()
+    assert "reviewed-hidden=1" in header
+    assert "session ses-a" not in out
+    assert "(0 candidates)" in out
+
+
+def test_reviewed_marks_do_not_change_document_frequency(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ses-a and ses-b share ``sharedtopic``; marking ses-a reviewed must not
+    # make the term unique to ses-b -- reviewed sessions count toward
+    # document frequency exactly like headless and out-of-window sessions.
+    db = make_db(
+        tmp_path,
+        [
+            (
+                "ses-a",
+                "2026-08-01",
+                [human(LONG + "zorblax zorblax zorblax sharedtopic sharedtopic sharedtopic")],
+            ),
+            ("ses-b", "2026-08-02", [human(LONG + "sharedtopic sharedtopic sharedtopic")]),
+            ("ses-c", "2026-08-03", [human(LONG)]),
+        ],
+    )
+
+    assert set(_by_id(_run_json(db, "--min-orphans", "1", capsys=capsys))) == {"ses-a"}
+
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "ses-a"]) == 0
+    capsys.readouterr()
+
+    # ses-b must NOT be nominated: sharedtopic still occurs in two sessions.
+    assert _run_json(db, "--min-orphans", "1", capsys=capsys)["candidates"] == []
+    # ... and with the mark shown, the shared term is still not an orphan of ses-b.
+    shown = _run_json(db, "--min-orphans", "1", "--show-reviewed", capsys=capsys)
+    by_id = _by_id(shown)
+    assert set(by_id) == {"ses-a"}
+    assert by_id["ses-a"]["orphan_terms"] == ["zorblax"]
+    assert "sharedtopic" not in by_id["ses-a"]["orphan_terms"]
+
+
+def test_every_file_of_a_reviewed_session_is_hidden(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One session id spanning two transcript files: marking the id hides both.
+    db = make_db(
+        tmp_path,
+        [
+            ("shared-id", "2026-08-01", [human(LONG + "alphaword alphaword alphaword")]),
+            ("shared-id", "2026-08-02", [human(LONG + "betaword betaword betaword")]),
+            ("ses-c", "2026-08-03", [human(LONG)]),
+        ],
+    )
+
+    assert set(_by_id(_run_json(db, "--min-orphans", "1", capsys=capsys))) == {"shared-id"}
+
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "shared-id"]) == 0
+    capsys.readouterr()
+
+    assert _run_json(db, "--min-orphans", "1", capsys=capsys)["candidates"] == []
+
+
+def test_reviewed_marks_survive_deleting_and_rebuilding_the_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sessions = [
+        ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+        ("ses-b", "2026-08-02", [human(LONG)]),
+        ("ses-c", "2026-08-03", [human(LONG)]),
+    ]
+    db = make_db(tmp_path, sessions)
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "ses-a"]) == 0
+    capsys.readouterr()
+
+    # The mark lives next to the database, not in it: delete and rebuild.
+    db.unlink()
+    build([tmp_path / "transcripts"], db)
+
+    payload = _run_json(db, "--min-orphans", "1", capsys=capsys)
+    assert payload["candidates"] == []
+    assert payload["reviewed_hidden"] == 1
+
+
+def test_a_failed_resolution_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+        ],
+    )
+    reviewed = _reviewed_path(db)
+    reviewed.write_text("# a comment\nses-a\n", encoding="utf-8")
+    before = reviewed.read_bytes()
+
+    code = main(["orphans", "--db", str(db), "--mark-reviewed", "ses-"])
+    assert code == 1
+    assert "matches 2 sessions" in capsys.readouterr().err
+    assert reviewed.read_bytes() == before
+
+    code = main(["orphans", "--db", str(db), "--mark-reviewed", "nope"])
+    assert code == 1
+    assert "no session matching prefix 'nope'" in capsys.readouterr().err
+    assert reviewed.read_bytes() == before
+
+    code = main(["orphans", "--db", str(db), "--unmark-reviewed", "nope"])
+    assert code == 1
+    assert "no session matching prefix 'nope'" in capsys.readouterr().err
+    assert reviewed.read_bytes() == before
+
+
+def test_mark_and_unmark_are_mutually_exclusive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG)]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+        ],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "orphans",
+                "--db",
+                str(db),
+                "--mark-reviewed",
+                "ses-a",
+                "--unmark-reviewed",
+                "ses-b",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_unmark_accepts_an_id_that_is_no_longer_in_the_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+        ],
+    )
+    reviewed = _reviewed_path(db)
+    reviewed.write_text("ses-gone\n", encoding="utf-8")  # never in this database
+
+    code = main(["orphans", "--db", str(db), "--unmark-reviewed", "ses-gone"])
+    assert code == 0
+    assert capsys.readouterr().out == "unmarked: ses-gone\n"
+    assert reviewed.read_text(encoding="utf-8") == ""
+
+
+def test_reviewed_file_format_comments_blanks_and_idempotence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+        ],
+    )
+    reviewed = tmp_path / "custom-reviews.txt"
+    reviewed.write_text("# my notes\n\n  ses-b  \n", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "orphans",
+                "--db",
+                str(db),
+                "--reviewed-file",
+                str(reviewed),
+                "--mark-reviewed",
+                "ses-a",
+            ]
+        )
+        == 0
+    )
+    assert reviewed.read_text(encoding="utf-8") == "# my notes\n\nses-b\nses-a\n"
+
+    # Idempotent: marking an already-present id adds no duplicate line.
+    assert (
+        main(
+            [
+                "orphans",
+                "--db",
+                str(db),
+                "--reviewed-file",
+                str(reviewed),
+                "--mark-reviewed",
+                "ses-a",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert reviewed.read_text(encoding="utf-8") == "# my notes\n\nses-b\nses-a\n"
+
+    # Unmarking removes only the id's line; the comment survives.
+    assert (
+        main(
+            [
+                "orphans",
+                "--db",
+                str(db),
+                "--reviewed-file",
+                str(reviewed),
+                "--unmark-reviewed",
+                "ses-b",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert reviewed.read_text(encoding="utf-8") == "# my notes\n\nses-a\n"
+
+    # A missing file is nothing reviewed, not an error.
+    payload = _run_json(
+        db, "--reviewed-file", str(tmp_path / "absent.txt"), "--min-orphans", "1",
+        capsys=capsys,
+    )
+    assert set(_by_id(payload)) == {"ses-a"}
+    assert payload["reviewed_hidden"] == 0
+
+
+def test_unreadable_reviewed_file_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+        ],
+    )
+    directory = tmp_path / "reviewed-as-dir"
+    directory.mkdir()
+
+    code = main(
+        ["orphans", "--db", str(db), "--reviewed-file", str(directory), "--min-orphans", "1"]
+    )
+    assert code == 1
+    assert "cannot read reviewed file" in capsys.readouterr().err
+
+    code = main(
+        [
+            "orphans",
+            "--db",
+            str(db),
+            "--reviewed-file",
+            str(directory),
+            "--mark-reviewed",
+            "ses-a",
+        ]
+    )
+    assert code == 1
+    assert "cannot read reviewed file" in capsys.readouterr().err
+
+
+def test_reviewed_file_defaults_next_to_the_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+        ],
+    )
+    assert main(["orphans", "--db", str(db), "--mark-reviewed", "ses-a"]) == 0
+    capsys.readouterr()
+    assert _reviewed_path(db).exists()
+
+
+# ---------------------------------------------------------------- reviewed file robustness
+
+
+def test_read_reviewed_invalid_utf8_raises_value_error(tmp_path: Path) -> None:
+    """Invalid UTF-8 in the reviewed file raises ValueError (not UnicodeDecodeError)."""
+    path = tmp_path / "orphans-reviewed.txt"
+    path.write_bytes(b"ses-a\n\xff\xfe\n")
+    with pytest.raises(ValueError, match="invalid UTF-8"):
+        read_reviewed(path)
+
+
+def test_read_reviewed_missing_file_is_empty(tmp_path: Path) -> None:
+    """A missing reviewed file returns an empty frozenset."""
+    assert read_reviewed(tmp_path / "nope.txt") == frozenset()
+
+
+def test_read_reviewed_valid_utf8(tmp_path: Path) -> None:
+    """A valid reviewed file returns the correct set of session ids."""
+    path = tmp_path / "orphans-reviewed.txt"
+    path.write_text("# comment\nses-a\n  ses-b  \n\nses-c\n", encoding="utf-8")
+    assert read_reviewed(path) == frozenset({"ses-a", "ses-b", "ses-c"})
+
+
+def test_cli_prints_traceback_on_invalid_utf8(tmp_path: Path, capsys) -> None:
+    """CLI prints an error message (not a traceback) when the reviewed file has invalid UTF-8."""
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [human(LONG + "zorblax zorblax zorblax")])],
+    )
+    reviewed = _reviewed_path(db)
+    reviewed.write_bytes(b"\xff\xfe\n")
+    code = main(["orphans", "--db", str(db), "--min-orphans", "1"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "UnicodeDecodeError" not in err  # no traceback
+    assert "invalid UTF-8" in err
+
+
+def test_update_reviewed_atomic_on_success(tmp_path: Path) -> None:
+    """update_reviewed produces the expected file content."""
+    path = tmp_path / "orphans-reviewed.txt"
+    update_reviewed(path, add={"ses-a", "ses-b"})
+    assert path.read_text(encoding="utf-8") == "ses-a\nses-b\n"
+
+
+def test_update_reviewed_atomic_preserves_old_on_failure(tmp_path: Path, monkeypatch) -> None:
+    """If the atomic write fails mid-way, the old file content survives."""
+    path = tmp_path / "orphans-reviewed.txt"
+    path.write_text("original\n", encoding="utf-8")
+    old_bytes = path.read_bytes()
+
+    import os
+
+    def fail_replace(src: str, dst: str) -> None:
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated failure"):
+        update_reviewed(path, add={"ses-new"})
+    assert path.read_bytes() == old_bytes
+
+
+def test_update_reviewed_lock_file_created(tmp_path: Path) -> None:
+    """update_reviewed creates a sibling lock file."""
+    path = tmp_path / "orphans-reviewed.txt"
+    lock = path.with_suffix(path.suffix + ".lock")
+    update_reviewed(path, add={"ses-a"})
+    assert lock.exists()
+
+
+def test_update_reviewed_returns_the_set_before_the_update(tmp_path: Path) -> None:
+    """The return value is the pre-update set, for the 'already/not reviewed' messages."""
+    path = tmp_path / "orphans-reviewed.txt"
+    path.write_text("ses-a\n", encoding="utf-8")
+    assert update_reviewed(path, add={"ses-b"}) == frozenset({"ses-a"})
+    assert update_reviewed(path, add={"ses-c"}) == frozenset({"ses-a", "ses-b"})
+    assert update_reviewed(path, remove={"ses-a"}) == frozenset({"ses-a", "ses-b", "ses-c"})
+    assert path.read_text(encoding="utf-8") == "ses-b\nses-c\n"
+
+
+def test_update_reviewed_concurrent_writers_lose_no_marks(tmp_path: Path) -> None:
+    """Two threads marking disjoint ids through update_reviewed lose nothing.
+
+    Each thread calls update_reviewed once per id, in a loop; afterwards the
+    file must contain all 2N ids.  When the lock is held only around the write
+    (the old read-outside-lock logic), the second writer reads a stale set and
+    its write drops the first writer's marks.
+    """
+    import threading
+
+    path = tmp_path / "orphans-reviewed.txt"
+    n = 25
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker(prefix: str) -> None:
+        try:
+            barrier.wait()
+            for i in range(n):
+                update_reviewed(path, add={f"{prefix}-{i:03d}"})
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(prefix,)) for prefix in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    ids = read_reviewed(path)
+    assert len(ids) == 2 * n
+    assert {f"a-{i:03d}" for i in range(n)} <= ids
+    assert {f"b-{i:03d}" for i in range(n)} <= ids
+
+
+

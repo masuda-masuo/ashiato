@@ -26,6 +26,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -185,6 +186,24 @@ class Served:
             response = connection.getresponse()
             body = response.read().decode("utf-8")
             return Reply(response.status, {k.lower(): v for k, v in response.getheaders()}, body)
+        finally:
+            connection.close()
+
+    def post(
+        self,
+        path: str,
+        body: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> Reply:
+        hdrs = {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body.encode("utf-8")))}
+        if headers:
+            hdrs.update(headers)
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            connection.request("POST", path, body=body.encode("utf-8"), headers=hdrs)
+            response = connection.getresponse()
+            resp_body = response.read().decode("utf-8")
+            return Reply(response.status, {k.lower(): v for k, v in response.getheaders()}, resp_body)
         finally:
             connection.close()
 
@@ -788,3 +807,491 @@ def test_serve_prints_its_url_and_answers(fixture: Fixture, home: Path) -> None:
     finally:
         proc.terminate()
         proc.wait(timeout=30)
+# ---------------------------------------------------------------- reviewed marks (issue #56)
+
+
+def test_a_reviewed_mark_hides_the_candidate_on_the_next_reload(
+    served: Served, fixture: Fixture
+) -> None:
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    before = _stamp(fixture.db)
+    assert _n_orphan(served) == 3
+    assert _tile(served.get("/").body, "orphans") == 1
+
+    reviewed.write_text("sess-alpha\n", encoding="utf-8")
+    assert served.get("/orphans").status == 200
+    assert _n_orphan(served) is None
+    assert 'href="/session/sess-alpha"' not in served.get("/orphans").body
+    assert _tile(served.get("/").body, "orphans") == 0
+    assert served.get("/api/orphans.json").json()["reviewed_hidden"] == 1
+    assert _stamp(fixture.db) == before  # ... and never through a rebuild
+
+    reviewed.write_text("", encoding="utf-8")  # unmarked: the candidate is back
+    assert _n_orphan(served) == 3
+    assert _tile(served.get("/").body, "orphans") == 1
+    assert _stamp(fixture.db) == before
+
+
+def test_writing_the_reviewed_file_recomputes_orphans(
+    served: Served, fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+    real = serve.find_orphans
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(serve, "find_orphans", counting)
+    for path in ("/orphans", "/orphans", "/api/orphans.json", "/"):
+        assert served.get(path).status == 200
+    assert len(calls) == 1
+
+    (fixture.db.parent / "orphans-reviewed.txt").write_text("sess-alpha\n", encoding="utf-8")
+    assert served.get("/orphans").status == 200
+    assert len(calls) == 2
+    assert served.get("/orphans").status == 200
+    assert len(calls) == 2
+
+
+def test_api_orphans_matches_the_cli_with_reviewed_marks(
+    served: Served, fixture: Fixture, capsys
+) -> None:
+    (fixture.db.parent / "orphans-reviewed.txt").write_text("sess-alpha\n", encoding="utf-8")
+    api = served.get("/api/orphans.json")
+    cli = _cli_json(
+        "orphans", "--db", str(fixture.db), "--no-default-sinks", "--limit", "30",
+        "--json", capsys=capsys,
+    )
+    assert api.json() == cli
+    assert api.json()["candidates"] == []
+    assert api.json()["reviewed_hidden"] == 1
+    assert api.json()["reviewed_file"] == str(fixture.db.parent / "orphans-reviewed.txt")
+
+
+def test_orphans_page_with_invalid_utf8_reviewed_file_is_a_clean_500(
+    served: Served, fixture: Fixture
+) -> None:
+    """A reviewed file with invalid UTF-8 makes /orphans answer a clean 500 page,
+    not a traceback."""
+    (fixture.db.parent / "orphans-reviewed.txt").write_bytes(b"\xff\xfe\n")
+    reply = served.get("/orphans")
+    assert reply.status == 500
+    assert "Traceback" not in reply.body
+    assert "Internal error" in reply.body
+    # The server keeps running.
+    (fixture.db.parent / "orphans-reviewed.txt").unlink()
+    assert served.get("/orphans").status == 200
+
+
+# ---------------------------------------------------------------- CSRF + POST /orphans/reviewed
+
+
+def _csrf_token(served: Served) -> str:
+    """Extract the CSRF token from the hidden field on the orphans page."""
+    body = served.get("/orphans").body
+    # Look for the always-present hidden input first.
+    m = re.search(r'id="csrf-token"\s+value="([^"]+)"', body)
+    if m:
+        return m.group(1)
+    # Fall back to form hidden fields.
+    m = re.search(r'name="token"\s+value="([^"]+)"', body)
+    assert m, "no CSRF token found on /orphans"
+    return m.group(1)
+
+
+def _origin(served: Served) -> str:
+    """Build a matching Origin header value from the served port."""
+    return f"http://127.0.0.1:{served.port}"
+
+
+# -- success path -----------------------------------------------------------
+
+
+def test_post_mark_reviewed_hides_candidate(
+    served: Served, fixture: Fixture
+) -> None:
+    """POST with valid token + matching Origin marks the session; next GET hides it."""
+    assert _n_orphan(served) == 3
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 303
+    assert reply.headers["location"] == "/orphans"
+    # The candidate is gone on the next reload.
+    assert _n_orphan(served) is None
+    assert 'href="/session/sess-alpha"' not in served.get("/orphans").body
+    # The reviewed file contains the full id.
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    assert "sess-alpha" in reviewed.read_text(encoding="utf-8")
+
+    # Unmark to restore state.  Token doesn't change; reuse the one from before.
+    served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=unmark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert _n_orphan(served) == 3
+
+
+def test_post_unmark_reviewed_restores_candidate(
+    served: Served, fixture: Fixture
+) -> None:
+    """POST with action=unmark removes a reviewed session."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("sess-alpha\n", encoding="utf-8")
+    assert _n_orphan(served) is None
+
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=unmark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 303
+    assert _n_orphan(served) == 3
+
+
+# -- CSRF guard tests -------------------------------------------------------
+
+
+def test_post_missing_token_is_403(served: Served, fixture: Fixture) -> None:
+    """POST without a token returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark",
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+def test_post_wrong_token_is_403(served: Served, fixture: Fixture) -> None:
+    """POST with a wrong token returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=WRONG_" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+def test_post_missing_origin_is_403(served: Served, fixture: Fixture) -> None:
+    """POST without an Origin header returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+def test_post_origin_null_is_403(served: Served, fixture: Fixture) -> None:
+    """POST with Origin: null returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": "null"},
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+def test_post_foreign_origin_is_403(served: Served, fixture: Fixture) -> None:
+    """POST with a foreign Origin returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": "http://evil.example"},
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+def test_post_non_loopback_host_is_403(served: Served, fixture: Fixture) -> None:
+    """POST with a non-loopback Host returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": "http://evil.example", "Host": "evil.example"},
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+# -- input validation -------------------------------------------------------
+
+
+def test_post_unknown_session_id_is_400(served: Served, fixture: Fixture) -> None:
+    """POST with an unknown session id returns 400 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=no-such-id&action=mark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 400
+    assert reviewed.read_bytes() == before
+
+
+def test_post_session_prefix_is_not_resolved(served: Served, fixture: Fixture) -> None:
+    """A prefix that the CLI would resolve is rejected from the web: only a
+    full session id marks anything, and nothing is written for a prefix."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-al&action=mark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 400
+    assert reviewed.read_bytes() == before
+
+
+def test_post_bad_action_is_400(served: Served, fixture: Fixture) -> None:
+    """POST with an invalid action returns 400 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=delete&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 400
+    assert reviewed.read_bytes() == before
+
+
+def test_post_oversize_body_is_413(served: Served, fixture: Fixture) -> None:
+    """POST with a body over 4 KiB returns 413 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    big_body = "x" * 5000 + "&token=" + token
+    reply = served.post(
+        "/orphans/reviewed",
+        body=big_body,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 413
+    assert reviewed.read_bytes() == before
+
+
+def test_post_on_an_out_of_date_database_is_503_and_writes_nothing(
+    served: Served, fixture: Fixture
+) -> None:
+    """POST /orphans/reviewed against a stale-schema database answers the clean
+    503 the GET pages give, and the reviewed file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    # Make the database look built by an older version: drop the format marker.
+    code = (
+        "import duckdb, sys\n"
+        "c = duckdb.connect(sys.argv[1])\n"
+        "c.execute(\"DELETE FROM ashiato_meta WHERE key = 'format_version'\")\n"
+        "c.close()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(fixture.db)], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 503
+    assert "Database unavailable" in reply.body
+    assert reviewed.read_bytes() == before
+
+
+# -- other methods / paths still 405 ----------------------------------------
+
+
+def _raw_post(served: Served, path: str, headers: str) -> Reply:
+    """POST *path* over a raw socket with exactly *headers* (a ``\\r\\n``-joined
+    block, e.g. ``"Connection: close\\r\\n"``).  ``http.client`` would silently
+    add ``Content-Length: 0`` to a bodiless POST -- precisely what must *not*
+    be sent when testing a request with no Content-Length at all.
+    """
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{served.port}\r\n"
+        f"{headers}\r\n"
+    ).encode()
+    with socket.create_connection(("127.0.0.1", served.port), timeout=30) as sock:
+        sock.sendall(request)
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    resp_headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, _, value = line.decode("latin-1").partition(":")
+        resp_headers[name.lower().strip()] = value.strip()
+    return Reply(status, resp_headers, body.decode("utf-8", errors="replace"))
+
+
+def test_post_to_other_path_is_405(served: Served) -> None:
+    """POST to any path other than /orphans/reviewed is 405."""
+    assert served.post("/", body="foo=bar").status == 405
+    assert served.post("/api/orphans.json", body="foo=bar").status == 405
+
+
+def test_post_wrong_path_is_405_before_body_checks(served: Served) -> None:
+    """Only POST /orphans/reviewed validates the body: any other POST path
+    answers 405 without reading the body, whatever its Content-Length says."""
+    for path in ("/orphans", "/"):
+        # (a) no Content-Length header at all.
+        reply = _raw_post(served, path, "Connection: close\r\n")
+        assert reply.status == 405, (path, "no Content-Length")
+        # (b) an unparseable Content-Length.
+        reply = served.get(path, method="POST", headers={"Content-Length": "abc"})
+        assert reply.status == 405, (path, "Content-Length: abc")
+        # (c) an oversize Content-Length.
+        reply = served.get(path, method="POST", headers={"Content-Length": "999999"})
+        assert reply.status == 405, (path, "Content-Length: 999999")
+
+
+def test_put_delete_patch_options_still_405(served: Served) -> None:
+    """PUT, DELETE, PATCH, OPTIONS are 405 as before."""
+    assert served.get("/", method="PUT").status == 405
+    assert served.get("/", method="DELETE").status == 405
+    assert served.get("/", method="PATCH").status == 405
+    assert served.get("/", method="OPTIONS").status == 405
+
+
+# -- security header checks -------------------------------------------------
+
+
+def test_csp_contains_form_action_self(served: Served) -> None:
+    """Content-Security-Policy allows form-action 'self'."""
+    reply = served.get("/")
+    csp = reply.headers.get("content-security-policy", "")
+    assert "form-action 'self'" in csp
+    assert "form-action 'none'" not in csp
+
+
+def test_referrer_policy_is_same_origin(served: Served) -> None:
+    """Referrer-Policy is 'same-origin'."""
+    reply = served.get("/")
+    assert reply.headers.get("referrer-policy") == "same-origin"
+
+
+# -- real HTTP handler tests ------------------------------------------------
+
+
+def test_real_http_post_mark_reviewed(served: Served, fixture: Fixture) -> None:
+    """A real HTTP POST over a socket marks a session reviewed."""
+    assert _n_orphan(served) == 3
+    token = _csrf_token(served)
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert reply.status == 303
+    assert reply.headers["location"] == "/orphans"
+    # Verify the candidate is gone via API.
+    api = served.get("/api/orphans.json").json()
+    assert api["candidates"] == []
+    assert api["reviewed_hidden"] == 1
+
+    # Restore.  Token doesn't change; reuse the one from before.
+    served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=unmark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert _n_orphan(served) == 3
+
+
+def test_real_http_post_missing_origin_is_403(served: Served, fixture: Fixture) -> None:
+    """A real HTTP POST without Origin returns 403 and the file is unchanged."""
+    reviewed = fixture.db.parent / "orphans-reviewed.txt"
+    reviewed.write_text("", encoding="utf-8")
+    before = reviewed.read_bytes()
+    token = _csrf_token(served)
+    # POST without Origin header.
+    reply = served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+    )
+    assert reply.status == 403
+    assert reviewed.read_bytes() == before
+
+
+# -- reviewed page with ?reviewed=1 -----------------------------------------
+
+
+def test_orphans_page_shows_reviewed_toggle(served: Served, fixture: Fixture) -> None:
+    """The orphans page shows a 'show N reviewed' link when some are hidden."""
+    assert _n_orphan(served) == 3
+    # Initially no reviewed sessions, no toggle.
+    body = served.get("/orphans").body
+    assert "show 1 reviewed" not in body
+
+    # Mark it.
+    token = _csrf_token(served)
+    served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=mark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    # The orphans page now has 0 candidates and shows "show 1 reviewed".
+    body = served.get("/orphans").body
+    assert "show 1 reviewed" in body
+
+    # The ?reviewed=1 page shows the reviewed candidate with an unreview button.
+    body = served.get("/orphans?reviewed=1").body
+    assert 'href="/session/sess-alpha"' in body
+    assert "hide reviewed" in body
+    assert 'value="unmark"' in body
+    # Restore.
+    served.post(
+        "/orphans/reviewed",
+        body="session_id=sess-alpha&action=unmark&token=" + token,
+        headers={"Origin": _origin(served)},
+    )
+    assert _n_orphan(served) == 3

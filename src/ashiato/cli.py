@@ -35,7 +35,14 @@ from ashiato.hygiene import audit as hygiene_audit
 from ashiato.memory_authors import run as memory_authors_run
 from ashiato.nominate import run as nominate_run
 from ashiato.orphans import DEFAULT_LIMIT as DEFAULT_ORPHANS_LIMIT
-from ashiato.orphans import DEFAULT_MIN_HUMAN_CHARS, DEFAULT_MIN_ORPHANS, DEFAULT_MIN_TF
+from ashiato.orphans import (
+    DEFAULT_MIN_HUMAN_CHARS,
+    DEFAULT_MIN_ORPHANS,
+    DEFAULT_MIN_TF,
+    default_reviewed_path,
+    mark_reviewed,
+    unmark_reviewed,
+)
 from ashiato.orphans import run as orphans_run
 from ashiato.pending import run as pending_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
@@ -359,6 +366,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=f"maximum candidates, 0 for all (default {DEFAULT_ORPHANS_LIMIT})",
     )
+    reviewed_mark = orphans_parser.add_mutually_exclusive_group()
+    reviewed_mark.add_argument(
+        "--mark-reviewed",
+        action="append",
+        metavar="ID",
+        help="resolve ID (a full session id or unique prefix) and append its full "
+        "session id to the reviewed file, then exit without nominating "
+        "(repeatable; conflicts with --unmark-reviewed)",
+    )
+    reviewed_mark.add_argument(
+        "--unmark-reviewed",
+        action="append",
+        metavar="ID",
+        help="resolve ID and remove its line(s) from the reviewed file, then exit "
+        "without nominating (repeatable; conflicts with --mark-reviewed)",
+    )
+    orphans_parser.add_argument(
+        "--reviewed-file",
+        metavar="PATH",
+        help="file of reviewed session ids, one per line (default: "
+        "orphans-reviewed.txt next to the database)",
+    )
+    orphans_parser.add_argument(
+        "--show-reviewed",
+        action="store_true",
+        help="also nominate sessions whose session ids are in the reviewed file",
+    )
     orphans_parser.add_argument(
         "--json", action="store_true", dest="json_output", help="output as JSON"
     )
@@ -506,6 +540,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="memory directory scanned for unattributed *.md files on the memory page "
         "(repeatable; default every existing ~/.claude/projects/*/memory dir)",
+    )
+    serve_parser.add_argument(
+        "--reviewed-file",
+        metavar="PATH",
+        help="file of reviewed session ids read by the orphans page "
+        "(default: orphans-reviewed.txt next to the database)",
     )
 
     compare_periods_parser = subparsers.add_parser(
@@ -1020,9 +1060,45 @@ def _run_nominate(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
 
 
+def _run_reviewed_update(
+    db_path: Path,
+    reviewed_path: Path,
+    args: argparse.Namespace,
+    out: Any,
+    err: Any,
+) -> int:
+    """``orphans --mark-reviewed`` / ``--unmark-reviewed``: rewrite the
+    reviewed file without running the nomination."""
+    if not db_path.exists():
+        print(f"error: no database at {db_path} (run 'ashiato build' first)", file=err)
+        return 1
+    connection = connect(db_path, read_only=True)
+    try:
+        assert_readable(connection)
+        if args.mark_reviewed:
+            return mark_reviewed(connection, reviewed_path, args.mark_reviewed, out=out, err=err)
+        return unmark_reviewed(connection, reviewed_path, args.unmark_reviewed, out=out, err=err)
+    except SchemaOutOfDate as error:
+        print(f"error: {error}", file=err)
+        return 1
+    except duckdb.Error as error:
+        print(f"error: {error}", file=err)
+        return 1
+    finally:
+        connection.close()
+
+
 def _run_orphans(args: argparse.Namespace, out: Any, err: Any) -> int:
+    db_path = _resolve_db(args.db)
+    reviewed_path = (
+        Path(args.reviewed_file).expanduser()
+        if args.reviewed_file
+        else default_reviewed_path(db_path)
+    )
+    if args.mark_reviewed or args.unmark_reviewed:
+        return _run_reviewed_update(db_path, reviewed_path, args, out, err)
     return orphans_run(
-        _resolve_db(args.db),
+        db_path,
         since=args.since,
         until=args.until,
         sinks=[Path(sink).expanduser() for sink in args.sink or []],
@@ -1033,6 +1109,8 @@ def _run_orphans(args: argparse.Namespace, out: Any, err: Any) -> int:
         include_headless=args.include_headless,
         limit=args.limit,
         json_output=args.json_output,
+        reviewed_file=reviewed_path,
+        show_reviewed=args.show_reviewed,
         out=out,
         err=err,
     )
@@ -1076,6 +1154,9 @@ def _run_serve(args: argparse.Namespace, out: Any, err: Any) -> int:
         sinks=[Path(sink).expanduser() for sink in args.sink or []],
         default_sinks=not args.no_default_sinks,
         memory_dirs=[Path(path).expanduser() for path in args.memory_dir or []],
+        reviewed_file=(
+            Path(args.reviewed_file).expanduser() if args.reviewed_file else None
+        ),
         out=out,
         err=err,
     )

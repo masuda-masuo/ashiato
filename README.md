@@ -41,14 +41,14 @@ ashiato schema [TABLE] [--db PATH]
 ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
-ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--json]
+ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--mark-reviewed ID]... [--unmark-reviewed ID]... [--reviewed-file PATH] [--show-reviewed] [--json]
 ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]... [--model NAME] [--json]
 ashiato pending [--db PATH] [--gh] [--owner NAME] [--repo OWNER/NAME] [--all-summaries] [--since TS] [--until TS] [--show-resolved] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato topics SESSION_PREFIX [--db PATH] [--window N] [--terms N] [--json]
 ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
-ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-default-sinks] [--memory-dir PATH]...
+ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-default-sinks] [--memory-dir PATH]... [--reviewed-file PATH]
 ```
 
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
@@ -171,7 +171,31 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   caps them (default 20, `0` for all); each shows the session, its density, its top orphan
   terms and the first thing the human said. `--json` prints one document with the header and
   the same
-  fields. This is report-only: it never writes anything. Known limit: *absence of the words is
+  fields.
+  The same candidate is nominated on every run until someone says it has been read.
+  `--mark-reviewed ID` (repeatable) resolves *ID* -- a full session id or a unique prefix --
+  and appends the **full** session id to the *reviewed file*, then exits 0 without
+  nominating (`reviewed: <id>` per line, or `already reviewed: <id>`); `--unmark-reviewed
+  ID` (repeatable) removes the id again (`unmarked: <id>` or `not reviewed: <id>`), and an
+  id present in the file still unmarks even when its session is no longer in the database.
+  The two flags conflict, any missing or ambiguous id exits 1 having **written nothing**, and
+  the nomination never runs in the same invocation. The file is `orphans-reviewed.txt` next
+  to the database (`--reviewed-file PATH` overrides it): plain UTF-8, one session id per
+  line, blank lines and `#` comments ignored, surrounding whitespace stripped; writing
+  preserves existing lines and is idempotent, and a missing file means nothing reviewed.
+  It lives *outside* the database on purpose -- a delete-and-rebuild of the database must
+  not forget the marks, and the reviewed file is the only thing this command ever writes
+  (apart from that, it stays report-only, like `nominate` and `salvage`). A reviewed
+  session is skipped from nomination -- every file of that session id is hidden, because the
+  key is the session id, not the transcript file -- but it still counts toward document
+  frequency exactly like a headless or out-of-window session, so marking a session reviewed
+  can never make one of its shared terms look unique to another session. The header reports
+  how many would-be candidates the mark hid: `reviewed-hidden=N` on the text header, and
+  `reviewed_hidden` plus the resolved `reviewed_file` path in the JSON header.
+  `--show-reviewed` nominates reviewed sessions too, flagging each with `[reviewed]` on the
+  text session line or `"reviewed": true|false` in JSON, with `reviewed_hidden` 0 then. A
+  reviewed file that exists but cannot be read (a directory, permission denied) is an error
+  on stderr, exit 1 -- never silently treated as empty. Known limit: *absence of the words is
   not absence of the idea* -- a topic saved under different words is still nominated, and a
   topic whose words happen to appear in a sink is missed. It is a nomination only; judging
   whether a candidate is worth keeping is for the reader. Exit code `0` on success (including
@@ -358,15 +382,30 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   recorded none), `freshness` (`{"state": "current" | "stale" | "unknown", "gap": N}`), `tiles`
   (`orphan_candidates`, `memory_unattributed`, `denied_calls`) and `top_orphans` (the three
   densest candidates, as `orphans --json` prints them). A memo written into a sink
-  directory retires an orphan candidate on the next reload, and a memory file that appears
+  directory retires an orphan candidate on the next reload, and so does a session marked
+  reviewed with `ashiato orphans --mark-reviewed`: the orphans page reads the same reviewed
+  file as the CLI (next to the database, or the `--reviewed-file PATH` override), hides
+  reviewed sessions from `/orphans`, `/api/orphans.json` and the overview tile, and the
+  orphans cache is keyed by the reviewed file's stamp too, so a mark shows up on the next
+  reload without a restart or a rebuild. A memory file that appears
   or disappears shows up as such on the next reload, without waiting for a rebuild. Long
   text is truncated behind a `<details>` element; the only script on the pages filters
   tables client-side, and nothing is loaded from outside (CSS and script are inline).
   It is **loopback-only**: the default `--host` is `127.0.0.1`, `--host` accepts only
   `127.0.0.1`, `::1` or `localhost` (anything else exits `2` before binding, because
   transcripts contain secrets), and requests whose `Host` header names anything but the
-  loopback are refused with `403`. It is **read-only**: it writes nothing and every database
-  value shown is HTML-escaped. It uses **per-request connections**: each request opens the
+  loopback are refused with `403`. It is **read-only except one guarded endpoint**:
+  every database value shown is HTML-escaped. The sole write is
+  `POST /orphans/reviewed`, which marks or unmarks a session as reviewed
+  in the same file the CLI writes. Each `/orphans` row includes a one-click
+  "reviewed" button (a standard HTML form, no JavaScript). The write is
+  CSRF-guarded: a per-process random token is embedded as a hidden form
+  field, and the request's `Origin` header must equal `http://<Host>`
+  (the existing loopback Host check applies too). A cross-site form POST
+  to 127.0.0.1 cannot forge both. On success the server responds with
+  `303 See Other` redirecting to `/orphans`; the row is gone on that
+  reload. `?reviewed=1` shows the reviewed sessions with an "unreview"
+  button. It uses **per-request connections**: each request opens the
   database read-only and closes it before responding, so a nightly `ashiato build` (which
   needs to write) is never blocked by the dashboard. **During a rebuild** -- or when the
   database is missing or out of date -- pages answer `503` (`Retry-After: 30`) saying the
@@ -376,7 +415,8 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   modification time and size, and recomputed when either changes; the freshness banner is
   not cached, since it compares the transcript directories against the database. `--port`
   defaults to `8772` (`0` picks a free port); the URL is printed on start. `--sink PATH`
-  (repeatable) and `--no-default-sinks` are passed to the orphans page exactly as
+  (repeatable), `--no-default-sinks` and `--reviewed-file PATH` are passed to the orphans
+  page exactly as
   `ashiato orphans` takes them, and `--memory-dir PATH` (repeatable) as
   `ashiato memory-authors` takes it; by default both use every existing
   `~/.claude/projects/*/memory` directory. There is no authentication and no TLS: the
