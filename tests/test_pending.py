@@ -909,3 +909,442 @@ def test_gh_repo_list_called_once_with_only_the_owner(
     assert refs[1]["owner"] == "masuda-masuo"
     assert refs[1]["repo"] == "kusabi"  # nope#12 degrades to a bare #12
     assert refs[1]["bare"] is True
+
+
+# ---------------------------------------------------------------- issue #55: <name> #N with whitespace
+
+
+KNOWN_NAME_SPACE_SUMMARY = """\
+7. Pending Tasks:
+   - masuda-masuo/sagasu#99 is the anchor.
+   - sagasu #12 closed, but recheck.
+   - see #34 the follow-up.
+8. Current Work:
+"""
+
+
+def test_known_name_with_space_before_hash(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """<name> #N with whitespace resolves as a non-bare short form."""
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(KNOWN_NAME_SPACE_SUMMARY, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    def keys(item: dict[str, Any]) -> list[tuple[str | None, str | None, int]]:
+        return [(r["owner"], r["repo"], r["number"]) for r in item["references"]]
+
+    # Item 0: explicit ref
+    assert keys(items[0]) == [("masuda-masuo", "sagasu", 99)]
+    # Item 1: sagasu #12 → known name with space, non-bare
+    assert keys(items[1]) == [("masuda-masuo", "sagasu", 12)]
+    assert items[1]["references"][0]["bare"] is False
+    # Item 2: see #34 → bare (no known name)
+    assert keys(items[2]) == [("masuda-masuo", "sagasu", 34)]
+    assert items[2]["references"][0]["bare"] is True
+    assert items[2]["references"][0]["via"] == "summary"
+
+
+# ---------------------------------------------------------------- issue #55: bare repo-name word
+
+
+BARE_NAME_SUMMARY = """\
+7. Pending Tasks:
+   - masuda-masuo/shiori#1 is the anchor.
+   - shiori open issues after this session: zero (all of #288/#271/#75).
+8. Current Work:
+"""
+
+
+def test_bare_name_mention_resolves_later_bare_refs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare whole word that is a known repo name sets the nearest preceding repo."""
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(BARE_NAME_SUMMARY, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    def keys(item: dict[str, Any]) -> list[tuple[str | None, str | None, int]]:
+        return [(r["owner"], r["repo"], r["number"]) for r in item["references"]]
+
+    # Item 0: explicit anchor
+    assert keys(items[0]) == [("masuda-masuo", "shiori", 1)]
+    # Item 1: All three bare refs resolve to shiori via the name mention
+    assert keys(items[1]) == [
+        ("masuda-masuo", "shiori", 288),
+        ("masuda-masuo", "shiori", 271),
+        ("masuda-masuo", "shiori", 75),
+    ]
+    assert all(r["bare"] for r in items[1]["references"])
+    assert all(r["via"] == "name" for r in items[1]["references"])
+
+
+def test_shiori_case_insensitive_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Capitalised 'Shiori' does not match the lowercase known name 'shiori'."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/shiori#1 is the anchor.\n"
+        "   - Shiori open issues: #288.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+    ref = items[1]["references"][0]
+    # 'Shiori' is not a known name (case-sensitive), so #288 is a bare ref
+    # resolved via the summary fallback, not via a name mention.
+    assert ref["owner"] == "masuda-masuo"
+    assert ref["repo"] == "shiori"
+    assert ref["bare"] is True
+    assert ref["via"] == "summary"
+
+
+def test_shiori_hyphenated_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'shiori-demo' is not a bare name mention (longer word)."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/shiori#1 is the anchor.\n"
+        "   - shiori-demo has issues #99.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+    ref = items[1]["references"][0]
+    assert ref["number"] == 99
+    assert ref["bare"] is True
+    # shiori-demo is not a known name, so #99 resolves via summary fallback
+    assert ref["via"] == "summary"
+
+
+def test_shiori_underscore_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'shiori_eval' is not a bare name mention (longer word)."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/shiori#1 is the anchor.\n"
+        "   - shiori_eval needs testing #50.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+    ref = items[1]["references"][0]
+    assert ref["number"] == 50
+    assert ref["bare"] is True
+    assert ref["via"] == "summary"
+
+
+def test_path_shiori_x_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'shiori' inside a path like 'path/shiori/x' is not a bare name mention."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/shiori#1 is the anchor.\n"
+        "   - check path/shiori/x for #77.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+    ref = items[1]["references"][0]
+    assert ref["number"] == 77
+    assert ref["bare"] is True
+    assert ref["via"] == "summary"
+
+
+def test_name_mention_after_bare_ref_does_not_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A name mention after the bare ref does not apply to it (order matters)."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/shiori#1 is the anchor.\n"
+        "   - fix #12 then check shiori for #34.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    refs = items[1]["references"]
+    # #12 comes before the shiori name mention, so it uses summary fallback
+    # (via "summary"); #34 comes after, so it uses the name mention (via "name")
+    assert refs[0]["number"] == 12
+    assert refs[0]["bare"] is True
+    assert refs[0]["via"] == "summary"
+    assert refs[1]["number"] == 34
+    assert refs[1]["bare"] is True
+    assert refs[1]["via"] == "name"
+
+
+# ------------------------------------------------ issue #55 repair: nearest preceding by position
+
+
+def test_name_mention_beats_farther_resolved_ref(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The nearest preceding entry wins: the shiori mention is closer to
+    #288/#271 than the earlier kusabi#12 resolved ref."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/kusabi#1 and masuda-masuo/shiori#1 are the anchors.\n"
+        "   - kusabi#12 is done; shiori open issues: #288/#271.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    refs = items[1]["references"]
+    assert [r["number"] for r in refs] == [12, 288, 271]
+    # #12 is a known short form, non-bare.
+    assert refs[0]["repo"] == "kusabi"
+    assert refs[0]["bare"] is False
+    # The shiori mention precedes and is closer than kusabi#12, so it wins.
+    for ref in refs[1:]:
+        assert ref["owner"] == "masuda-masuo"
+        assert ref["repo"] == "shiori"
+        assert ref["bare"] is True
+        assert ref["via"] == "name"
+
+
+def test_resolved_ref_and_mention_interleave(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#288 uses the earlier shiori mention; the kusabi ref that follows
+    becomes the nearest entry for #13."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/kusabi#1 and masuda-masuo/shiori#1 are the anchors.\n"
+        "   - shiori open issues #288, then kusabi#12 and #13.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    refs = items[1]["references"]
+    assert [r["number"] for r in refs] == [288, 12, 13]
+    assert refs[0]["repo"] == "shiori"
+    assert refs[0]["bare"] is True
+    assert refs[0]["via"] == "name"
+    assert refs[1]["repo"] == "kusabi"
+    assert refs[1]["bare"] is False
+    assert refs[2]["repo"] == "kusabi"
+    assert refs[2]["bare"] is True
+    assert refs[2]["via"] == "nearest"
+
+
+def test_resolved_ref_closer_than_mention_wins(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """kusabi#12 is closer to #13 than the shiori mention, so via 'nearest'."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/kusabi#1 and masuda-masuo/shiori#1 are the anchors.\n"
+        "   - shiori and kusabi#12: #13.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    refs = items[1]["references"]
+    assert [r["number"] for r in refs] == [12, 13]
+    assert refs[0]["repo"] == "kusabi"
+    assert refs[0]["bare"] is False
+    assert refs[1]["repo"] == "kusabi"
+    assert refs[1]["bare"] is True
+    assert refs[1]["via"] == "nearest"
+
+
+# ---------------------------------------------------------------- issue #55: 404 on inferred repo
+
+
+def test_404_on_bare_ref_is_unresolved(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 404 on a bare (inferred) ref becomes 'unresolved', not 'unknown'."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sunaba#10 is the anchor.\n"
+        "   - shiori open issues: #999.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "sunaba"}, {"name": "shiori"}], ""
+        parts = argv[2].split("/")
+        number = int(parts[-1])
+        if number == 999:
+            return False, None, "gh: Not Found (HTTP 404)"
+        return True, {"state": "open"}, ""
+
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake)
+    items = payload["sessions"][0]["items"]
+    # #999 is bare, inferred to shiori, 404 → unresolved
+    ref_999 = items[1]["references"][0]
+    assert ref_999["number"] == 999
+    assert ref_999["bare"] is True
+    assert ref_999["state"] == "unresolved"
+    assert "inferred repo masuda-masuo/shiori" in ref_999["error"]
+    assert "HTTP 404" in ref_999["error"]
+    # Item status is unchecked (unresolved refs → unchecked)
+    assert items[1]["status"] == "unchecked"
+
+
+def test_404_on_explicit_ref_is_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 404 on an explicit ref stays 'unknown' (real broken reference)."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sunaba#999 is broken.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "sunaba"}], ""
+        return False, None, "gh: Not Found (HTTP 404)"
+
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake)
+    items = payload["sessions"][0]["items"]
+    ref = items[0]["references"][0]
+    assert ref["number"] == 999
+    assert ref["bare"] is False
+    assert ref["state"] == "unknown"
+    assert "HTTP 404" in ref["error"]
+    assert items[0]["status"] == "unknown"
+
+
+def test_non_404_failure_on_bare_ref_is_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-404 failure on a bare (inferred) ref stays 'unknown'."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sunaba#10 is the anchor.\n"
+        "   - fix #888 after the merge.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+
+    def fake(argv: list[str]) -> tuple[bool, Any, str]:
+        if argv[1] == "repo":
+            return True, [{"name": "sunaba"}], ""
+        parts = argv[2].split("/")
+        number = int(parts[-1])
+        if number == 888:
+            return False, None, "graphql: Not Found"
+        return True, {"state": "open"}, ""
+
+    payload = _run_direct_json(db, use_gh=True, gh_call=fake)
+    items = payload["sessions"][0]["items"]
+    ref = items[1]["references"][0]
+    assert ref["number"] == 888
+    # #888 is bare, inferred to sunaba via summary fallback
+    assert ref["bare"] is True
+    # Non-404 failure → unknown (not unresolved)
+    assert ref["state"] == "unknown"
+    assert items[1]["status"] == "unknown"
+
+
+# ---------------------------------------------------------------- via key
+
+
+def test_via_key_on_bare_refs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Bare refs carry 'via' indicating how they were resolved."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - masuda-masuo/sunaba#10 is the anchor and also #20.\n"
+        "   - masuda-masuo/shiori#1 is the other anchor.\n"
+        "   - shiori has issues #30/#40.\n"
+        "   - #50 via summary fallback.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, capsys=capsys)
+    items = payload["sessions"][0]["items"]
+
+    # Item 0: explicit ref has no via; bare #20 resolves via nearest
+    assert items[0]["references"][0].get("via") is None
+    assert items[0]["references"][1]["bare"] is True
+    assert items[0]["references"][1]["via"] == "nearest"
+
+    # Item 1: explicit ref has no via
+    assert items[1]["references"][0].get("via") is None
+
+    # Item 2: #30/#40 resolved via name (shiori mention precedes them)
+    assert items[2]["references"][0]["via"] == "name"
+    assert items[2]["references"][1]["via"] == "name"
+
+    # Item 3: #50 resolved via summary fallback
+    assert items[3]["references"][0]["via"] == "summary"
+
+
+def test_via_repo_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Bare ref resolved via --repo carries 'via: repo_flag'."""
+    summary = (
+        "7. Pending Tasks:\n"
+        "   - fix the #42 follow-up.\n"
+        "8. Current Work:\n"
+    )
+    db = make_db(
+        tmp_path,
+        [("ses-a", "2026-08-01", [user(summary, compact=True)])],
+    )
+    payload = _run_cli_json(db, "--repo", "masuda-masuo/sunaba", capsys=capsys)
+    ref = payload["sessions"][0]["items"][0]["references"][0]
+    assert ref["via"] == "repo_flag"
+    assert ref["bare"] is True

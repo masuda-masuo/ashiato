@@ -234,11 +234,18 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   and lists each item with its references and a status. References resolve in this order: a
   GitHub URL (`https://github.com/<o>/<r>/(issues|pull)/<n>`); an explicit `<o>/<r>#<n>`
   (the owner must start with a letter, so `454/PR#466` is not one); a short form
-  (`<name>#<n>`, `<name> PR #<n>`, `<name> PR#<n>`, `<name> issue #<n>`) where `<name>` is a
-  known repository name; and a bare `#<n>` (including `PR #<n>` / `Issue #<n>` with no repo
-  name before them). A bare reference resolves to the nearest preceding repository in the
-  same item, else the repository named most often in the same summary, else
-  `--repo OWNER/NAME`, else it is reported as `unresolved` and never checked. Known repository
+  (`<name>#<n>`, `<name> #<n>`, `<name> PR #<n>`, `<name> PR#<n>`, `<name> issue #<n>`)
+  where `<name>` is a known repository name; and a bare `#<n>` (including `PR #<n>` /
+  `Issue #<n>` with no repo name before them). A bare reference resolves to the nearest
+  preceding entry in the same item -- a resolved repository or a bare name mention,
+  whichever is closest before it -- else the repository named most
+  often in the same summary, else `--repo OWNER/NAME`, else it is reported as `unresolved`
+  and never checked. A bare word that is a known repository name (not part of a path, URL,
+  `owner/repo`, identifier, or longer word such as `shiori-demo`) sets the nearest preceding
+  repository for later bare refs in the same item. Bare references carry a `via` key
+  indicating how they were resolved: `"nearest"` (preceding resolved ref), `"name"`
+  (preceding bare name mention), `"summary"` (summary fallback), or `"repo_flag"`
+  (`--repo`). Non-bare refs omit `via`. Known repository
   names come from the explicit references found anywhere in the database's summaries, or with
   `--gh` from the owner's repositories (`gh repo list <owner> --limit 200 --json name`, one
   call per run); `--owner NAME` sets the owner those short forms resolve to, defaulting to the
@@ -246,11 +253,14 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   `unchecked` — no subprocess, no network. `--gh` checks each unique `owner/repo/number` once
   with `gh api repos/<o>/<r>/issues/<n>` (read-only GET; a PR counts as `merged` when
   `merged_at` is set) and records `open` / `closed` / `merged` / `unknown` per reference, an
-  `unknown` carrying the gh error message. An item is `open` when any reference is open,
-  `resolved` when all references are closed/merged, `unreferenced` when it has no references,
-  and `unknown`/`unchecked` otherwise. By default only items that are not `resolved` are
-  shown; `--show-resolved` shows all. `--since TS` / `--until TS` filter by summary
-  timestamp, and `--json` prints one document with `sessions` (session id, summary timestamp,
+  `unknown` carrying the gh error message. A 404 on an inferred (bare) reference is recorded
+  as `unresolved` (the repo was guessed and wrong, not a broken reference); an explicit
+  `owner/repo#n` or URL that 404s stays `unknown`. An item is `open` when any reference is
+  open, `resolved` when all references are closed/merged, `unreferenced` when it has no
+  references, and `unknown`/`unchecked` otherwise. By default only items that are not
+  `resolved` are shown; `--show-resolved` shows all. `--since TS` / `--until TS` filter by
+  summary timestamp, and `--json` prints one document with `sessions` (session id, summary
+  timestamp,
   project, latest `ai-title`/`custom-title`, items) and `counts` — counts by status plus the
   number of summaries with no Pending Tasks section. Item text is truncated to 300
   characters. This is report-only: it writes nothing. Exit code `0` on success and `1` when

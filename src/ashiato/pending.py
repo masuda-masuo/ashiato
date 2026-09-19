@@ -22,14 +22,23 @@ whitespace collapsed.
 References resolve in this precedence: a GitHub URL
 (``https://github.com/<o>/<r>/(issues|pull)/<n>``); an explicit ``<o>/<r>#<n>``
 (the owner must start with a letter, so ``454/PR#466`` is not one); a short
-form (``<name>#<n>``, ``<name> PR #<n>``, ``<name> PR#<n>``,
+form (``<name>#<n>``, ``<name> #<n>``, ``<name> PR #<n>``, ``<name> PR#<n>``,
 ``<name> issue #<n>``) where ``<name>`` is a known repository name; and a bare
 ``#<n>`` (including ``PR #<n>`` / ``Issue #<n>`` with no repo name before
-them).  A bare reference resolves to the nearest preceding repository in the
-same item, else the repository named most often in the same summary, else
-``--repo OWNER/NAME``, else it is reported as ``unresolved`` and never
-checked.  Known repository names come from the explicit references found
-anywhere in the database's summaries, or with ``--gh`` from
+them).  A bare reference resolves to the nearest preceding resolved
+repository in the same item, else a bare whole word that is exactly a known
+repository name (case-sensitive) in the same item (``via: "name"``), else the
+repository named most often in the same summary, else ``--repo OWNER/NAME``,
+else it is reported as ``unresolved`` and never checked.  A bare word that is
+a known repository name (not part of a path, URL, ``owner/repo``,
+identifier, or longer word such as ``shiori-demo``) sets the nearest
+preceding repository for later bare refs in the same item, the same way a
+resolved explicit/short ref does.  Bare references carry a ``via`` key
+indicating how they were resolved: ``"nearest"`` (preceding resolved ref),
+``"name"`` (preceding bare name mention), ``"summary"`` (summary fallback),
+or ``"repo_flag"`` (``--repo``).  Non-bare refs omit ``via``.  Known
+repository names come from the explicit references found anywhere in the
+database's summaries, or with ``--gh`` from
 ``gh repo list <owner> --limit 200 --json name`` (one call per run, only the
 owner name leaves the machine); ``--owner NAME`` sets the owner directly and
 defaults to the owner named most often by those explicit references.
@@ -39,10 +48,12 @@ and nothing is spawned.  With ``--gh`` each unique ``(owner, repo, number)``
 is looked up once through the ``gh`` CLI (``gh api repos/<o>/<r>/issues/<n>``,
 read-only; a PR counts as ``merged`` when ``merged_at`` is set) and recorded
 as ``open`` / ``closed`` / ``merged`` / ``unknown``; a failure carries its
-error message and the remaining references are still checked.  Only owner,
-repo, number and (for the repository listing) the owner name ever leave the
-machine -- never transcript text -- and the call sits behind one injectable
-function so tests can replace it.
+error message and the remaining references are still checked.  A 404 on an
+inferred (bare) reference is recorded as ``unresolved`` (the repo was guessed
+and wrong, not a broken reference); an explicit ``owner/repo#n`` or URL that
+404s stays ``unknown``.  Only owner, repo, number and (for the repository
+listing) the owner name ever leave the machine -- never transcript text -- and
+the call sits behind one injectable function so tests can replace it.
 
 Report-only, mirroring ``ashiato.orphans`` and ``ashiato.nominate``: it never
 writes to any file or store, only reads the already-built DuckDB.  No new
@@ -90,16 +101,25 @@ _DEFERRED_RE = re.compile(
 #: Every reference form in one pass, matched in precedence order: a GitHub URL
 #: (``https://github.com/<o>/<r>/(issues|pull)/<n>``); an explicit
 #: ``<o>/<r>#<n>`` whose owner starts with a letter (GitHub login rules, so
-#: ``454/PR#466`` is not one); a short form (``<name>#<n>``, ``<name> PR #<n>``,
-#: ``<name> PR#<n>``, ``<name> issue #<n>``, PR/issue case-insensitive); and a
-#: bare ``#<n>`` (including ``PR #<n>`` / ``Issue #<n>`` with no repo name
-#: before them).
+#: ``454/PR#466`` is not one); a short form (``<name>#<n>``, ``<name> #<n>``,
+#: ``<name> PR #<n>``, ``<name> PR#<n>``, ``<name> issue #<n>``, PR/issue
+#: case-insensitive); and a bare ``#<n>`` (including ``PR #<n>`` / ``Issue #<n>``
+#: with no repo name before them).
 _REF_TOKEN_RE = re.compile(
     r"https://github\.com/(?P<url_owner>[A-Za-z0-9_.-]+)/(?P<url_repo>[A-Za-z0-9_.-]+)/(?:issues|pull)/(?P<url_num>\d+)"
     r"|(?<![A-Za-z0-9_.-])(?P<slash_owner>[A-Za-z][A-Za-z0-9_.-]*)/(?P<slash_repo>[A-Za-z0-9_.-]+)#(?P<slash_num>\d+)"
-    r"|(?<![A-Za-z0-9_.-])(?P<short_name>[A-Za-z0-9_.-]+)(?:\s+(?:PR|issue)\s*)?#(?P<short_num>\d+)"
+    r"|(?<![A-Za-z0-9_.-])(?P<short_name>[A-Za-z0-9_.-]+)(?:\s+(?:PR|issue)\s*)?\s*#(?P<short_num>\d+)"
     r"|(?<![A-Za-z0-9_.-])(?:(?:PR|issue)\s*)?#(?P<bare_num>\d+)",
     re.IGNORECASE,
+)
+
+#: A whole word that is exactly a known repository name (case-sensitive).
+#: Used to detect bare name mentions that set the "nearest preceding repo"
+#: for later bare refs in the same item.  Excludes: names inside URLs,
+#: paths (owner/repo), identifiers with hyphens/underscores, and names
+#: embedded in longer words.
+_NAME_BARE_RE = re.compile(
+    r"(?<![A-Za-z0-9_/.-])(?P<name>[A-Za-z0-9_.-]+)(?![A-Za-z0-9_./-])"
 )
 
 #: Item text is truncated at this many characters in the text report.
@@ -284,7 +304,10 @@ class Reference:
     ``state`` is ``open`` / ``closed`` / ``merged`` / ``unknown`` after
     ``--gh``, ``unchecked`` without it, or ``unresolved`` for a bare ``#n``
     that no summary repo and no ``--repo`` could resolve.  ``error`` carries
-    the gh failure message for ``unknown``.
+    the gh failure message for ``unknown``.  ``via`` (bare refs only)
+    indicates how the repo was resolved: ``"nearest"`` (preceding resolved
+    ref), ``"name"`` (preceding bare name mention), ``"summary"`` (summary
+    fallback), ``"repo_flag"`` (``--repo``), or ``None`` (unresolved).
     """
 
     owner: str | None
@@ -293,6 +316,7 @@ class Reference:
     state: str
     bare: bool = False
     error: str | None = None
+    via: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -304,6 +328,8 @@ class Reference:
         }
         if self.error:
             payload["error"] = self.error
+        if self.bare:
+            payload["via"] = self.via
         return payload
 
 
@@ -485,6 +511,7 @@ def _analyze_summary(
     *,
     owner: str | None,
     known_repos: frozenset[str] | None,
+    known_names: frozenset[str] | None = None,
 ) -> list[PendingItem] | None:
     """The items of one summary, or None when it has no Pending Tasks section.
 
@@ -492,9 +519,14 @@ def _analyze_summary(
     ``owner/repo#n`` with a letter-starting owner) and known short forms
     resolve directly; a bare ``#n`` (including ``PR #<n>`` / ``Issue #<n>`` and
     short forms whose name is not a known repository) resolves to the nearest
-    preceding resolved repository in the same item, else the most frequent
-    resolved repository in this summary, else ``--repo``, else it is reported
-    as ``unresolved`` and never checked.
+    preceding entry in the same item -- a resolved ref or a bare name mention,
+    whichever is closest in text order -- else the most frequent resolved
+    repository in this summary, else ``--repo``, else it is reported as
+    ``unresolved`` and never checked.  A bare name mention is a whole word
+    exactly equal to a known repository name (case-sensitive).  Bare refs
+    resolved via the closest preceding resolved ref carry ``via: "nearest"``;
+    via the closest preceding name mention ``via: "name"``; via the summary
+    fallback ``via: "summary"``; via ``--repo`` ``via: "repo_flag"``.
     """
     section = extract_section(summary.text)
     if section is None:
@@ -502,26 +534,69 @@ def _analyze_summary(
     texts = extract_items(section)
 
     # The summary fallback for bare refs: the most frequent resolved
-    # repository (explicit refs and known short forms); --repo is only the
-    # fallback for a summary that resolves nothing.
+    # repository (explicit refs and known short forms).  When the summary
+    # resolves nothing, --repo is the fallback but carries a distinct via.
     resolved: Counter[tuple[str, str]] = Counter()
     for text in texts:
         for ref_owner, ref_repo, _number, bare in _scan_refs(text, known_repos, owner):
             if not bare and ref_owner is not None and ref_repo is not None:
                 resolved[(ref_owner, ref_repo)] += 1
-    fallback = max(resolved, key=lambda key: (resolved[key], key)) if resolved else repo
+    summary_fallback: tuple[str, str] | None = (
+        max(resolved, key=lambda key: (resolved[key], key)) if resolved else None
+    )
 
     items: list[PendingItem] = []
     for text in texts:
         references: list[Reference] = []
         seen: set[tuple[str | None, str | None, int]] = set()
-        last: tuple[str, str] | None = None  # nearest preceding resolved repo
-        for ref_owner, ref_repo, number, bare in _scan_refs(text, known_repos, owner):
+
+        # The nearest-preceding-repository timeline of this item: every
+        # resolved (non-bare) ref and every bare name mention, in text order.
+        # A bare ``#n`` takes the most recent entry before it, of either kind
+        # -- ``via: "nearest"`` when the closest entry is a resolved ref,
+        # ``via: "name"`` when it is a name mention.  A bare ref resolved this
+        # way never becomes an entry itself (only resolved refs and mentions
+        # do), so a bare ref between a mention and a later bare ref does not
+        # hide the mention.
+        last_resolved: tuple[str, str] | None = None  # nearest preceding resolved ref
+        last_resolved_pos = -1
+        mentions: list[tuple[str, int]] = []  # (name, position), in text order
+        if known_names is not None:
+            for m in _NAME_BARE_RE.finditer(text):
+                if m.group("name") in known_names:
+                    mentions.append((m.group("name"), m.start()))
+        mention_index = 0  # first mention not yet before the current ref
+
+        ref_positions = [m.start() for m in _REF_TOKEN_RE.finditer(text)]
+        for (ref_owner, ref_repo, number, bare), ref_pos in zip(
+            _scan_refs(text, known_repos, owner), ref_positions, strict=True
+        ):
+            # The most recent bare name mention strictly before this ref.
+            while mention_index < len(mentions) and mentions[mention_index][1] < ref_pos:
+                mention_index += 1
+            prev_mention: tuple[str, int] | None = (
+                mentions[mention_index - 1] if mention_index > 0 else None
+            )
+            via: str | None = None
             if bare:
-                if last is not None:
-                    ref_owner, ref_repo = last
-                elif fallback is not None:
-                    ref_owner, ref_repo = fallback
+                # Whichever of the two kinds is closest before the ref wins;
+                # a mention at the same position as a resolved ref is the
+                # short form's own name, so the resolved ref wins (>=).
+                if last_resolved is not None and (
+                    prev_mention is None or last_resolved_pos >= prev_mention[1]
+                ):
+                    ref_owner, ref_repo = last_resolved
+                    via = "nearest"
+                elif prev_mention is not None:
+                    ref_owner = owner
+                    ref_repo = prev_mention[0]
+                    via = "name"
+                elif summary_fallback is not None:
+                    ref_owner, ref_repo = summary_fallback
+                    via = "summary"
+                elif repo is not None:
+                    ref_owner, ref_repo = repo
+                    via = "repo_flag"
                 else:
                     ref_owner, ref_repo = None, None
             if ref_owner is None or ref_repo is None:
@@ -529,14 +604,20 @@ def _analyze_summary(
                 if key not in seen:
                     seen.add(key)
                     references.append(
-                        Reference(None, None, number, "unresolved", bare=True)
+                        Reference(None, None, number, "unresolved", bare=True, via=via)
                     )
                 continue
             key = (ref_owner, ref_repo, number)
             if key not in seen:
                 seen.add(key)
-                references.append(Reference(ref_owner, ref_repo, number, UNCHECKED, bare=bare))
-            last = (ref_owner, ref_repo)
+                references.append(
+                    Reference(ref_owner, ref_repo, number, UNCHECKED, bare=bare, via=via)
+                )
+            # Only resolved refs (non-bare) join the timeline; bare refs --
+            # even ones resolved from a name mention -- do not.
+            if not bare:
+                last_resolved = (ref_owner, ref_repo)
+                last_resolved_pos = ref_pos
         items.append(PendingItem(text=text, deferred=is_deferred(text), references=references))
     return items
 
@@ -600,9 +681,20 @@ def check_references(
             ok, payload, error = False, None, _GH_TIMEOUT_MESSAGE
         state, message = _state_from_payload(ok, payload, error)
         for reference in references:
-            reference.state = state
-            if message:
-                reference.error = message
+            # A 404 on an inferred (bare) repo is "unresolved" -- the repo
+            # was guessed and the guess was wrong, not a broken reference.
+            if (
+                reference.bare
+                and state == "unknown"
+                and message is not None
+                and "HTTP 404" in message
+            ):
+                reference.state = "unresolved"
+                reference.error = f"inferred repo {owner}/{repo}: {message}"
+            else:
+                reference.state = state
+                if message:
+                    reference.error = message
 
 
 def _gh_api(argv: Sequence[str]) -> tuple[bool, Any, str]:
@@ -787,6 +879,7 @@ def run(
             if listed is not None:
                 known_repos = listed
     known = frozenset(name.lower() for name in known_repos)
+    known_names = frozenset(known_repos)  # original case for bare name mentions
 
     selected = _selected_summaries(summaries, all_summaries=all_summaries)
     if since is not None or until is not None:
@@ -800,7 +893,9 @@ def run(
     all_items: list[PendingItem] = []
     no_section = 0
     for summary in selected:
-        items = _analyze_summary(summary, repo, owner=resolved_owner, known_repos=known)
+        items = _analyze_summary(
+            summary, repo, owner=resolved_owner, known_repos=known, known_names=known_names
+        )
         if items is None:
             no_section += 1
             continue
