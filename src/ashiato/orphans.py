@@ -16,11 +16,15 @@ A session is a candidate when all three hold:
   ``<system-reminder>``, ...) are stripped.
 * **Not persisted** -- those unique terms appear in no *sink* text: the memory
   directories, notes repos, ... the caller names.
+* **Worth reading** -- at least ``min_orphans`` distinct orphan terms (density
+  is noisy for tiny counts), and not a headless session (an SDK / headless
+  entrypoint, ``sdk-*`` -- kusabi workers, subagents -- whose "human" text is
+  a machine-written brief) unless the caller opts in.
 
-Document frequency is computed over every session that has any prose,
-whatever the ``since``/``until`` window or the human-chars threshold: the
-window only restricts which sessions are *nominated*, and must not make an old
-topic look unique.
+Document frequency is computed over every session that has any prose --
+headless ones included -- whatever the ``since``/``until`` window or the
+thresholds: the window only restricts which sessions are *nominated*, and must
+not make an old topic look unique.
 
 Known limit: *absence of the words is not absence of the idea*.  A topic that
 was persisted under different words is still nominated.  This is nomination
@@ -54,6 +58,7 @@ from ashiato.build import SchemaOutOfDate, assert_readable, connect
 
 DEFAULT_MIN_TF = 3
 DEFAULT_MIN_HUMAN_CHARS = 800
+DEFAULT_MIN_ORPHANS = 3
 DEFAULT_LIMIT = 20
 
 #: Orphan terms shown per candidate.
@@ -90,6 +95,10 @@ _HEX_ID_RE = re.compile(r"^[0-9a-f]{7,}$|[0-9a-f]{8}-")
 _UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
 )
+# A bare lowercase letter+digit token (no ``-``, no ``_``): a background-task
+# id, a short hex handle, a Windows file id, ``urllib3``.  No hyphen, so the
+# boundary-less words the regex can also match (``bench-10k``) are untouched.
+_ALNUM_ID_RE = re.compile(r"^[a-z0-9]+$")
 
 
 def strip_harness(text: str) -> str:
@@ -98,12 +107,16 @@ def strip_harness(text: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
-    """Lowercased terms of *text*, minus code identifiers and hex/UUID ids."""
+    """Lowercased terms of *text*, minus code identifiers and id-like tokens."""
     terms = []
     for match in _TOKEN_RE.finditer(_UUID_RE.sub(" ", text)):
         term = match.group().lower()
         # A token with ``_`` is a code identifier -- its real sink is the repo.
         if "_" in term or _HEX_ID_RE.search(term):
+            continue
+        # A token made only of letters and digits, with at least one of each,
+        # is an id (``bk7tgrw6i``, ``c1bf1``, ``urllib3``), not a topic word.
+        if _ALNUM_ID_RE.match(term) and any(ch.isdigit() for ch in term):
             continue
         terms.append(term)
     return terms
@@ -122,6 +135,7 @@ _EVENTS_QUERY = """
         s.started_at,
         s.project_dir,
         s.n_tool_calls,
+        s.entrypoint,
         e.role,
         e.text
     FROM events e
@@ -143,10 +157,12 @@ class SessionProse:
     started_at: datetime | None
     project_dir: str | None
     n_tool_calls: int | None
+    entrypoint: str | None = None
     human_chars: int = 0
     first_utterance: str = ""
     has_prose: bool = False
     terms: Counter[str] = field(default_factory=Counter)
+    total_terms: int = 0
 
     def add(self, role: str, text: str | None) -> None:
         """Fold one event in: harness wrappers stripped from human text."""
@@ -164,7 +180,9 @@ class SessionProse:
             if not prose.strip():
                 return
         self.has_prose = True
-        self.terms.update(tokenize(prose))
+        terms = tokenize(prose)
+        self.terms.update(terms)
+        self.total_terms += len(terms)
 
 
 def _iter_rows(connection: duckdb.DuckDBPyConnection) -> Iterator[tuple[Any, ...]]:
@@ -180,14 +198,33 @@ def collect_sessions(connection: duckdb.DuckDBPyConnection) -> list[SessionProse
     """Every session (one per transcript file) that has any prose."""
     sessions: list[SessionProse] = []
     current: SessionProse | None = None
-    for file_path, session_id, started_at, project_dir, n_tool_calls, role, text in _iter_rows(
-        connection
-    ):
+    for (
+        file_path,
+        session_id,
+        started_at,
+        project_dir,
+        n_tool_calls,
+        entrypoint,
+        role,
+        text,
+    ) in _iter_rows(connection):
         if current is None or current.file_path != file_path:
-            current = SessionProse(file_path, session_id, started_at, project_dir, n_tool_calls)
+            current = SessionProse(
+                file_path,
+                session_id,
+                started_at,
+                project_dir,
+                n_tool_calls,
+                entrypoint=entrypoint,
+            )
             sessions.append(current)
         current.add(role, text)
     return [session for session in sessions if session.has_prose]
+
+
+def is_headless(entrypoint: str | None) -> bool:
+    """True when *entrypoint* is an SDK / headless variant (``sdk-*``)."""
+    return entrypoint is not None and entrypoint.startswith("sdk")
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +310,16 @@ class Candidate:
     human_chars: int
     n_unique: int
     n_orphan: int
+    total_terms: int
     orphan_terms: list[str]
     first_utterance: str
+
+    @property
+    def orphan_density(self) -> float:
+        """Orphan terms per thousand terms: rankable across session sizes."""
+        if not self.total_terms:
+            return 0.0
+        return self.n_orphan / self.total_terms * 1000
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -285,6 +330,7 @@ class Candidate:
             "human_chars": self.human_chars,
             "n_unique": self.n_unique,
             "n_orphan": self.n_orphan,
+            "orphan_density": self.orphan_density,
             "orphan_terms": self.orphan_terms,
             "first_utterance": self.first_utterance,
         }
@@ -298,12 +344,17 @@ def find_orphans(
     until: datetime | None = None,
     min_tf: int = DEFAULT_MIN_TF,
     min_human_chars: int = DEFAULT_MIN_HUMAN_CHARS,
+    min_orphans: int = DEFAULT_MIN_ORPHANS,
+    include_headless: bool = False,
     limit: int = DEFAULT_LIMIT,
 ) -> list[Candidate]:
     """Nominate sessions whose unique terms appear in no sink text.
 
     *sessions* is the whole corpus: document frequency is taken over all of
-    it, and only the nomination is restricted by the window and thresholds.
+    it -- headless sessions included, so an SDK / headless (``sdk-*``)
+    session's terms keep their owners' words from looking unique -- and only
+    the nomination is restricted by the window, thresholds and the headless
+    exclusion.
     """
     document_frequency: Counter[str] = Counter()
     for session in sessions:
@@ -311,6 +362,8 @@ def find_orphans(
 
     candidates: list[Candidate] = []
     for session in sessions:
+        if is_headless(session.entrypoint) and not include_headless:
+            continue
         if session.human_chars < min_human_chars:
             continue
         if since is not None and (session.started_at is None or session.started_at < since):
@@ -325,6 +378,8 @@ def find_orphans(
         orphans = {term: count for term, count in unique.items() if term not in sink_text}
         if not orphans:
             continue
+        if len(orphans) < min_orphans:
+            continue
         ranked = sorted(orphans.items(), key=lambda item: (-item[1], item[0]))
         candidates.append(
             Candidate(
@@ -336,13 +391,20 @@ def find_orphans(
                 human_chars=session.human_chars,
                 n_unique=len(unique),
                 n_orphan=len(orphans),
+                total_terms=session.total_terms,
                 orphan_terms=[term for term, _ in ranked[:TOP_TERMS]],
                 first_utterance=session.first_utterance,
             )
         )
 
     candidates.sort(
-        key=lambda c: (-c.n_orphan, -c.human_chars, c.session_id or "", c.file_path)
+        key=lambda c: (
+            -c.orphan_density,
+            -c.n_orphan,
+            -c.human_chars,
+            c.session_id or "",
+            c.file_path,
+        )
     )
     return candidates[:limit] if limit else candidates
 
@@ -360,6 +422,8 @@ def _header(
     until: datetime | None,
     min_tf: int,
     min_human_chars: int,
+    min_orphans: int,
+    include_headless: bool,
     limit: int,
 ) -> str:
     window = ""
@@ -370,7 +434,8 @@ def _header(
     return (
         f"corpus: {n_sessions} session{'' if n_sessions == 1 else 's'} with prose, "
         f"sinks: {n_sink_files} file{'' if n_sink_files == 1 else 's'}, "
-        f"min-tf={min_tf} min-human-chars={min_human_chars} limit={limit}{window}"
+        f"min-tf={min_tf} min-human-chars={min_human_chars} min-orphans={min_orphans} "
+        f"include-headless={'yes' if include_headless else 'no'} limit={limit}{window}"
     )
 
 
@@ -383,6 +448,8 @@ def run(
     default_sinks: bool = True,
     min_tf: int = DEFAULT_MIN_TF,
     min_human_chars: int = DEFAULT_MIN_HUMAN_CHARS,
+    min_orphans: int = DEFAULT_MIN_ORPHANS,
+    include_headless: bool = False,
     limit: int = DEFAULT_LIMIT,
     json_output: bool = False,
     out: Any = None,
@@ -430,6 +497,8 @@ def run(
         until=until,
         min_tf=min_tf,
         min_human_chars=min_human_chars,
+        min_orphans=min_orphans,
+        include_headless=include_headless,
         limit=limit,
     )
     header = {
@@ -438,6 +507,8 @@ def run(
         "thresholds": {
             "min_tf": min_tf,
             "min_human_chars": min_human_chars,
+            "min_orphans": min_orphans,
+            "include_headless": include_headless,
             "limit": limit,
             "since": since.isoformat() if since else None,
             "until": until.isoformat() if until else None,
@@ -457,6 +528,8 @@ def run(
             until=until,
             min_tf=min_tf,
             min_human_chars=min_human_chars,
+            min_orphans=min_orphans,
+            include_headless=include_headless,
             limit=limit,
         ),
         file=out,
@@ -467,7 +540,8 @@ def run(
         print(f"session {c.session_id}  {started}  {c.project_dir or '?'}", file=out)
         print(
             f"  tool_calls={c.n_tool_calls}  human_chars={c.human_chars}  "
-            f"unique={c.n_unique}  orphan={c.n_orphan}",
+            f"unique={c.n_unique}  orphan={c.n_orphan}  "
+            f"density={c.orphan_density:.1f}",
             file=out,
         )
         print(f"  terms: {', '.join(c.orphan_terms)}", file=out)
