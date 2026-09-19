@@ -1,4 +1,4 @@
-"""A read-only local dashboard over the built database: ``ashiato serve`` (issue #49).
+"""A local dashboard over the built database: ``ashiato serve`` (issue #49).
 
 One stdlib HTTP server renders the analyses ``info``, ``orphans``,
 ``memory-authors``, ``denials``, ``hygiene`` and ``session-trace`` as
@@ -24,14 +24,22 @@ The parts that must never bend:
   and routinely holds ``<script>``, HTML and markdown.
 * **The analyses are reused, not re-implemented.**  Each page calls the same
   data functions the CLI commands do.
-* **Read-only, offline.**  Nothing is written, nothing is fetched, and the
+* **Read-only except one guarded endpoint.**  Nothing is fetched, and the
   pages carry no external asset: CSS and the one filtering script are inline.
+  The sole write is ``POST /orphans/reviewed``, which marks or unmarks a
+  session as reviewed in the same file the CLI writes.  It is CSRF-guarded:
+  every request carries a per-process random token (embedded as a hidden
+  form field) and a matching ``Origin`` header equal to ``http://<Host>``
+  (the existing loopback Host check applies too).  A cross-site form POST
+  to 127.0.0.1 cannot forge both.
 
 The expensive analyses (``orphans`` ~5 s, ``memory-authors`` ~1-2 s on a real
 database) are cached per page, keyed by the database file's
 ``(st_mtime_ns, st_size)``.  ``orphans`` is also keyed by a stat-only fingerprint of the
 sink files (a memo written after reading a candidate must retire it on the next reload,
-not at the nightly rebuild), and ``memory-authors`` re-checks, on every hit, that each file
+not at the nightly rebuild) and of the reviewed file next to the database (a mark made
+with ``ashiato orphans --mark-reviewed`` must hide the candidate on the next reload too),
+and ``memory-authors`` re-checks, on every hit, that each file
 it reports as present or missing still is.  ``info`` is the exception: its freshness gap
 reads the transcript directories, not the database, so caching it by the database's
 stamp would hide exactly the staleness it exists to show.
@@ -39,8 +47,10 @@ stamp would hide exactly the staleness it exists to show.
 
 from __future__ import annotations
 
+import hmac
 import html
 import json
+import secrets
 import socket
 import sys
 import threading
@@ -74,10 +84,13 @@ from ashiato.orphans import (
     Candidate,
     _iter_sink_files,
     collect_sessions,
+    default_reviewed_path,
     find_orphans,
     load_sinks,
     payload_header,
+    read_reviewed,
     resolve_sink_paths,
+    update_reviewed,
 )
 from ashiato.schema import denial_followups_query
 from ashiato.session_trace import (
@@ -106,15 +119,15 @@ ORPHANS_LIMIT = 30
 DENIALS_LIMIT = 50
 
 #: Sent on every response.  The page needs inline CSS and one inline script and
-#: nothing else: no fetch, no image, no frame, no form.
+#: one form, and nothing else: no fetch, no image, no frame.
 _SECURITY_HEADERS = (
     (
         "Content-Security-Policy",
         "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     ),
     ("X-Content-Type-Options", "nosniff"),
-    ("Referrer-Policy", "no-referrer"),
+    ("Referrer-Policy", "same-origin"),
     ("Cache-Control", "no-store"),
 )
 
@@ -156,11 +169,17 @@ class Dashboard:
         sinks: Sequence[Path] = (),
         default_sinks: bool = True,
         memory_dirs: Sequence[Path] = (),
+        reviewed_file: Path | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.sinks = list(sinks)
         self.default_sinks = default_sinks
         self.memory_dirs = list(memory_dirs)
+        self.reviewed_file = (
+            Path(reviewed_file)
+            if reviewed_file is not None
+            else default_reviewed_path(self.db_path)
+        )
         self._cache: dict[str, tuple[Hashable, Any]] = {}
         # One lock per cached value name (orphans, memory, denials, and one per
         # session outline), created on first use.  Locks are never evicted:
@@ -219,6 +238,22 @@ class Dashboard:
                 size += stat.st_size
         return tuple(paths), missing, count, newest, size
 
+    def _reviewed_fingerprint(self) -> Hashable:
+        """The reviewed file's ``(st_mtime_ns, st_size)``, or ``None`` when it is absent.
+
+        A mark or unmark made from the CLI changes this, so the next page
+        reload recomputes the candidates without any database change.
+        """
+        try:
+            stat = self.reviewed_file.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _orphans_fingerprint(self) -> Hashable:
+        """The outside state ``orphans`` depends on: the sinks plus the reviewed file."""
+        return self._sink_fingerprint(), self._reviewed_fingerprint()
+
     def _cached(
         self,
         name: str,
@@ -244,19 +279,30 @@ class Dashboard:
     # -- analyses --------------------------------------------------------
 
     def orphans(self) -> dict[str, Any]:
-        """Every candidate at the CLI defaults; pages slice it."""
+        """Every candidate at the CLI defaults, with reviewed flag and hidden
+        count; pages filter."""
 
         def compute(connection: duckdb.DuckDBPyConnection) -> dict[str, Any]:
             sessions = collect_sessions(connection)
             loaded = load_sinks(resolve_sink_paths(self.sinks, self.default_sinks))
-            candidates = find_orphans(sessions, loaded.text, limit=0)
+            reviewed = read_reviewed(self.reviewed_file)
+            all_candidates = find_orphans(
+                sessions,
+                loaded.text,
+                limit=0,
+                reviewed=reviewed,
+                show_reviewed=True,
+            )
             return {
                 "sessions_with_prose": len(sessions),
                 "sink_files": loaded.n_files,
-                "candidates": candidates,
+                "all_candidates": all_candidates,
+                "candidates": [c for c in all_candidates if not c.reviewed],
+                "reviewed_hidden": sum(1 for c in all_candidates if c.reviewed),
+                "reviewed_file": str(self.reviewed_file),
             }
 
-        return self._cached("orphans", compute, fingerprint=self._sink_fingerprint)
+        return self._cached("orphans", compute, fingerprint=self._orphans_fingerprint)
 
     def orphans_payload(self) -> dict[str, Any]:
         """The ``orphans --json`` document, at the page's limit."""
@@ -271,6 +317,8 @@ class Dashboard:
             min_orphans=DEFAULT_MIN_ORPHANS,
             include_headless=False,
             limit=ORPHANS_LIMIT,
+            reviewed_hidden=data["reviewed_hidden"],
+            reviewed_file=data["reviewed_file"],
         )
         candidates = [c.to_dict() for c in data["candidates"][:ORPHANS_LIMIT]]
         return {**header, "candidates": candidates}
@@ -689,12 +737,44 @@ def render_overview(view: dict[str, Any]) -> str:
     return _layout("概況", "/", body)
 
 
-def render_orphans(data: dict[str, Any]) -> str:
-    candidates: list[Candidate] = data["candidates"][:ORPHANS_LIMIT]
+def _review_form(session_id: str, csrf_token: str, *, unmark: bool = False) -> str:
+    """A small POST form to mark or unmark a session as reviewed."""
+    action = "unmark" if unmark else "mark"
+    label = "unreview" if unmark else "reviewed"
+    return (
+        f'<form method="post" action="/orphans/reviewed" class="review-form">'
+        f'<input type="hidden" name="token" value="{_e(csrf_token)}">'
+        f'<input type="hidden" name="session_id" value="{_e(session_id)}">'
+        f'<input type="hidden" name="action" value="{action}">'
+        f'<button type="submit">{label}</button>'
+        f'</form>'
+    )
+
+
+def render_orphans(
+    data: dict[str, Any], csrf_token: str = "", *, show_reviewed: bool = False
+) -> str:
+    reviewed_hidden = data.get("reviewed_hidden", 0)
+
+    if show_reviewed:
+        candidates: list[Candidate] = data.get("all_candidates", data["candidates"])[:ORPHANS_LIMIT]
+        toggle = '<a href="/orphans">hide reviewed</a>'
+    else:
+        candidates = data["candidates"][:ORPHANS_LIMIT]
+        toggle = (
+            f'<a href="/orphans?reviewed=1">'
+            f'show {reviewed_hidden} reviewed</a>'
+        ) if reviewed_hidden else ""
+
     rows = []
     for rank, c in enumerate(candidates):
         terms = "".join(f'<span class="term">{_e(term)}</span>' for term in c.orphan_terms)
         density = f"{c.orphan_density:.1f}"
+        review_cell = (
+            _review_form(c.session_id, csrf_token, unmark=True)
+            if c.reviewed and c.session_id
+            else _review_form(c.session_id, csrf_token) if c.session_id else ""
+        )
         rows.append(
             [
                 _e(rank + 1),
@@ -708,6 +788,7 @@ def render_orphans(data: dict[str, Any]) -> str:
                 terms,
                 _long(c.first_utterance),
                 _session_link(c.session_id),
+                review_cell,
             ]
         )
     columns = (
@@ -721,6 +802,7 @@ def render_orphans(data: dict[str, Any]) -> str:
         ("orphan terms", ""),
         ("first utterance", ""),
         ("session", "m"),
+        ("", ""),
     )
     table = _table("t-orphans", columns, rows)
     note = ""
@@ -729,12 +811,14 @@ def render_orphans(data: dict[str, Any]) -> str:
             '<p class="dim">No sink text loaded &mdash; every unique term counts as an orphan.</p>'
         )
     empty = "" if candidates else '<p class="dim">No candidates.</p>'
+    toggle_html = f' <span class="dim">{toggle}</span>' if toggle else ""
     body = (
         "<h1>発掘</h1>"
         f'<p class="lede">Sessions whose one-off terms left no trace in any sink. '
         f"Corpus: {data['sessions_with_prose']} sessions with prose, "
         f"{data['sink_files']} sink files. Top {ORPHANS_LIMIT} by density.</p>"
-        f"{note}{_filter_box('t-orphans')}{table}{empty}"
+        f'<input type="hidden" id="csrf-token" value="{_e(csrf_token)}">'
+        f"{note}{toggle_html}{_filter_box('t-orphans')}{table}{empty}"
     )
     return _layout("発掘", "/orphans", body, filterable=True)
 
@@ -1022,15 +1106,112 @@ class App:
 
     def __init__(self, dashboard: Dashboard) -> None:
         self.dashboard = dashboard
+        self._csrf_token = secrets.token_urlsafe(32)
 
-    def handle(self, target: str, host_header: str | None = None) -> Response:
-        """The response to ``GET target``; never raises."""
+    def _check_csrf(
+        self,
+        host_header: str | None,
+        origin: str | None,
+        content_length: str | None,
+        body: bytes,
+    ) -> Response | None:
+        """Validate CSRF guards for the reviewed-mark endpoint.
+
+        Returns ``None`` on success (caller should proceed), or an error
+        ``Response`` to return immediately.
+        """
+        # 1. Host must be loopback.
+        if not host_allowed(host_header):
+            return _error(
+                403, "Forbidden",
+                "This dashboard only answers requests to localhost.",
+                api=False,
+            )
+
+        # 2. Origin header must be present and match http://<Host>.
+        if not origin:
+            return _error(403, "Forbidden", "Missing Origin header.", api=False)
+        if host_header is None:
+            # HTTP/1.0 has no Host; Origin cannot be validated.
+            return _error(
+                403, "Forbidden",
+                "Missing Host header; cannot validate Origin.",
+                api=False,
+            )
+        expected_origin = f"http://{host_header.strip()}"
+        if not hmac.compare_digest(origin, expected_origin):
+            return _error(403, "Forbidden", "Origin does not match Host.", api=False)
+
+        # 3. Content-Length must be present, numeric, and small.
+        if content_length is None:
+            return _error(400, "Bad request", "Missing Content-Length header.", api=False)
+        try:
+            length = int(content_length)
+        except ValueError:
+            return _error(400, "Bad request", "Invalid Content-Length header.", api=False)
+        if length > 4096:
+            return _error(413, "Request too large", "Body exceeds 4 KiB limit.", api=False)
+        if length != len(body):
+            return _error(
+                400, "Bad request",
+                "Content-Length does not match body length.",
+                api=False,
+            )
+
+        # 4. Parse form body.
+        try:
+            form = parse_qs(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            return _error(400, "Bad request", "Body is not valid UTF-8.", api=False)
+
+        # 5. Validate token.
+        tokens = form.get("token", [])
+        if not tokens or not hmac.compare_digest(tokens[0], self._csrf_token):
+            return _error(403, "Forbidden", "Invalid or missing CSRF token.", api=False)
+
+        # 6. Validate session_id is present.
+        session_ids = form.get("session_id", [])
+        if not session_ids or not session_ids[0]:
+            return _error(400, "Bad request", "Missing session_id.", api=False)
+
+        # 7. Validate action is mark or unmark.
+        actions = form.get("action", [])
+        if not actions or actions[0] not in ("mark", "unmark"):
+            return _error(400, "Bad request", "Action must be 'mark' or 'unmark'.", api=False)
+
+        return None  # caller proceeds
+
+    def handle(
+        self,
+        target: str,
+        method: str = "GET",
+        host_header: str | None = None,
+        origin: str | None = None,
+        content_length: str | None = None,
+        body: bytes = b"",
+    ) -> Response:
+        """The response to ``{method} target``; never raises."""
         api = target.startswith("/api/")
         if not host_allowed(host_header):
             return _error(
                 403, "Forbidden", "This dashboard only answers requests addressed to localhost.",
                 api=api,
             )
+        if method == "OPTIONS":
+            return Response(405, "text/plain", b"", (("Allow", "GET, HEAD"),))
+        # POST /orphans/reviewed is the only write.
+        if method == "POST":
+            parts = urlsplit(target)
+            path = parts.path.rstrip("/") or "/"
+            if path == "/orphans/reviewed":
+                return self._handle_post_reviewed(
+                    host_header, origin, content_length, body
+                )
+            # Every other POST path is 405.
+            return Response(405, "text/plain", b"", (("Allow", "GET, HEAD"),))
+        # PUT/DELETE/PATCH are always 405.
+        if method not in ("GET", "HEAD"):
+            return Response(405, "text/plain", b"", (("Allow", "GET, HEAD"),))
         try:
             parts = urlsplit(target)
             path = parts.path.rstrip("/") or "/"
@@ -1055,7 +1236,7 @@ class App:
                 "Reload in a minute.",
                 api=api,
                 detail=str(error),
-                headers=(("Retry-After", "30"),),
+                headers=((("Retry-After", "30"),)),
             )
         except Exception as error:
             traceback.print_exc(file=sys.stderr)
@@ -1066,15 +1247,83 @@ class App:
                 api=api,
             )
 
+    def _handle_post_reviewed(
+        self,
+        host_header: str | None,
+        origin: str | None,
+        content_length: str | None,
+        body: bytes,
+    ) -> Response:
+        """Handle POST /orphans/reviewed."""
+        csrf_err = self._check_csrf(host_header, origin, content_length, body)
+        if csrf_err is not None:
+            return csrf_err
+
+        form = parse_qs(body.decode("utf-8"))
+        session_id = form["session_id"][0]
+        action = form["action"][0]
+
+        # Validate session_id against the database.  The web accepts only a
+        # *full* session id that exists exactly: no prefix resolution, unlike
+        # the CLI, so a typo'd or guessed prefix can never mark a session the
+        # page did not show.
+        try:
+            self.dashboard.probe()
+            with self.dashboard.connection() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ? "
+                    "UNION "
+                    "SELECT 1 FROM tool_calls WHERE session_id = ?",
+                    [session_id, session_id],
+                ).fetchone()
+        except (DatabaseUnavailable, SchemaOutOfDate, duckdb.Error) as error:
+            return _error(
+                503, "Database unavailable",
+                f"Cannot validate session id: {error}",
+                api=False,
+                detail=str(error),
+            )
+        if row is None:
+            return _error(
+                400, "Bad request",
+                f"Unknown session id: {session_id}",
+                api=False,
+            )
+
+        reviewed_path = self.dashboard.reviewed_file
+        try:
+            if action == "mark":
+                update_reviewed(reviewed_path, add={session_id})
+            else:  # unmark
+                update_reviewed(reviewed_path, remove={session_id})
+        except (OSError, ValueError) as error:
+            return _error(
+                500, "Internal error",
+                f"Failed to write reviewed file: {error}",
+                api=False,
+            )
+
+        # Invalidate the orphans cache so the next GET sees the change.
+        self.dashboard._cache.pop("orphans", None)
+
+        # 303 See Other -> /orphans
+        return Response(
+            303, "text/html", b"",
+            (("Location", "/orphans"),),
+        )
+
     def _route(self, path: str, query: dict[str, list[str]]) -> Callable[[], Response] | None:
         dashboard = self.dashboard
         model = (query.get("model") or [""])[0] or None
+        show_reviewed = "reviewed" in query
 
         def overview_page() -> Response:
             return _html(render_overview(dashboard.overview()))
 
         def orphans_page() -> Response:
-            return _html(render_orphans(dashboard.orphans()))
+            return _html(render_orphans(
+                dashboard.orphans(), self._csrf_token, show_reviewed=show_reviewed,
+            ))
 
         def memory_page() -> Response:
             return _html(render_memory(dashboard.memory(model), model))
@@ -1096,7 +1345,7 @@ class App:
         if path in pages:
             return pages[path]
         if path.startswith("/session/") and len(path) > len("/session/"):
-            prefix = unquote(path[len("/session/") :])
+            prefix = unquote(path[len("/session/"):])
             return lambda: _html(render_session(dashboard.session(prefix)))
         return None
 
@@ -1110,14 +1359,17 @@ def _make_handler(app: App) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "ashiato-serve"
 
-        def _answer(self, *, send_body: bool) -> None:
-            response = app.handle(self.path, self.headers.get("Host"))
+        def _send(self, response: Response) -> None:
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(response.body)))
             for name, value in (*_SECURITY_HEADERS, *response.headers):
                 self.send_header(name, value)
             self.end_headers()
+
+        def _answer(self, *, send_body: bool) -> None:
+            response = app.handle(self.path, host_header=self.headers.get("Host"))
+            self._send(response)
             if send_body:
                 self.wfile.write(response.body)
 
@@ -1127,13 +1379,63 @@ def _make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def do_HEAD(self) -> None:
             self._answer(send_body=False)
 
+        def do_POST(self) -> None:
+            parts = urlsplit(self.path)
+            path = parts.path.rstrip("/") or "/"
+            if path != "/orphans/reviewed":
+                # Every other POST path is 405 without reading the body,
+                # whatever its Content-Length header says.
+                response = app.handle(
+                    self.path,
+                    method="POST",
+                    host_header=self.headers.get("Host"),
+                    origin=None,
+                    content_length=None,
+                    body=b"",
+                )
+                self._send(response)
+                if response.body:
+                    self.wfile.write(response.body)
+                return
+            cl = self.headers.get("Content-Length")
+            if cl is None:
+                body = b""
+            else:
+                try:
+                    length = int(cl)
+                except ValueError:
+                    err = _error(400, "Bad request", "Invalid Content-Length.", api=False)
+                    self._send(err)
+                    self.wfile.write(err.body)
+                    return
+                if length > 4096:
+                    err = _error(413, "Request too large", "Body exceeds 4 KiB limit.", api=False)
+                    self._send(err)
+                    self.wfile.write(err.body)
+                    return
+                body = self.rfile.read(length)
+            origin = self.headers.get("Origin")
+            response = app.handle(
+                self.path,
+                method="POST",
+                host_header=self.headers.get("Host"),
+                origin=origin,
+                content_length=cl,
+                body=body,
+            )
+            self._send(response)
+            if response.status == 303:
+                pass  # redirect with no body
+            elif response.body:
+                self.wfile.write(response.body)
+
         def _refuse(self) -> None:
             self.send_response(405)
             self.send_header("Allow", "GET, HEAD")
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse
+        do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse
 
     return Handler
 
@@ -1154,11 +1456,16 @@ def make_server(
     sinks: Sequence[Path] = (),
     default_sinks: bool = True,
     memory_dirs: Sequence[Path] = (),
+    reviewed_file: Path | None = None,
 ) -> ThreadingHTTPServer:
     """A bound, not yet serving, dashboard server.  ``ValueError`` for a non-loopback *host*."""
     address = bind_address(host)
     dashboard = Dashboard(
-        db_path, sinks=sinks, default_sinks=default_sinks, memory_dirs=memory_dirs
+        db_path,
+        sinks=sinks,
+        default_sinks=default_sinks,
+        memory_dirs=memory_dirs,
+        reviewed_file=reviewed_file,
     )
     server_class = _Server6 if ":" in address else _Server4
     return server_class((address, port), _make_handler(App(dashboard)))
@@ -1178,6 +1485,7 @@ def run(
     sinks: Sequence[Path] = (),
     default_sinks: bool = True,
     memory_dirs: Sequence[Path] = (),
+    reviewed_file: Path | None = None,
     out: Any = None,
     err: Any = None,
 ) -> int:
@@ -1205,6 +1513,7 @@ def run(
             sinks=sinks,
             default_sinks=default_sinks,
             memory_dirs=memory_dirs,
+            reviewed_file=reviewed_file,
         )
     except OSError as error:
         print(f"error: cannot listen on {host} port {port}: {error}", file=err)

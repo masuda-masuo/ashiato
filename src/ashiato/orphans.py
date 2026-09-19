@@ -31,18 +31,30 @@ was persisted under different words is still nominated.  This is nomination
 only; judging the candidate is for the reader.
 
 Report-only, mirroring ``ashiato.nominate`` and ``ashiato.salvage``: it never
-writes to any file or store, only reads the already-built DuckDB and the sink
-files.  No new stored tables or views, so no ``FORMAT_VERSION`` bump.
+writes to the database, to any sink or to any other file, only reads the
+already-built DuckDB and the sink files.  The single exception is the
+*reviewed file*: ``--mark-reviewed`` / ``--unmark-reviewed`` write one full
+session id per line to ``orphans-reviewed.txt`` next to the database, and
+nomination reads that file to skip sessions a human has already judged.  The
+marks live outside the database on purpose: a delete-and-rebuild of the
+database must not forget them.  No new stored tables or views, so no
+``FORMAT_VERSION`` bump.
 """
 
 from __future__ import annotations
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 import json
 import os
 import re
 import sys
+import tempfile
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +63,7 @@ from typing import Any
 import duckdb
 
 from ashiato.build import SchemaOutOfDate, assert_readable, connect
+from ashiato.session_trace import SessionResolutionError, resolve_session
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -322,6 +335,229 @@ def load_sinks(paths: Sequence[Path]) -> Sinks:
 
 
 # ---------------------------------------------------------------------------
+# Reviewed marks
+# ---------------------------------------------------------------------------
+
+#: The reviewed-file name.  One full session id per line, UTF-8; blank lines
+#: and lines starting with ``#`` are ignored, surrounding whitespace is
+#: stripped.  It sits next to the database -- outside it -- so deleting and
+#: rebuilding the database cannot lose a mark.
+REVIEWED_FILE_NAME = "orphans-reviewed.txt"
+
+
+def default_reviewed_path(db_path: Path) -> Path:
+    """The reviewed file next to *db_path*: ``<db dir>/orphans-reviewed.txt``."""
+    return Path(db_path).parent / REVIEWED_FILE_NAME
+
+
+def _lock_path(path: Path) -> Path:
+    """The sibling lock file for *path*."""
+    return path.with_suffix(path.suffix + ".lock")
+
+
+def read_reviewed(path: Path) -> frozenset[str]:
+    """The session ids marked reviewed in *path*; a missing file is empty.
+
+    A file that *exists* but cannot be read (it is a directory, permission
+    denied, not valid UTF-8) raises ``ValueError`` -- never silently treated
+    as empty.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return frozenset()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid UTF-8 in reviewed file {path}: {exc}") from exc
+    ids: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        ids.add(line)
+    return frozenset(ids)
+
+
+def update_reviewed(
+    path: Path,
+    *,
+    add: Iterable[str] = (),
+    remove: Iterable[str] = (),
+) -> frozenset[str]:
+    """Under the exclusive lock: read the file, apply add/remove, write atomically.
+
+    Returns the set as it was *before* the update (callers use it for
+    'already reviewed' / 'not reviewed' messages).  A missing file is an
+    empty set.  Existing blank and comment lines are preserved verbatim and
+    the resulting ids are laid out as in :func:`_write_reviewed_inner`; the
+    parent directory is created if needed; the update is idempotent.
+
+    The exclusive ``fcntl`` lock (a sibling ``.lock`` file) is held across the
+    read, the update and the atomic write, so two concurrent read-modify-write
+    from the CLI and the dashboard cannot drop each other's marks; on a
+    platform without ``fcntl`` (or when the lock file cannot be opened) the
+    update proceeds unlocked rather than failing.
+    """
+    adds = frozenset(add)
+    removes = frozenset(remove)
+    if fcntl is None:
+        return _update_reviewed_inner(path, adds, removes)
+    lock = _lock_path(path)
+    try:
+        fd = open(lock, "a+")  # noqa: SIM115
+    except OSError:
+        # Lock file cannot be opened (e.g. read-only directory); proceed
+        # without serialisation rather than failing.
+        return _update_reviewed_inner(path, adds, removes)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return _update_reviewed_inner(path, adds, removes)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def _update_reviewed_inner(
+    path: Path,
+    add: frozenset[str],
+    remove: frozenset[str],
+) -> frozenset[str]:
+    """Inner update: read the current ids, apply add/remove, then atomic replace.
+
+    Returns the set as it was *before* the update.  Callers hold the lock.
+    """
+    current = read_reviewed(path)
+    _write_reviewed_inner(path, (current | add) - remove)
+    return current
+
+
+def _write_reviewed_inner(path: Path, ids: frozenset[str]) -> None:
+    """Inner write: read-modify-write, then atomic replace."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    kept: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+        elif stripped in ids and stripped not in kept:
+            kept.add(stripped)
+            out.append(stripped)
+    out.extend(sorted(ids - kept))
+    if not out and not path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write: temp file + fsync + os.replace.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + ("\n" if out else ""))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def mark_reviewed(
+    connection: duckdb.DuckDBPyConnection,
+    path: Path,
+    prefixes: Sequence[str],
+    *,
+    out: Any = None,
+    err: Any = None,
+) -> int:
+    """Resolve *prefixes* against the database and append their full session
+    ids to the reviewed file *path*.
+
+    Every prefix is resolved first (an exact id wins, otherwise the prefix
+    must be unique); only when all resolve is the file written, so a missing
+    or ambiguous id changes nothing.  Prints one line per id to stdout --
+    ``reviewed: <id>`` or ``already reviewed: <id>`` -- and returns 0; on any
+    resolution failure, or when *path* exists but cannot be read, prints an
+    error to stderr and returns 1.
+    """
+    if out is None:
+        out = sys.stdout
+    if err is None:
+        err = sys.stderr
+    try:
+        ids = [resolve_session(connection, prefix) for prefix in prefixes]
+    except SessionResolutionError as error:
+        print(f"error: {error}", file=err)
+        return 1
+    try:
+        existing = update_reviewed(path, add=ids)
+    except (OSError, ValueError) as error:
+        print(f"error: cannot read reviewed file {path}: {error}", file=err)
+        return 1
+    for session_id in ids:
+        print(
+            f"{'already reviewed' if session_id in existing else 'reviewed'}: {session_id}",
+            file=out,
+        )
+    return 0
+
+
+def unmark_reviewed(
+    connection: duckdb.DuckDBPyConnection,
+    path: Path,
+    prefixes: Sequence[str],
+    *,
+    out: Any = None,
+    err: Any = None,
+) -> int:
+    """Remove the ids *prefixes* name from the reviewed file *path*.
+
+    An id is matched against the file content first -- so an id that is in the
+    file still unmarks even when its session is no longer in the database (a
+    rebuild must never make a mark unremovable) -- and resolved against the
+    database only when it is not there.  Every prefix is resolved before the
+    file is written.  Prints one line per id to stdout -- ``unmarked: <id>``
+    or ``not reviewed: <id>`` -- and returns 0; on any resolution failure, or
+    when *path* exists but cannot be read, prints an error to stderr and
+    returns 1.
+    """
+    if out is None:
+        out = sys.stdout
+    if err is None:
+        err = sys.stderr
+    # The read here is only to decide how to resolve each prefix (an id that
+    # is in the file unmarks even when its session is gone from the database);
+    # the removal itself happens under the lock, inside update_reviewed.
+    try:
+        existing = read_reviewed(path)
+    except (OSError, ValueError) as error:
+        print(f"error: cannot read reviewed file {path}: {error}", file=err)
+        return 1
+    ids: list[str] = []
+    for prefix in prefixes:
+        if prefix in existing:
+            ids.append(prefix)
+            continue
+        try:
+            ids.append(resolve_session(connection, prefix))
+        except SessionResolutionError as error:
+            print(f"error: {error}", file=err)
+            return 1
+    try:
+        before = update_reviewed(path, remove=ids)
+    except (OSError, ValueError) as error:
+        print(f"error: cannot read reviewed file {path}: {error}", file=err)
+        return 1
+    for session_id in ids:
+        print(
+            f"{'unmarked' if session_id in before else 'not reviewed'}: {session_id}",
+            file=out,
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Nomination
 # ---------------------------------------------------------------------------
 
@@ -341,6 +577,7 @@ class Candidate:
     total_terms: int
     orphan_terms: list[str]
     first_utterance: str
+    reviewed: bool = False
 
     @property
     def orphan_density(self) -> float:
@@ -349,8 +586,8 @@ class Candidate:
             return 0.0
         return self.n_orphan / self.total_terms * 1000
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_reviewed: bool = False) -> dict[str, Any]:
+        fields: dict[str, Any] = {
             "session_id": self.session_id,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "project_dir": self.project_dir,
@@ -362,9 +599,12 @@ class Candidate:
             "orphan_terms": self.orphan_terms,
             "first_utterance": self.first_utterance,
         }
+        if include_reviewed:
+            fields["reviewed"] = self.reviewed
+        return fields
 
 
-def find_orphans(
+def _nominate(
     sessions: Sequence[SessionProse],
     sink_text: str,
     *,
@@ -374,15 +614,16 @@ def find_orphans(
     min_human_chars: int = DEFAULT_MIN_HUMAN_CHARS,
     min_orphans: int = DEFAULT_MIN_ORPHANS,
     include_headless: bool = False,
+    reviewed: frozenset[str] = frozenset(),
+    show_reviewed: bool = False,
     limit: int = DEFAULT_LIMIT,
-) -> list[Candidate]:
-    """Nominate sessions whose unique terms appear in no sink text.
+) -> tuple[list[Candidate], int]:
+    """The candidates, and how many would-be ones the ``reviewed`` mark hid.
 
-    *sessions* is the whole corpus: document frequency is taken over all of
-    it -- headless sessions included, so an SDK / headless (``sdk-*``)
-    session's terms keep their owners' words from looking unique -- and only
-    the nomination is restricted by the window, thresholds and the headless
-    exclusion.
+    Document frequency is taken over all of *sessions* -- headless sessions
+    and reviewed sessions included, so their terms keep their owners' words
+    from looking unique -- and only the nomination is restricted by the
+    window, thresholds, the headless exclusion and the ``reviewed`` mark.
     """
     document_frequency: Counter[str] = Counter()
     for session in sessions:
@@ -422,6 +663,7 @@ def find_orphans(
                 total_terms=session.total_terms,
                 orphan_terms=[term for term, _ in ranked[:TOP_TERMS]],
                 first_utterance=session.first_utterance,
+                reviewed=session.session_id in reviewed,
             )
         )
 
@@ -434,7 +676,85 @@ def find_orphans(
             c.file_path,
         )
     )
-    return candidates[:limit] if limit else candidates
+    if show_reviewed:
+        return candidates[:limit] if limit else candidates, 0
+    hidden = sum(1 for candidate in candidates if candidate.reviewed)
+    visible = [candidate for candidate in candidates if not candidate.reviewed]
+    return visible[:limit] if limit else visible, hidden
+
+
+def find_orphans(
+    sessions: Sequence[SessionProse],
+    sink_text: str,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    min_tf: int = DEFAULT_MIN_TF,
+    min_human_chars: int = DEFAULT_MIN_HUMAN_CHARS,
+    min_orphans: int = DEFAULT_MIN_ORPHANS,
+    include_headless: bool = False,
+    reviewed: frozenset[str] = frozenset(),
+    show_reviewed: bool = False,
+    limit: int = DEFAULT_LIMIT,
+) -> list[Candidate]:
+    """Nominate sessions whose unique terms appear in no sink text.
+
+    *sessions* is the whole corpus: document frequency is taken over all of
+    it -- headless sessions included, so an SDK / headless (``sdk-*``)
+    session's terms keep their owners' words from looking unique -- and only
+    the nomination is restricted by the window, thresholds, the headless
+    exclusion and the ``reviewed`` mark.  A session whose ``session_id`` is in
+    *reviewed* is skipped unless *show_reviewed* -- every file of that session
+    is hidden, because the key is the session id, not the transcript file --
+    but it still counts toward document frequency exactly like a headless or
+    out-of-window session.
+    """
+    candidates, _ = _nominate(
+        sessions,
+        sink_text,
+        since=since,
+        until=until,
+        min_tf=min_tf,
+        min_human_chars=min_human_chars,
+        min_orphans=min_orphans,
+        include_headless=include_headless,
+        reviewed=reviewed,
+        show_reviewed=show_reviewed,
+        limit=limit,
+    )
+    return candidates
+
+
+def find_orphans_with_hidden(
+    sessions: Sequence[SessionProse],
+    sink_text: str,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    min_tf: int = DEFAULT_MIN_TF,
+    min_human_chars: int = DEFAULT_MIN_HUMAN_CHARS,
+    min_orphans: int = DEFAULT_MIN_ORPHANS,
+    include_headless: bool = False,
+    reviewed: frozenset[str] = frozenset(),
+    show_reviewed: bool = False,
+    limit: int = DEFAULT_LIMIT,
+) -> tuple[list[Candidate], int]:
+    """Like :func:`find_orphans`, but also reports how many would-be
+    candidates the ``reviewed`` mark hid (0 with ``show_reviewed``).
+    """
+    return _nominate(
+        sessions,
+        sink_text,
+        since=since,
+        until=until,
+        min_tf=min_tf,
+        min_human_chars=min_human_chars,
+        min_orphans=min_orphans,
+        include_headless=include_headless,
+        reviewed=reviewed,
+        show_reviewed=show_reviewed,
+        limit=limit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -461,11 +781,15 @@ def payload_header(
     min_orphans: int,
     include_headless: bool,
     limit: int,
+    reviewed_hidden: int = 0,
+    reviewed_file: str | None = None,
 ) -> dict[str, Any]:
     """The corpus and threshold block that opens the ``--json`` document."""
     return {
         "sessions_with_prose": n_sessions,
         "sink_files": n_sink_files,
+        "reviewed_hidden": reviewed_hidden,
+        "reviewed_file": reviewed_file,
         "thresholds": {
             "min_tf": min_tf,
             "min_human_chars": min_human_chars,
@@ -489,6 +813,7 @@ def _header(
     min_orphans: int,
     include_headless: bool,
     limit: int,
+    reviewed_hidden: int = 0,
 ) -> str:
     window = ""
     if since is not None:
@@ -500,6 +825,7 @@ def _header(
         f"sinks: {n_sink_files} file{'' if n_sink_files == 1 else 's'}, "
         f"min-tf={min_tf} min-human-chars={min_human_chars} min-orphans={min_orphans} "
         f"include-headless={'yes' if include_headless else 'no'} limit={limit}{window}"
+        f" reviewed-hidden={reviewed_hidden}"
     )
 
 
@@ -516,10 +842,13 @@ def run(
     include_headless: bool = False,
     limit: int = DEFAULT_LIMIT,
     json_output: bool = False,
+    reviewed_file: Path | None = None,
+    show_reviewed: bool = False,
     out: Any = None,
     err: Any = None,
 ) -> int:
-    """Nominate candidates and render them.  Returns 0, or 1 if the db is unreadable."""
+    """Nominate candidates and render them.  Returns 0, or 1 if the database
+    or the reviewed file is unreadable."""
     if out is None:
         out = sys.stdout
     if err is None:
@@ -551,7 +880,16 @@ def run(
             file=err,
         )
 
-    candidates = find_orphans(
+    reviewed_path = (
+        Path(reviewed_file) if reviewed_file is not None else default_reviewed_path(db_path)
+    )
+    try:
+        reviewed = read_reviewed(reviewed_path)
+    except (OSError, ValueError) as error:
+        print(f"error: cannot read reviewed file {reviewed_path}: {error}", file=err)
+        return 1
+
+    candidates, reviewed_hidden = find_orphans_with_hidden(
         sessions,
         loaded.text,
         since=since,
@@ -560,6 +898,8 @@ def run(
         min_human_chars=min_human_chars,
         min_orphans=min_orphans,
         include_headless=include_headless,
+        reviewed=reviewed,
+        show_reviewed=show_reviewed,
         limit=limit,
     )
     header = payload_header(
@@ -572,10 +912,15 @@ def run(
         min_orphans=min_orphans,
         include_headless=include_headless,
         limit=limit,
+        reviewed_hidden=reviewed_hidden,
+        reviewed_file=str(reviewed_path),
     )
 
     if json_output:
-        payload = {**header, "candidates": [c.to_dict() for c in candidates]}
+        payload = {
+            **header,
+            "candidates": [c.to_dict(include_reviewed=show_reviewed) for c in candidates],
+        }
         print(json.dumps(payload, indent=2, ensure_ascii=False), file=out)
         return 0
 
@@ -590,13 +935,15 @@ def run(
             min_orphans=min_orphans,
             include_headless=include_headless,
             limit=limit,
+            reviewed_hidden=reviewed_hidden,
         ),
         file=out,
     )
     for c in candidates:
         started = c.started_at.isoformat(sep=" ") if c.started_at else "?"
+        mark = " [reviewed]" if c.reviewed else ""
         print("", file=out)
-        print(f"session {c.session_id}  {started}  {c.project_dir or '?'}", file=out)
+        print(f"session {c.session_id}{mark}  {started}  {c.project_dir or '?'}", file=out)
         print(
             f"  tool_calls={c.n_tool_calls}  human_chars={c.human_chars}  "
             f"unique={c.n_unique}  orphan={c.n_orphan}  "
