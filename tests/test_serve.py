@@ -325,6 +325,43 @@ def test_session_page_names_an_unknown_or_ambiguous_prefix(served: Served) -> No
     assert "sess-alpha" in ambiguous.body and "sess-gamma" in ambiguous.body
 
 
+def test_session_page_shows_the_outline_above_the_timeline(served: Served) -> None:
+    body = served.get("/session/sess-alpha").body
+    outline = _table(body, "t-outline")
+    assert outline.count("<tr>") == 2  # header + the one segment
+    assert "2026-03-01 10:00:00" in outline  # the segment's time range
+    assert "1 exchange" in body  # the header line names the exchange count
+    # Transcript text inside the outline is escaped, exactly like the timeline.
+    assert ESCAPED_SCRIPT in outline
+    assert SCRIPT not in outline
+    assert "zorblax" in outline
+    # The outline sits above the timeline.
+    assert body.index("t-outline") < body.index("t-trace")
+
+
+def test_session_outline_is_cached_until_the_database_changes(
+    served: Served, fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+    real = serve.topics_outline
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(serve, "topics_outline", counting)
+    for _ in range(3):
+        assert served.get("/session/sess-alpha").status == 200
+    assert len(calls) == 1
+
+    stat = fixture.db.stat()
+    os.utime(fixture.db, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    assert served.get("/session/sess-alpha").status == 200
+    assert len(calls) == 2
+    assert served.get("/session/sess-alpha").status == 200
+    assert len(calls) == 2
+
+
 # ---------------------------------------------------------------- JSON
 
 

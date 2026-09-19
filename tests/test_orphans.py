@@ -100,6 +100,8 @@ def _records(
             record["isMeta"] = True
         if event["kind"] == "sidechain":
             record["isSidechain"] = True
+        if event["kind"] == "compaction":
+            record["isCompactSummary"] = True
         if entrypoint is not None:
             record["entrypoint"] = entrypoint
         records.append(record)
@@ -451,6 +453,69 @@ def test_session_id_fan_out_does_not_double_count(tmp_path: Path) -> None:
         connection.close()
 
     assert sorted(s.human_chars for s in sessions) == [len("first file"), len("second file text")]
+
+
+def test_compaction_summary_rows_contribute_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A resumed session's machine-written recap: user rows whose raw JSON marks
+    # them isCompactSummary.  They are not human prose -- no chars, no terms,
+    # no first utterance -- so they cannot inflate a candidate.
+    summary = "continuationword " * 60 + "recapword " * 60
+    db = make_db(
+        tmp_path,
+        [
+            (
+                "ses-a",
+                "2026-08-01",
+                [
+                    human(summary, kind="compaction"),
+                    human("plain question"),
+                    human(LONG + "zorblax zorblax zorblax"),
+                    human("<system-reminder>x</system-reminder>", kind="compaction"),
+                ],
+            ),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+            ("ses-c", "2026-08-03", [human(LONG)]),
+        ],
+    )
+    connection = connect(db, read_only=True)
+    try:
+        sessions = {s.session_id: s for s in collect_sessions(connection)}
+    finally:
+        connection.close()
+    a = sessions["ses-a"]
+    expected = len("plain question") + len(LONG + "zorblax zorblax zorblax")
+    assert a.human_chars == expected
+    assert a.first_utterance == "plain question"
+    assert "continuationword" not in a.terms
+    assert "recapword" not in a.terms
+
+    # ...and on the orphans output, the candidate carries the same reduced size.
+    payload = _run_json(db, "--min-human-chars", "100", "--min-orphans", "1", capsys=capsys)
+    candidate = _by_id(payload)["ses-a"]
+    assert candidate["human_chars"] == expected
+    assert candidate["orphan_terms"] == ["zorblax"]
+    assert candidate["first_utterance"] == "plain question"
+
+
+def test_a_summary_only_session_has_no_prose(tmp_path: Path) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-a", "2026-08-01", [human("continuationword " * 50, kind="compaction")]),
+            ("ses-b", "2026-08-02", [human(LONG)]),
+            ("ses-c", "2026-08-03", [human(LONG)]),
+        ],
+    )
+    connection = connect(db, read_only=True)
+    try:
+        sessions = {s.session_id: s for s in collect_sessions(connection)}
+    finally:
+        connection.close()
+
+    assert "ses-a" not in sessions
+    assert "continuationword" not in sessions["ses-b"].terms
 
 
 # ---------------------------------------------------------------- criterion 4: identifiers

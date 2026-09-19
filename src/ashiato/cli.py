@@ -58,6 +58,9 @@ from ashiato.session_trace import (
 )
 from ashiato.session_trace import SessionResolutionError, resolve_session
 from ashiato.session_trace import trace as session_trace
+from ashiato.topics import DEFAULT_TERMS as DEFAULT_TOPICS_TERMS
+from ashiato.topics import DEFAULT_WINDOW as DEFAULT_TOPICS_WINDOW
+from ashiato.topics import run as topics_run
 
 FORMATS = ("table", "json", "csv")
 
@@ -174,6 +177,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="maximum characters of each text/result excerpt, 0 for uncapped "
         f"(default {DEFAULT_SESSION_TRACE_EXCERPT})",
+    )
+
+    topics_parser = subparsers.add_parser(
+        "topics",
+        help="a deterministic topic outline of one session, segmented without an LLM",
+    )
+    topics_parser.add_argument(
+        "session_prefix",
+        metavar="SESSION_PREFIX",
+        help="session id, or a unique prefix of it",
+    )
+    topics_parser.add_argument("--db", metavar="PATH", help="database path")
+    topics_parser.add_argument(
+        "--window",
+        type=_positive,
+        default=DEFAULT_TOPICS_WINDOW,
+        metavar="N",
+        help="exchanges on each side of a candidate boundary gap, at least 1 "
+        f"(default {DEFAULT_TOPICS_WINDOW})",
+    )
+    topics_parser.add_argument(
+        "--terms",
+        type=_row_limit,
+        default=DEFAULT_TOPICS_TERMS,
+        metavar="N",
+        help=f"topic terms per segment (default {DEFAULT_TOPICS_TERMS})",
+    )
+    topics_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="output as JSON"
     )
 
     info_parser = subparsers.add_parser("info", help="describe the database")
@@ -520,6 +552,13 @@ def _row_limit(value: str) -> int:
     return number
 
 
+def _positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 1 or greater")
+    return number
+
+
 def _port(value: str) -> int:
     number = int(value)
     if not 0 <= number <= 65535:
@@ -736,6 +775,18 @@ def _run_session_trace(args: argparse.Namespace, out: Any, err: Any) -> int:
     else:
         _print_session_trace_table(payload, out)
     return 0
+
+
+def _run_topics(args: argparse.Namespace, out: Any, err: Any) -> int:
+    return topics_run(
+        _resolve_db(args.db),
+        args.session_prefix,
+        window=args.window,
+        terms=args.terms,
+        json_output=args.json_output,
+        out=out,
+        err=err,
+    )
 
 
 def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
@@ -1285,6 +1336,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_recalls(args, out, err)
     if args.command == "session-trace":
         return _run_session_trace(args, out, err)
+    if args.command == "topics":
+        return _run_topics(args, out, err)
     if args.command == "info":
         return _run_info(args, out, err)
     if args.command == "schema":
