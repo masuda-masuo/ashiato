@@ -54,6 +54,27 @@ class CodexTextChunk:
 
 
 @dataclass(slots=True)
+class CodexEvent:
+    """One non-text event in a Codex session (e.g. a context compaction).
+
+    Text messages become :class:`CodexTextChunk`; this carries the item types
+    that must surface as ``events`` rows with a type of their own (a
+    ``ContextCompaction`` item) rather than as assistant text.
+    """
+
+    event_id: str
+    session_id: str | None
+    file_path: str
+    seq: int
+    ts: datetime | None
+    type: str
+    text: str | None
+    #: The verbatim item JSON, so the ``events.raw`` promise ("nothing is
+    #: dropped") holds for these rows too.
+    raw: str
+
+
+@dataclass(slots=True)
 class ParsedCodexFile:
     """Everything one Codex session JSONL file contributes to ashiato."""
 
@@ -61,6 +82,7 @@ class ParsedCodexFile:
     session_id: str | None
     tool_calls: list[CodexToolCall]
     text_chunks: list[CodexTextChunk]
+    events: list[CodexEvent]
     n_parse_errors: int
     #: Earliest timestamp across all records (min of record timestamps).
     started_at: datetime | None
@@ -165,6 +187,7 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
 
     tool_calls: list[CodexToolCall] = []
     text_chunks: list[CodexTextChunk] = []
+    events: list[CodexEvent] = []
 
     timestamps: list[datetime] = []
     # Accumulate thread_token_usage; last token_usage_record wins.
@@ -266,6 +289,102 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                             seq=seq,
                             record_ts=record_ts,
                         )
+                    elif item_type == "FileChange":
+                        # The only record of which host files a Codex session
+                        # edited: one row whose input carries the paths (as a
+                        # ``files`` list and as the keys of the verbatim
+                        # ``changes`` payload) and whose result is the tool's
+                        # own stdout.
+                        changes = item.get("changes")
+                        if not isinstance(changes, dict):
+                            changes = {}
+                        files = [path for path in changes if isinstance(path, str)]
+                        stderr = item.get("stderr")
+                        tool_calls.append(
+                            CodexToolCall(
+                                call_id=str(item_id),
+                                session_id=session_id,
+                                file_path=file_path,
+                                seq=seq,
+                                ts=record_ts,
+                                tool_name="FileChange",
+                                input={"files": files, "changes": changes},
+                                output=str(item.get("stdout")) if item.get("stdout") else None,
+                                status=item.get("status"),
+                                error=stderr if isinstance(stderr, str) and stderr else None,
+                                duration_ms=_duration_to_ms(item.get("duration")),
+                            )
+                        )
+                    elif item_type == "CollabAgentToolCall":
+                        # A delegation record: the parent session calling its
+                        # collaboration tool (``tool``, e.g. ``wait``), with
+                        # the receiver thread/agent fields when the item
+                        # carries them.
+                        tool = item.get("tool")
+                        collab_input: dict[str, object] = {}
+                        for key in ("sender_thread_id", "receiver_thread_ids",
+                                    "receiver_agents", "agents_states"):
+                            value = item.get(key)
+                            if value is not None:
+                                collab_input[key] = value
+                        tool_calls.append(
+                            CodexToolCall(
+                                call_id=str(item_id),
+                                session_id=session_id,
+                                file_path=file_path,
+                                seq=seq,
+                                ts=record_ts,
+                                tool_name=(
+                                    f"collab__{tool}" if isinstance(tool, str) and tool
+                                    else "CollabAgentToolCall"
+                                ),
+                                input=collab_input,
+                                output=None,
+                                status=item.get("status"),
+                                duration_ms=_duration_to_ms(item.get("duration")),
+                            )
+                        )
+                    elif item_type == "SubAgentActivity":
+                        # The subagent's side of the delegation: one row per
+                        # activity (``kind``: started / interacted / completed)
+                        # naming the agent's thread and path when carried.
+                        subagent_input: dict[str, object] = {}
+                        for key in ("kind", "agent_thread_id", "agent_path"):
+                            value = item.get(key)
+                            if value is not None:
+                                subagent_input[key] = value
+                        tool_calls.append(
+                            CodexToolCall(
+                                call_id=str(item_id),
+                                session_id=session_id,
+                                file_path=file_path,
+                                seq=seq,
+                                ts=record_ts,
+                                tool_name="collab__subagent",
+                                input=subagent_input,
+                                output=None,
+                                status=item.get("status"),
+                                duration_ms=_duration_to_ms(item.get("duration")),
+                            )
+                        )
+                    elif item_type == "ContextCompaction":
+                        # A compaction marker becomes an events row with a type
+                        # of its own (never assistant text), so a session's
+                        # compaction points are queryable.  The item itself
+                        # carries only an id; the verbatim item JSON is kept in
+                        # ``raw``.
+                        events.append(
+                            CodexEvent(
+                                event_id=str(item_id),
+                                session_id=session_id,
+                                file_path=file_path,
+                                seq=seq,
+                                ts=record_ts,
+                                type="context_compaction",
+                                text=None,
+                                raw=json.dumps(item, ensure_ascii=False),
+                            )
+                        )
 
         elif rec_type == "response_item":
             # Live Codex text: top-level response_item with payload.type == "message"
@@ -298,6 +417,7 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
         session_id=session_id,
         tool_calls=tool_calls,
         text_chunks=text_chunks,
+        events=events,
         n_parse_errors=n_parse_errors,
         started_at=started_at,
         ended_at=ended_at,

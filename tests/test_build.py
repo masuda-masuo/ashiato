@@ -2788,3 +2788,181 @@ def test_connect_disables_progress_bar(
     finally:
         connection.close()
     assert setting == (False,)
+def test_codex_build_file_change_rows_identify_touched_files(tmp_path: Path):
+    """A FileChange item inserts a tool_calls row whose files are queryable."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "file-change.jsonl",
+        "codex-fc",
+        [
+            {
+                "type": "FileChange",
+                "id": "fc-1",
+                "changes": {
+                    "/work/src/foo.py": {"type": "edit", "content": "x"},
+                    "/work/src/bar.py": {"type": "delete"},
+                },
+                "status": "completed",
+                "stdout": "Success. Updated the following files:\nM /work/src/foo.py\n",
+                "stderr": "",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_fc.duckdb"
+    result = build([], db_path, codex_sources=[codex_dir])
+    assert result.n_tool_calls == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT tool_name, input, outcome, is_error FROM tool_calls WHERE tool_use_id = 'fc-1'"
+        ).fetchone()
+        assert row is not None
+        tool_name, input_json, outcome, is_error = row
+        assert tool_name == "FileChange"
+        # Both touched files are reachable in the input JSON.
+        assert "src/foo.py" in input_json
+        assert "src/bar.py" in input_json
+        assert scalar(
+            connection,
+            "SELECT count(*) FROM tool_calls WHERE tool_name = 'FileChange' "
+            "AND input LIKE '%src/foo.py%'",
+        ) == 1
+        # completed status + stdout -> a clean success.
+        assert outcome == "ok"
+        assert is_error is False
+    finally:
+        connection.close()
+
+
+def test_codex_build_collab_and_subagent_rows_carry_agent(tmp_path: Path):
+    """Delegation items insert rows; the delegated agent is reachable."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "delegation.jsonl",
+        "codex-del",
+        [
+            {
+                "type": "CollabAgentToolCall",
+                "id": "call-wait-1",
+                "tool": "wait",
+                "status": "completed",
+                "sender_thread_id": "thread-parent",
+                "receiver_thread_ids": ["thread-child"],
+                "receiver_agents": ["sol"],
+                "agents_states": {},
+            },
+            {
+                "type": "SubAgentActivity",
+                "id": "call-sa-1",
+                "kind": "started",
+                "agent_thread_id": "agent-1",
+                "agent_path": "/root/kusabi_484_luna",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "codex_del.duckdb"
+    result = build([], db_path, codex_sources=[codex_dir])
+    assert result.n_tool_calls == 2
+
+    connection = connect(db_path, read_only=True)
+    try:
+        names = connection.execute(
+            "SELECT tool_name FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert names == [("collab__wait",), ("collab__subagent",)]
+
+        # The delegated agent is reachable from the collab call's input.
+        collab_input = scalar(
+            connection,
+            "SELECT input FROM tool_calls WHERE tool_use_id = 'call-wait-1'",
+        )
+        assert collab_input is not None
+        assert '"receiver_agents"' in collab_input
+        assert '"sol"' in collab_input
+
+        # And the subagent row names its agent path.
+        subagent_input = scalar(
+            connection,
+            "SELECT input FROM tool_calls WHERE tool_use_id = 'call-sa-1'",
+        )
+        assert subagent_input is not None
+        assert "kusabi_484_luna" in subagent_input
+        assert scalar(
+            connection,
+            "SELECT count(*) FROM tool_calls WHERE tool_name = 'collab__subagent' "
+            "AND input LIKE '%kusabi_484_luna%'",
+        ) == 1
+    finally:
+        connection.close()
+
+
+def test_codex_build_context_compaction_is_its_own_event_type(tmp_path: Path):
+    """A ContextCompaction item inserts an events row with a distinct type."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "compaction.jsonl",
+        "codex-compact",
+        [
+            {"type": "ContextCompaction", "id": "compaction-1"},
+        ],
+    )
+
+    db_path = tmp_path / "codex_compact.duckdb"
+    result = build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        # One events row, with its own type -- never 'text'.
+        rows = connection.execute(
+            "SELECT type, role, text FROM events ORDER BY seq"
+        ).fetchall()
+        assert rows == [("context_compaction", None, "")]
+        assert scalar(connection, "SELECT count(*) FROM events WHERE type = 'text'") == 0
+        # No tool call is produced by a compaction.
+        assert result.n_tool_calls == 0
+        # The event counts toward sessions/source_files n_events.
+        assert scalar(connection, "SELECT n_events FROM sessions") == 1
+        assert scalar(
+            connection,
+            "SELECT n_events FROM source_files WHERE file_path LIKE '%compaction.jsonl'",
+        ) == 1
+    finally:
+        connection.close()
+
+
+def test_codex_build_new_item_types_tolerate_malformed_instances(tmp_path: Path):
+    """Malformed new item types build without raising and keep their rows."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "malformed.jsonl",
+        "codex-mal",
+        [
+            {"type": "FileChange", "id": "fc-1", "changes": "not-a-dict"},
+            {"type": "CollabAgentToolCall", "id": "ca-1", "tool": 42},
+            {"type": "SubAgentActivity", "id": "sa-1", "agent_path": 7},
+            {"type": "ContextCompaction", "id": "cc-1"},
+            {"type": "MysteryFutureItem", "id": "m-1"},
+        ],
+    )
+
+    db_path = tmp_path / "codex_mal.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        # The three malformed-but-known tool calls still get rows; the unknown
+        # type is dropped silently.
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 3
+        assert scalar(
+            connection,
+            "SELECT count(*) FROM events WHERE type = 'context_compaction'",
+        ) == 1
+    finally:
+        connection.close()
