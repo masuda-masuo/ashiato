@@ -45,6 +45,7 @@ import socket
 import sys
 import threading
 import traceback
+from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -86,6 +87,9 @@ from ashiato.session_trace import (
     resolve_session,
     trace,
 )
+from ashiato.topics import DEFAULT_TERMS as DEFAULT_TOPICS_TERMS
+from ashiato.topics import DEFAULT_WINDOW as DEFAULT_TOPICS_WINDOW
+from ashiato.topics import outline as topics_outline
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8772
@@ -158,7 +162,10 @@ class Dashboard:
         self.default_sinks = default_sinks
         self.memory_dirs = list(memory_dirs)
         self._cache: dict[str, tuple[Hashable, Any]] = {}
-        self._locks = {name: threading.Lock() for name in ("orphans", "memory", "denials")}
+        # One lock per cached value name (orphans, memory, denials, and one per
+        # session outline), created on first use.  Locks are never evicted:
+        # acceptable at this scale (one user, hundreds of sessions).
+        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
     # -- database access -------------------------------------------------
 
@@ -341,15 +348,35 @@ class Dashboard:
         }
 
     def session(self, prefix: str) -> dict[str, Any]:
-        """``session-trace`` for a session id or unique prefix, at the CLI defaults."""
+        """``session-trace`` plus the topic outline, for a session id or unique prefix.
+
+        The trace is computed at the CLI defaults; the outline is served from
+        the per-session cache (keyed like the other pages, by the database
+        stamp).  No connection is held between the two lookups, so the
+        per-request connection rule still holds.
+        """
         with self.connection() as connection:
             session_id = resolve_session(connection, prefix)
-            return trace(
+            trace_payload = trace(
                 connection,
                 session_id,
                 limit=DEFAULT_LIMIT,
                 max_excerpt_chars=DEFAULT_EXCERPT_CHARS,
             )
+        return {**trace_payload, "outline": self.topics(session_id)}
+
+    def topics(self, session_id: str) -> dict[str, Any]:
+        """One session's topic outline, cached per database stamp."""
+
+        def compute(connection: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+            return topics_outline(
+                connection,
+                session_id,
+                window=DEFAULT_TOPICS_WINDOW,
+                terms=DEFAULT_TOPICS_TERMS,
+            )
+
+        return self._cached(f"topics:{session_id}", compute)
 
 
 def _memory_flags_current(data: dict[str, Any]) -> bool:
@@ -844,6 +871,38 @@ def render_session(payload: dict[str, Any]) -> str:
         )
         if session.get(key) is not None
     )
+    outline = payload.get("outline")
+    outline_html = ""
+    if outline and outline["segments"]:
+        outline_rows = []
+        for number, segment in enumerate(outline["segments"], start=1):
+            terms = "".join(
+                f'<span class="term">{_e(term)}</span>' for term in segment["terms"]
+            )
+            range_cell = (
+                f"{_e(segment['start_ts']) or '&mdash;'} &rarr; "
+                f"{_e(segment['end_ts']) or '&mdash;'}"
+            )
+            outline_rows.append(
+                [
+                    _e(number),
+                    range_cell,
+                    terms or '<span class="dim">&mdash;</span>',
+                    _long(segment["opening"]),
+                ]
+            )
+        title_html = (
+            _e(outline["title"]) if outline["title"] else '<span class="dim">no title</span>'
+        )
+        outline_html = (
+            "<h2>Outline</h2>"
+            f'<p class="dim">{title_html} &mdash; {_e(outline["n_exchanges"])} exchanges</p>'
+            + _table(
+                "t-outline",
+                (("#", "n"), ("range", "m"), ("terms", ""), ("opening", "")),
+                outline_rows,
+            )
+        )
     rows = []
     for row in payload["timeline"]:
         if row["kind"] == "text":
@@ -904,6 +963,7 @@ def render_session(payload: dict[str, Any]) -> str:
         "<h1>session</h1>"
         f'<p class="mono">{_e(session["session_id"])}</p>'
         f'<p class="lede">{meta}</p>'
+        f"{outline_html}"
         f'<p class="dim">Showing {coverage["returned"]} of {coverage["total"]} rows.{cut}</p>'
         f"{_filter_box('t-trace')}{timeline}"
     )

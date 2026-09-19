@@ -42,6 +42,7 @@ ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-def
 ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]... [--model NAME] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
+ashiato topics SESSION_PREFIX [--db PATH] [--window N] [--terms N] [--json]
 ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
 ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-default-sinks] [--memory-dir PATH]...
 ```
@@ -141,7 +142,10 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   occur in no other session in the whole database, at least `--min-tf N` times (default 3);
   (2) it is a **discussion** -- its human-typed text, with harness wrappers such as
   `<system-reminder>` and `<local-command-stdout>` blocks stripped, is at least
-  `--min-human-chars N` characters (default 800); (3) it is **not persisted** -- none of
+  `--min-human-chars N` characters (default 800); compaction summaries -- Claude Code's
+  machine-written "this session is being continued from a previous conversation" recaps,
+  recognised by `"isCompactSummary": true` in the row's `raw` JSON -- are not human text and
+  contribute nothing: no characters, no terms, no first utterance; (3) it is **not persisted** -- none of
   those unique terms appears in any *sink*; and (4) it is **worth reading** -- at least
   `--min-orphans N` distinct orphan terms (default 3; density is noisy for tiny counts), and it
   is not a *headless* session (an SDK / headless entrypoint, `sdk-*` -- kusabi workers,
@@ -272,6 +276,35 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   which may contain harness noise the trace does not display. The command
   is read-only: it opens the database with `read_only` and writes nothing.
 
+- `topics` renders one session as a deterministic topic outline -- no LLM, no
+  embeddings -- because a session's stored title (`ai-title`) is generated once
+  from the first prompt and never updated, so a long session's label says
+  nothing about what it was really about. The outline is derived from the
+  session's own words in four mechanical steps: (1) **exchanges** -- the
+  session's user/assistant text rows in transcript order, excluding meta and
+  sidechain rows, tool-result user rows and compaction summaries (Claude
+  Code's machine-written "this session is being continued" recaps, recognised
+  by `"isCompactSummary": true` in `raw`), and deduplicated by the row's
+  `uuid` so a resumed session that re-persists the same messages does not
+  double them; each non-empty human row opens an exchange and the following
+  assistant text is appended to it; (2) **weights** -- tf-idf with document
+  frequency over the whole database exactly as `orphans` computes it, dropping
+  terms that occur in more than 30% of sessions; (3) **boundaries** --
+  TextTiling-style: a gap between exchanges is a segment boundary when the
+  cosine similarity of the summed `--window N` exchanges on each side (default
+  3) is a local minimum below `mean - 0.5 * sd` of all gap similarities, and a
+  session with fewer than `2 * window` exchanges is one segment; (4)
+  **segments** -- each carries its exchange range, start/end timestamps,
+  exchange count, the top `--terms N` topic terms by in-segment tf-idf
+  (default 8) and the opening (first human text, collapsed, 160 chars). The
+  header carries `session_id`, `project_dir`, the latest `custom-title` if the
+  human set one (else the latest `ai-title`) and the exchange count. The
+  `SESSION_PREFIX` argument resolves exactly like `session-trace` (exact id
+  wins, otherwise a unique prefix; a missing or ambiguous prefix is a clean
+  error on stderr, exit code 1). `--json` prints one document with the header
+  and the ordered `segments`. This is report-only: it reads the database and
+  writes nothing, and the same bytes always produce the same outline.
+
 - `serve` runs a read-only local dashboard so the analyses can be glanced at in a browser
   instead of run one by one. It is a stdlib HTTP server (no new dependency) rendering
   `info`, `orphans`, `memory-authors`, `denials`, `hygiene` and `session-trace` as HTML:
@@ -280,8 +313,9 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   candidates, unattributed memory files and denied calls), `/orphans` (the top 30
   candidates by density), `/memory` (`?model=NAME` filters like `memory-authors --model`),
   `/denials` (the 50 most recent denials with what the session did next, then the `hygiene`
-  categories) and `/session/<id-or-prefix>` (the `session-trace` timeline; an unknown or
-  ambiguous prefix is a 404 naming the problem). `/api/orphans.json`, `/api/memory.json` and
+  categories) and `/session/<id-or-prefix>` (the `session-trace` timeline with the session's
+  `topics` outline -- a compact table of time range, topic terms and opening -- above it; an
+  unknown or ambiguous prefix is a 404 naming the problem). `/api/orphans.json`, `/api/memory.json` and
   `/api/denials.json` return the same data as JSON, in the shape of the matching command's
   `--json` / `--format json` output. `/api/overview.json` (also `/api/info.json`) has no
   command to mirror, since `info` prints no JSON: it is one object with `db_path`,

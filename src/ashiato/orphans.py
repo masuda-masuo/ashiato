@@ -122,12 +122,34 @@ def tokenize(text: str) -> list[str]:
     return terms
 
 
+def is_compaction_summary(raw: str | None) -> bool:
+    """True when a user row's ``raw`` marks it as a compaction summary.
+
+    Claude Code's continuation message (\"This session is being continued from
+    a previous conversation ...\") is a user row whose JSON carries
+    ``\"isCompactSummary\": true``.  ``raw`` is not always valid JSON (other
+    source formats store different text there), so it is parsed defensively:
+    anything unparseable, or missing the flag, is not a summary.  Machine-written
+    recaps of earlier content must not count as human prose.
+    """
+    if not raw:
+        return False
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return False
+    return record.get("isCompactSummary") is True
+
+
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
 
 # Join on file_path, never session_id: a session_id fans out across files.
 # Tool results are user-role rows carrying ``"tool_result"`` in ``raw``.
+# ``raw`` is selected too: compaction summaries (a user row whose JSON carries
+# ``"isCompactSummary": true``) must not count as human prose, and whether a
+# row is one is decided in Python by :func:`is_compaction_summary`.
 _EVENTS_QUERY = """
     SELECT
         s.file_path,
@@ -137,7 +159,8 @@ _EVENTS_QUERY = """
         s.n_tool_calls,
         s.entrypoint,
         e.role,
-        e.text
+        e.text,
+        e.raw
     FROM events e
     JOIN sessions s ON e.file_path = s.file_path
     WHERE e.role IN ('user', 'assistant')
@@ -207,6 +230,7 @@ def collect_sessions(connection: duckdb.DuckDBPyConnection) -> list[SessionProse
         entrypoint,
         role,
         text,
+        raw,
     ) in _iter_rows(connection):
         if current is None or current.file_path != file_path:
             current = SessionProse(
@@ -218,6 +242,10 @@ def collect_sessions(connection: duckdb.DuckDBPyConnection) -> list[SessionProse
                 entrypoint=entrypoint,
             )
             sessions.append(current)
+        # A compaction summary is a machine-written recap of earlier content,
+        # not something the human typed: it contributes nothing.
+        if role == "user" and is_compaction_summary(raw):
+            continue
         current.add(role, text)
     return [session for session in sessions if session.has_prose]
 
