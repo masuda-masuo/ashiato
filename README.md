@@ -36,7 +36,7 @@ ashiato schema [TABLE] [--db PATH]
 ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
-ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--limit N] [--json]
+ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
@@ -137,19 +137,28 @@ ashiato compare-periods --period START..END --period START..END [--db PATH] [--f
   occur in no other session in the whole database, at least `--min-tf N` times (default 3);
   (2) it is a **discussion** -- its human-typed text, with harness wrappers such as
   `<system-reminder>` and `<local-command-stdout>` blocks stripped, is at least
-  `--min-human-chars N` characters (default 800); and (3) it is **not persisted** -- none of
-  those unique terms appears in any *sink*. `--sink PATH` (repeatable) names a file or a
+  `--min-human-chars N` characters (default 800); (3) it is **not persisted** -- none of
+  those unique terms appears in any *sink*; and (4) it is **worth reading** -- at least
+  `--min-orphans N` distinct orphan terms (default 3; density is noisy for tiny counts), and it
+  is not a *headless* session (an SDK / headless entrypoint, `sdk-*` -- kusabi workers,
+  subagents -- whose
+  "human" text is a machine-written brief) unless `--include-headless` is given. `--sink PATH`
+  (repeatable) names a file or a
   directory, walked recursively, of text the topic might have been written down in; without
   `--sink` the sinks are every existing `~/.claude/projects/*/memory` directory, and
   `--no-default-sinks` turns that default off. A sink path that does not exist is a warning on
   stderr, not an error, and with no sink text at all every unique term counts as an orphan
   (say so on stderr). Terms are lowercased words of 4+ Latin characters, katakana runs and
-  kanji runs; code identifiers (containing `_`) and hex/UUID ids are dropped. Uniqueness is
-  always measured over every session that has prose: `--since TS` / `--until TS` only
-  restrict which sessions are *nominated*, so a window never makes an old topic look unique.
-  Candidates are ranked by number of orphan terms, then human-typed length, and `--limit N`
-  caps them (default 20, `0` for all); each shows the session, its top orphan terms and the
-  first thing the human said. `--json` prints one document with the header and the same
+  kanji runs; code identifiers (containing `_`), hex/UUID ids and mixed letter+digit tokens
+  such as `bk7tgrw6i` or `urllib3` are dropped. Uniqueness is
+  always measured over every session that has prose -- headless ones included -- so
+  `--since TS` / `--until TS` only
+  restrict which sessions are *nominated*, and a window never makes an old topic look unique.
+  Candidates are ranked by orphan density (orphan terms per thousand terms), then number of
+  orphan terms, then human-typed length, and `--limit N`
+  caps them (default 20, `0` for all); each shows the session, its density, its top orphan
+  terms and the first thing the human said. `--json` prints one document with the header and
+  the same
   fields. This is report-only: it never writes anything. Known limit: *absence of the words is
   not absence of the idea* -- a topic saved under different words is still nominated, and a
   topic whose words happen to appear in a sink is missed. It is a nomination only; judging

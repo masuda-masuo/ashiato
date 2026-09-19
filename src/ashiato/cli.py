@@ -34,7 +34,7 @@ from ashiato.grep import window as grep_window
 from ashiato.hygiene import audit as hygiene_audit
 from ashiato.nominate import run as nominate_run
 from ashiato.orphans import DEFAULT_LIMIT as DEFAULT_ORPHANS_LIMIT
-from ashiato.orphans import DEFAULT_MIN_HUMAN_CHARS, DEFAULT_MIN_TF
+from ashiato.orphans import DEFAULT_MIN_HUMAN_CHARS, DEFAULT_MIN_ORPHANS, DEFAULT_MIN_TF
 from ashiato.orphans import run as orphans_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
@@ -300,6 +300,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="minimum characters of human-typed text in a session "
         f"(default {DEFAULT_MIN_HUMAN_CHARS})",
+    )
+    orphans_parser.add_argument(
+        "--min-orphans",
+        type=_row_limit,
+        default=DEFAULT_MIN_ORPHANS,
+        metavar="N",
+        help="minimum distinct orphan terms for a session to be nominated "
+        f"(default {DEFAULT_MIN_ORPHANS})",
+    )
+    orphans_parser.add_argument(
+        "--include-headless",
+        action="store_true",
+        help="also nominate headless (sdk-cli entrypoint) sessions, whose "
+        "'human' text is a machine-written brief",
     )
     orphans_parser.add_argument(
         "--limit",
@@ -831,6 +845,8 @@ def _run_orphans(args: argparse.Namespace, out: Any, err: Any) -> int:
         default_sinks=not args.no_default_sinks,
         min_tf=args.min_tf,
         min_human_chars=args.min_human_chars,
+        min_orphans=args.min_orphans,
+        include_headless=args.include_headless,
         limit=args.limit,
         json_output=args.json_output,
         out=out,

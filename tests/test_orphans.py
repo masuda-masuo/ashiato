@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,9 +19,11 @@ import pytest
 from ashiato.build import build, connect
 from ashiato.cli import main
 from ashiato.orphans import (
+    SessionProse,
     collect_sessions,
     default_sink_dirs,
     find_orphans,
+    is_headless,
     load_sinks,
     run,
     strip_harness,
@@ -63,7 +66,12 @@ def assistant(text: str, *, kind: str = "text") -> dict[str, Any]:
     return _event("assistant", text, kind=kind)
 
 
-def _records(session_id: str, day: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _records(
+    session_id: str,
+    day: str,
+    events: list[dict[str, Any]],
+    entrypoint: str | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     parent = None
     for index, event in enumerate(events):
@@ -92,18 +100,27 @@ def _records(session_id: str, day: str, events: list[dict[str, Any]]) -> list[di
             record["isMeta"] = True
         if event["kind"] == "sidechain":
             record["isSidechain"] = True
+        if entrypoint is not None:
+            record["entrypoint"] = entrypoint
         records.append(record)
         parent = uuid
     return records
 
 
-def make_db(tmp_path: Path, sessions: list[tuple[str, str, list[dict[str, Any]]]]) -> Path:
-    """Build a DuckDB from ``(session_id, "YYYY-MM-DD", events)`` sessions."""
+def make_db(tmp_path: Path, sessions: list[tuple[Any, ...]]) -> Path:
+    """Build a DuckDB from ``(session_id, "YYYY-MM-DD", events)`` sessions;
+    an optional fourth element sets the session ``entrypoint`` (e.g. ``"sdk-cli"``,
+    ``"sdk-py"``)."""
     directory = tmp_path / "transcripts"
     directory.mkdir(exist_ok=True)
-    for index, (session_id, day, events) in enumerate(sessions):
+    for index, item in enumerate(sessions):
+        session_id, day, events = item[0], item[1], item[2]
+        entrypoint = item[3] if len(item) > 3 else None
         path = directory / f"{index:02d}-{session_id}.jsonl"
-        lines = [json.dumps(record) for record in _records(session_id, day, events)]
+        lines = [
+            json.dumps(record)
+            for record in _records(session_id, day, events, entrypoint=entrypoint)
+        ]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     db_path = tmp_path / "orphans.duckdb"
     build([directory], db_path)
@@ -240,7 +257,9 @@ def test_default_sink_dirs_are_existing_memory_dirs(home: Path) -> None:
 def test_unique_term_is_orphan_and_shared_term_is_not(
     corpus: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    payload = _run_json(corpus, "--min-human-chars", "100", capsys=capsys)
+    payload = _run_json(
+        corpus, "--min-human-chars", "100", "--min-orphans", "1", capsys=capsys
+    )
 
     candidates = _by_id(payload)
     assert set(candidates) == {"ses-a"}  # B and C have nothing unique
@@ -257,7 +276,7 @@ def test_term_in_a_sink_is_not_an_orphan(
     sink = tmp_path / "notes.md"
     sink.write_text("We decided: Wibbleframe is the name.", encoding="utf-8")
 
-    payload = _run_json(corpus, "--sink", str(sink), capsys=capsys)
+    payload = _run_json(corpus, "--sink", str(sink), "--min-orphans", "1", capsys=capsys)
 
     a = _by_id(payload)["ses-a"]
     assert a["orphan_terms"] == ["zorblax"]
@@ -273,14 +292,17 @@ def test_session_whose_unique_terms_are_all_persisted_is_not_nominated(
     sink.mkdir()
     (sink / "a.md").write_text("zorblax and wibbleframe", encoding="utf-8")
 
-    payload = _run_json(corpus, "--sink", str(sink), capsys=capsys)
+    payload = _run_json(corpus, "--sink", str(sink), "--min-orphans", "1", capsys=capsys)
 
     assert payload["candidates"] == []
 
 
 def test_min_tf_is_respected(corpus: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert _by_id(_run_json(corpus, "--min-tf", "3", capsys=capsys))
-    assert _run_json(corpus, "--min-tf", "4", capsys=capsys)["candidates"] == []
+    assert _by_id(_run_json(corpus, "--min-tf", "3", "--min-orphans", "1", capsys=capsys))
+    assert (
+        _run_json(corpus, "--min-tf", "4", "--min-orphans", "1", capsys=capsys)["candidates"]
+        == []
+    )
 
 
 def test_short_session_still_counts_for_document_frequency(
@@ -296,7 +318,7 @@ def test_short_session_still_counts_for_document_frequency(
         ],
     )
 
-    assert _run_json(db, capsys=capsys)["candidates"] == []
+    assert _run_json(db, "--min-orphans", "1", capsys=capsys)["candidates"] == []
 
 
 def test_assistant_text_counts_as_prose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -309,7 +331,7 @@ def test_assistant_text_counts_as_prose(tmp_path: Path, capsys: pytest.CaptureFi
         ],
     )
 
-    assert _run_json(db, capsys=capsys)["candidates"] == []
+    assert _run_json(db, "--min-orphans", "1", capsys=capsys)["candidates"] == []
 
 
 # ---------------------------------------------------------------- criterion 2: wrappers
@@ -453,7 +475,7 @@ def test_identifier_and_hex_tokens_are_never_reported(
         ],
     )
 
-    a = _by_id(_run_json(db, capsys=capsys))["ses-a"]
+    a = _by_id(_run_json(db, "--min-orphans", "1", capsys=capsys))["ses-a"]
 
     assert a["orphan_terms"] == ["realtopic"]
     assert a["n_unique"] == 1
@@ -474,7 +496,7 @@ def test_since_does_not_make_a_shared_term_unique(
         ],
     )
 
-    payload = _run_json(db, "--since", "2026-08-05", capsys=capsys)
+    payload = _run_json(db, "--since", "2026-08-05", "--min-orphans", "1", capsys=capsys)
 
     assert payload["candidates"] == []
     # The corpus is still the whole database.
@@ -493,8 +515,10 @@ def test_since_and_until_window_is_inclusive(
         ],
     )
 
-    everything = set(_by_id(_run_json(db, capsys=capsys)))
-    from_second = set(_by_id(_run_json(db, "--since", "2026-08-02T10:00:00", capsys=capsys)))
+    everything = set(_by_id(_run_json(db, "--min-orphans", "1", capsys=capsys)))
+    from_second = set(
+        _by_id(_run_json(db, "--since", "2026-08-02T10:00:00", "--min-orphans", "1", capsys=capsys))
+    )
     only_second = set(
         _by_id(
             _run_json(
@@ -503,6 +527,8 @@ def test_since_and_until_window_is_inclusive(
                 "2026-08-02T10:00:00",
                 "--until",
                 "2026-08-02T10:00:00",
+                "--min-orphans",
+                "1",
                 capsys=capsys,
             )
         )
@@ -521,7 +547,7 @@ def test_missing_sink_warns_on_stderr_and_exits_zero(
 ) -> None:
     missing = tmp_path / "no-such-notes"
 
-    code = main(["orphans", "--db", str(corpus), "--sink", str(missing)])
+    code = main(["orphans", "--db", str(corpus), "--sink", str(missing), "--min-orphans", "1"])
 
     captured = capsys.readouterr()
     assert code == 0
@@ -532,7 +558,7 @@ def test_missing_sink_warns_on_stderr_and_exits_zero(
 def test_no_sink_text_notes_it_on_stderr(
     corpus: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code = main(["orphans", "--db", str(corpus), "--no-default-sinks"])
+    code = main(["orphans", "--db", str(corpus), "--no-default-sinks", "--min-orphans", "1"])
 
     captured = capsys.readouterr()
     assert code == 0
@@ -548,9 +574,11 @@ def test_default_sinks_are_the_memory_dirs(
     memory.mkdir(parents=True)
     (memory / "note.md").write_text("zorblax wibbleframe", encoding="utf-8")
 
-    with_default = _run_json(corpus, capsys=capsys)
-    without_default = _run_json(corpus, "--no-default-sinks", capsys=capsys)
-    explicit_only = _run_json(corpus, "--sink", str(home), capsys=capsys)
+    with_default = _run_json(corpus, "--min-orphans", "1", capsys=capsys)
+    without_default = _run_json(
+        corpus, "--no-default-sinks", "--min-orphans", "1", capsys=capsys
+    )
+    explicit_only = _run_json(corpus, "--sink", str(home), "--min-orphans", "1", capsys=capsys)
 
     assert with_default["candidates"] == []
     assert with_default["sink_files"] == 1
@@ -570,7 +598,7 @@ def test_explicit_sink_replaces_the_default(
     other = tmp_path / "other.md"
     other.write_text("nothing relevant", encoding="utf-8")
 
-    payload = _run_json(corpus, "--sink", str(other), capsys=capsys)
+    payload = _run_json(corpus, "--sink", str(other), "--min-orphans", "1", capsys=capsys)
 
     assert _by_id(payload)["ses-a"]["n_orphan"] == 2
 
@@ -591,10 +619,15 @@ def test_sessions_below_min_human_chars_are_not_nominated(
         ],
     )
 
-    assert _run_json(db, capsys=capsys)["candidates"] == []
-    lowered = _run_json(db, "--min-human-chars", "100", capsys=capsys)
+    assert _run_json(db, "--min-orphans", "1", capsys=capsys)["candidates"] == []
+    lowered = _run_json(db, "--min-human-chars", "100", "--min-orphans", "1", capsys=capsys)
     assert set(_by_id(lowered)) == {"ses-a"}
-    assert _run_json(db, "--min-human-chars", "100000", capsys=capsys)["candidates"] == []
+    assert (
+        _run_json(db, "--min-human-chars", "100000", "--min-orphans", "1", capsys=capsys)[
+            "candidates"
+        ]
+        == []
+    )
 
 
 def _topics(prefix: str, count: int) -> str:
@@ -618,22 +651,26 @@ def ranked(tmp_path: Path) -> Path:
     )
 
 
-def test_ranking_is_orphans_then_human_chars_then_session_id(
+def test_ranking_is_density_then_orphans_then_chars_then_session_id(
     ranked: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    payload = _run_json(ranked, capsys=capsys)
+    payload = _run_json(ranked, "--min-orphans", "1", capsys=capsys)
 
     ids = [c["session_id"] for c in payload["candidates"]]
-    # ses-tie-a / ses-tie-b differ only in their (equal-length) topic word.
-    assert ids == ["ses-many", "ses-long", "ses-tie-a", "ses-tie-b"]
-    assert _run_json(ranked, capsys=capsys) == payload  # deterministic
+    # Density (orphans per total terms) leads: the terse sessions outrank the
+    # padded ses-long despite having fewer raw orphans, and ses-tie-a /
+    # ses-tie-b tie on everything and differ only in their session id.
+    assert ids == ["ses-many", "ses-tie-a", "ses-tie-b", "ses-long"]
+    assert (
+        _run_json(ranked, "--min-orphans", "1", capsys=capsys) == payload
+    )  # deterministic
 
 
 def test_limit_caps_and_zero_means_all(ranked: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    two = _run_json(ranked, "--limit", "2", capsys=capsys)
-    all_of_them = _run_json(ranked, "--limit", "0", capsys=capsys)
+    two = _run_json(ranked, "--limit", "2", "--min-orphans", "1", capsys=capsys)
+    all_of_them = _run_json(ranked, "--limit", "0", "--min-orphans", "1", capsys=capsys)
 
-    assert [c["session_id"] for c in two["candidates"]] == ["ses-many", "ses-long"]
+    assert [c["session_id"] for c in two["candidates"]] == ["ses-many", "ses-tie-a"]
     assert len(all_of_them["candidates"]) == 4
 
 
@@ -669,6 +706,7 @@ JSON_FIELDS = {
     "human_chars",
     "n_unique",
     "n_orphan",
+    "orphan_density",
     "orphan_terms",
     "first_utterance",
 }
@@ -677,7 +715,7 @@ JSON_FIELDS = {
 def test_json_output_has_the_listed_fields_and_header(
     corpus: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    payload = _run_json(corpus, "--since", "2026-07-01", capsys=capsys)
+    payload = _run_json(corpus, "--since", "2026-07-01", "--min-orphans", "1", capsys=capsys)
 
     (candidate,) = payload["candidates"]
     assert set(candidate) == JSON_FIELDS
@@ -686,11 +724,15 @@ def test_json_output_has_the_listed_fields_and_header(
     assert candidate["n_tool_calls"] == 0
     assert candidate["human_chars"] > 800
     assert candidate["first_utterance"].startswith("we were talking")
+    assert candidate["n_orphan"] == 2
+    assert candidate["orphan_density"] == pytest.approx(2 / 129 * 1000)
     assert payload["sessions_with_prose"] == 3
     assert payload["sink_files"] == 0
     assert payload["thresholds"] == {
         "min_tf": 3,
         "min_human_chars": 800,
+        "min_orphans": 1,
+        "include_headless": False,
         "limit": 20,
         "since": "2026-07-01T00:00:00",
         "until": None,
@@ -700,7 +742,7 @@ def test_json_output_has_the_listed_fields_and_header(
 def test_text_output_has_header_and_one_block_per_candidate(
     corpus: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code = main(["orphans", "--db", str(corpus), "--no-default-sinks"])
+    code = main(["orphans", "--db", str(corpus), "--no-default-sinks", "--min-orphans", "1"])
 
     out = capsys.readouterr().out
     assert code == 0
@@ -709,8 +751,11 @@ def test_text_output_has_header_and_one_block_per_candidate(
     assert "0 files" in header
     assert "min-tf=3" in header
     assert "min-human-chars=800" in header
+    assert "min-orphans=1" in header
+    assert "include-headless=no" in header
     assert out.count("session ses-") == 1
     assert "terms: wibbleframe, zorblax" in out
+    assert "density=15.5" in out
     assert "first: we were talking" in out
     assert out.rstrip().endswith("(1 candidate)")
 
@@ -779,6 +824,171 @@ def test_find_orphans_is_pure_over_prepared_sessions() -> None:
         session("b", 2, "y" * 900),
     ]
 
-    (candidate,) = find_orphans(sessions, "")
+    (candidate,) = find_orphans(sessions, "", min_orphans=1)
     assert candidate.orphan_terms == ["uniqueword"]
-    assert find_orphans(sessions, "mentions uniqueword here") == []
+    assert find_orphans(sessions, "mentions uniqueword here", min_orphans=1) == []
+# ---------------------------------------------------------------- issue #45: precision
+
+
+def test_mixed_letter_digit_tokens_are_dropped() -> None:
+    text = (
+        "bk7tgrw6i c1bf1 x000100000005f1de urllib3 fargate bench-10k "
+        "adr-0010 認知負荷"
+    )
+    assert tokenize(text) == ["fargate", "bench-10k", "adr-0010", "認知負荷"]
+
+
+def test_min_orphans_default_and_flag(
+    corpus: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The corpus's ses-a has exactly two orphan terms: below the default 3.
+    assert (
+        _run_json(corpus, "--min-human-chars", "100", capsys=capsys)["candidates"] == []
+    )
+    one = _run_json(
+        corpus, "--min-human-chars", "100", "--min-orphans", "1", capsys=capsys
+    )
+    assert set(_by_id(one)) == {"ses-a"}
+
+
+def test_ranking_is_by_orphan_density() -> None:
+    def session(file_path: str, day: int, words: list[str], total_terms: int) -> SessionProse:
+        prose = SessionProse(file_path, file_path, datetime(2026, 8, day), None, 0)
+        prose.has_prose = True
+        prose.human_chars = 900
+        prose.terms = Counter({word: 3 for word in words})
+        prose.total_terms = total_terms
+        return prose
+
+    # A small discussion outranks a huge work session despite fewer orphans.
+    small = session("small", 1, [f"small{i}word" for i in range(5)], 200)
+    large = session("large", 2, [f"large{i}word" for i in range(40)], 20_000)
+
+    candidates = find_orphans([small, large], "")
+
+    assert [c.session_id for c in candidates] == ["small", "large"]
+    assert candidates[0].orphan_density == pytest.approx(5 / 200 * 1000)
+    assert candidates[1].orphan_density == pytest.approx(40 / 20_000 * 1000)
+    assert candidates[0].orphan_density > candidates[1].orphan_density
+
+
+def test_is_headless_recognises_sdk_variants() -> None:
+    for entrypoint in ("sdk-cli", "sdk-py", "sdk-ts"):
+        assert is_headless(entrypoint), entrypoint
+    for entrypoint in (None, "cli", "claude-desktop"):
+        assert not is_headless(entrypoint), entrypoint
+
+
+def test_headless_sessions_are_excluded_but_count_for_df(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            (
+                "ses-a",
+                "2026-08-01",
+                [
+                    human(
+                        LONG
+                        + "blorptastic blorptastic blorptastic quuxify quuxify quuxify "
+                        "wibbleframe wibbleframe wibbleframe "
+                        "alphatopic alphatopic alphatopic betatopic betatopic betatopic "
+                        "gammatopic gammatopic gammatopic"
+                    )
+                ],
+                "sdk-cli",
+            ),
+            (
+                "ses-b",
+                "2026-08-02",
+                [human(LONG + "sharedterm sharedterm sharedterm")],
+                "sdk-cli",
+            ),
+            (
+                "ses-c",
+                "2026-08-03",
+                [
+                    human(
+                        LONG
+                        + "alphatopic alphatopic alphatopic betatopic betatopic betatopic "
+                        "gammatopic gammatopic gammatopic sharedterm sharedterm sharedterm"
+                    )
+                ],
+            ),
+            (
+                "ses-d",
+                "2026-08-04",
+                [
+                    human(
+                        LONG
+                        + "soloterm soloterm soloterm anotherword anotherword anotherword "
+                        "thirdword thirdword thirdword"
+                    )
+                ],
+            ),
+            (
+                "ses-e",
+                "2026-08-05",
+                [human(LONG + "zetatopic zetatopic zetatopic")],
+            ),
+            (
+                "ses-f",
+                "2026-08-06",
+                [human(LONG + "zetatopic zetatopic zetatopic")],
+                "sdk-py",
+            ),
+        ],
+    )
+
+    default = _run_json(db, capsys=capsys)
+    # ses-d only: ses-a's unique terms live in a headless session, and the
+    # sdk-cli ses-a/ses-b (and the sdk-py ses-f) still make the shared terms
+    # non-unique for the cli ses-c and ses-e.
+    assert set(_by_id(default)) == {"ses-d"}
+
+    # Even with --min-orphans 1, ses-c and ses-e stay out: their only
+    # candidate terms (alphatopic/betatopic/gammatopic/sharedterm for ses-c,
+    # zetatopic for ses-e) are shared with headless sessions, and headless
+    # sessions count toward document frequency.  If they were dropped from
+    # the df corpus, all of those terms would become unique orphans and these
+    # assertions would fail.
+    sensitive = _run_json(db, "--min-orphans", "1", capsys=capsys)
+    assert set(_by_id(sensitive)) == {"ses-d"}
+
+    # Even when headless sessions are nominatable, ses-c and ses-e still are
+    # not: their terms stay non-unique (df 2) because df counts all sessions.
+    both = _run_json(db, "--include-headless", "--min-orphans", "1", capsys=capsys)
+    assert set(_by_id(both)) == {"ses-a", "ses-d"}
+
+    included = _run_json(db, "--include-headless", capsys=capsys)
+    assert set(_by_id(included)) == {"ses-a", "ses-d"}
+    assert included["thresholds"]["include_headless"] is True
+
+
+def test_total_terms_is_the_sum_of_filtered_term_counts(tmp_path: Path) -> None:
+    db = make_db(
+        tmp_path,
+        [
+            (
+                "ses-a",
+                "2026-08-01",
+                [
+                    human(LONG + "realtopic realtopic realtopic bk7tgrw6i urllib3"),
+                    assistant("fargate bench-10k"),
+                ],
+            )
+        ],
+    )
+    connection = connect(db, read_only=True)
+    try:
+        (session,) = collect_sessions(connection)
+    finally:
+        connection.close()
+
+    # The mixed letter+digit ids are dropped before counting, so the sum of
+    # the kept term counts is exactly the density denominator.
+    assert session.total_terms == sum(session.terms.values())
+    assert session.terms["realtopic"] == 3
+    assert "bk7tgrw6i" not in session.terms
+    assert "urllib3" not in session.terms
