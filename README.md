@@ -36,6 +36,7 @@ ashiato schema [TABLE] [--db PATH]
 ashiato salvage [--db PATH] [--kaiba-db PATH] [--window-minutes N] [--limit N] [--since TS]
 ashiato grep PATTERN [--db PATH] [--format table|json|csv] [--role user|assistant] [--since TS] [--until TS] [--session PREFIX] [-i|--ignore-case] [--tool-calls] [--include-meta] [--context N] [--all-matches] [--whole] [--limit N]
 ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min-stability F] [--exclude-file PATH] [--max-output-chars N] [--json]
+ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--limit N] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato compare-periods --period START..END --period START..END [--db PATH] [--format json|table]
@@ -126,6 +127,34 @@ ashiato compare-periods --period START..END --period START..END [--db PATH] [--f
   `stable-output` (default 1.0), `--since TS` / `--until TS` bound the time
   window, and `--json` outputs full records instead of the default one-line
   table. Exit code `0` when candidates exist, `1` when none.
+
+- `orphans` nominates one-off discussion topics that left no trace. A design chat, a
+  "what do you think about X" or a story idea happens once and never reaches a PR, a memory
+  file or a ledger, and neither `nominate` (which needs repetition across sessions) nor
+  `salvage` (which needs tool-call evidence) can see it. `orphans` finds candidates
+  deterministically -- no LLM, no embeddings -- so a reader only has to look at the top few. A
+  session is nominated when *all* of these hold: (1) it is **unique** -- it contains terms that
+  occur in no other session in the whole database, at least `--min-tf N` times (default 3);
+  (2) it is a **discussion** -- its human-typed text, with harness wrappers such as
+  `<system-reminder>` and `<local-command-stdout>` blocks stripped, is at least
+  `--min-human-chars N` characters (default 800); and (3) it is **not persisted** -- none of
+  those unique terms appears in any *sink*. `--sink PATH` (repeatable) names a file or a
+  directory, walked recursively, of text the topic might have been written down in; without
+  `--sink` the sinks are every existing `~/.claude/projects/*/memory` directory, and
+  `--no-default-sinks` turns that default off. A sink path that does not exist is a warning on
+  stderr, not an error, and with no sink text at all every unique term counts as an orphan
+  (say so on stderr). Terms are lowercased words of 4+ Latin characters, katakana runs and
+  kanji runs; code identifiers (containing `_`) and hex/UUID ids are dropped. Uniqueness is
+  always measured over every session that has prose: `--since TS` / `--until TS` only
+  restrict which sessions are *nominated*, so a window never makes an old topic look unique.
+  Candidates are ranked by number of orphan terms, then human-typed length, and `--limit N`
+  caps them (default 20, `0` for all); each shows the session, its top orphan terms and the
+  first thing the human said. `--json` prints one document with the header and the same
+  fields. This is report-only: it never writes anything. Known limit: *absence of the words is
+  not absence of the idea* -- a topic saved under different words is still nominated, and a
+  topic whose words happen to appear in a sink is missed. It is a nomination only; judging
+  whether a candidate is worth keeping is for the reader. Exit code `0` on success (including
+  no candidates) and `1` when the database cannot be read.
 
 - `hygiene` is a named, read-only audit of session hygiene over `tool_calls`,
   replacing the ad-hoc SQL that used to be rewritten for every such question.

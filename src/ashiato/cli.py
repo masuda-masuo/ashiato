@@ -33,6 +33,9 @@ from ashiato.grep import visible as grep_visible
 from ashiato.grep import window as grep_window
 from ashiato.hygiene import audit as hygiene_audit
 from ashiato.nominate import run as nominate_run
+from ashiato.orphans import DEFAULT_LIMIT as DEFAULT_ORPHANS_LIMIT
+from ashiato.orphans import DEFAULT_MIN_HUMAN_CHARS, DEFAULT_MIN_TF
+from ashiato.orphans import run as orphans_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import (
@@ -251,6 +254,61 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="truncate result text to N chars before comparison (default 2000)",
     )
     nominate_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="output as JSON"
+    )
+
+    orphans_parser = subparsers.add_parser(
+        "orphans",
+        help="nominate one-off discussion topics that left no trace in any sink",
+    )
+    orphans_parser.add_argument("--db", metavar="PATH", help="database path")
+    orphans_parser.add_argument(
+        "--since",
+        type=_parse_since,
+        metavar="TS",
+        help="only nominate sessions started at or after this ISO-8601 timestamp",
+    )
+    orphans_parser.add_argument(
+        "--until",
+        type=_parse_since,
+        metavar="TS",
+        help="only nominate sessions started at or before this ISO-8601 timestamp",
+    )
+    orphans_parser.add_argument(
+        "--sink",
+        action="append",
+        metavar="PATH",
+        help="file or directory of text the topic may have been persisted in "
+        "(repeatable; default every ~/.claude/projects/*/memory dir)",
+    )
+    orphans_parser.add_argument(
+        "--no-default-sinks",
+        action="store_true",
+        help="do not fall back to ~/.claude/projects/*/memory when no --sink is given",
+    )
+    orphans_parser.add_argument(
+        "--min-tf",
+        type=_row_limit,
+        default=DEFAULT_MIN_TF,
+        metavar="N",
+        help=f"minimum in-session occurrences of a unique term (default {DEFAULT_MIN_TF})",
+    )
+    orphans_parser.add_argument(
+        "--min-human-chars",
+        type=_row_limit,
+        default=DEFAULT_MIN_HUMAN_CHARS,
+        metavar="N",
+        help="minimum characters of human-typed text in a session "
+        f"(default {DEFAULT_MIN_HUMAN_CHARS})",
+    )
+    orphans_parser.add_argument(
+        "--limit",
+        type=_row_limit,
+        default=DEFAULT_ORPHANS_LIMIT,
+        metavar="N",
+        help=f"maximum candidates, 0 for all (default {DEFAULT_ORPHANS_LIMIT})",
+    )
+    orphans_parser.add_argument(
         "--json", action="store_true", dest="json_output", help="output as JSON"
     )
 
@@ -764,6 +822,22 @@ def _run_nominate(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
 
 
+def _run_orphans(args: argparse.Namespace, out: Any, err: Any) -> int:
+    return orphans_run(
+        _resolve_db(args.db),
+        since=args.since,
+        until=args.until,
+        sinks=[Path(sink).expanduser() for sink in args.sink or []],
+        default_sinks=not args.no_default_sinks,
+        min_tf=args.min_tf,
+        min_human_chars=args.min_human_chars,
+        limit=args.limit,
+        json_output=args.json_output,
+        out=out,
+        err=err,
+    )
+
+
 def _run_hygiene(args: argparse.Namespace, out: Any, err: Any) -> int:
     db_path = _resolve_db(args.db)
     if not db_path.exists():
@@ -1105,6 +1179,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_grep(args, out, err)
     if args.command == "nominate":
         return _run_nominate(args, out, err)
+    if args.command == "orphans":
+        return _run_orphans(args, out, err)
     if args.command == "hygiene":
         return _run_hygiene(args, out, err)
     if args.command == "compare-periods":
