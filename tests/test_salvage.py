@@ -291,8 +291,10 @@ def test_since_excludes_earlier_evidence(db: Path):
 
 def test_format_version_is_unchanged():
     # Bumped to 7 by issue #68: Codex parser now ingests collab/delegation
-    # item types and the response_item path for messages.
-    assert FORMAT_VERSION == 7
+    # item types and the response_item path for messages.  Bumped to 8 by
+    # issues #65/#67: codex text events carry the real role, is_meta for
+    # developer messages, and a file-path-scoped event_id.
+    assert FORMAT_VERSION == 8
 
 
 # ---------------------------------------------------------------- read-only discipline

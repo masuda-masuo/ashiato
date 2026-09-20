@@ -51,6 +51,7 @@ class CodexTextChunk:
     seq: int
     ts: datetime | None
     text: str
+    role: str | None = None
 
 
 @dataclass(slots=True)
@@ -151,6 +152,7 @@ def _append_codex_message_text(
     file_path: str,
     seq: int,
     record_ts: datetime | None,
+    role: str | None = None,
 ) -> None:
     """Join output_text/input_text parts from a message-shaped dict into one chunk."""
     content = message.get("content")
@@ -174,6 +176,7 @@ def _append_codex_message_text(
             seq=seq,
             ts=record_ts,
             text="".join(text_parts),
+            role=role,
         )
     )
 
@@ -397,6 +400,7 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                     file_path=file_path,
                     seq=seq,
                     record_ts=record_ts,
+                    role=payload.get("role"),
                 )
 
         elif rec_type == "token_usage_record":
