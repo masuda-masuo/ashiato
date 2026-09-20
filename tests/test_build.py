@@ -1454,6 +1454,385 @@ def test_opencode_build_is_incremental(tmp_path: Path):
         connection.close()
 
 
+# ---------------------------------------------------------------- opencode into sessions/events/tool_calls
+
+
+def test_opencode_transcript_populates_sessions_events_tool_calls(tmp_path: Path):
+    """Acceptance criterion 1: rows in all three main tables, source = 'opencode'."""
+    db_path = tmp_path / "opencode_main.duckdb"
+    result = build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    assert result.n_sessions == 3
+    assert result.n_events == 3
+    assert result.n_tool_calls == 3
+
+    connection = connect(db_path, read_only=True)
+    try:
+        sessions = connection.execute(
+            "SELECT session_id, source, started_at, ended_at, n_events, n_tool_calls "
+            "FROM sessions ORDER BY session_id"
+        ).fetchall()
+        # One row per distinct session id; started_at/ended_at are the min/max
+        # of the tool-call timestamps the file carries for that session.
+        assert sessions == [
+            ("ses_aaa", "opencode", datetime(1970, 1, 1, 0, 0, 1), datetime(1970, 1, 1, 0, 0, 1), 2, 1),
+            ("ses_bbb", "opencode", datetime(1970, 1, 1, 0, 0, 2), datetime(1970, 1, 1, 0, 0, 2), 1, 1),
+            ("ses_ddd", "opencode", datetime(1970, 1, 1, 0, 0, 4), datetime(1970, 1, 1, 0, 0, 4), 0, 1),
+        ]
+
+        events = connection.execute(
+            "SELECT event_id, session_id, source, seq, ts, type, text FROM events ORDER BY seq"
+        ).fetchall()
+        assert len(events) == 3
+        assert [row[1] for row in events] == ["ses_aaa", "ses_aaa", "ses_bbb"]
+        assert all(row[2] == "opencode" for row in events)
+        # ts is NULL: opencode text parts carry no timestamp at all.
+        assert all(row[4] is None and row[5] == "text" for row in events)
+        assert all(row[0].startswith("opencode:text:") for row in events)
+        assert [row[6] for row in events] == [
+            "Let me check kaiba for prior guidance before editing anything.",
+            "Applying denial_pattern_x9 as documented in the recall output.",
+            "Proceeding with the standard approach and ignoring that suggestion.",
+        ]
+
+        calls = connection.execute(
+            "SELECT tool_use_id, session_id, source, seq, ts, tool_name, outcome, is_error, "
+            "call_event_id, result_event_id, input FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert len(calls) == 3
+        assert [row[1] for row in calls] == ["ses_aaa", "ses_bbb", "ses_ddd"]
+        assert all(row[2] == "opencode" for row in calls)
+        assert [row[5] for row in calls] == ["kaiba_recall", "kaiba_recall", "bash"]
+        assert all(row[6] == "ok" and row[7] is False for row in calls)
+        # opencode does not link its tool parts to events rows.
+        assert all(row[8] is None and row[9] is None for row in calls)
+        assert calls[0][10] == '{"query": "denial pattern anchoring"}'
+    finally:
+        connection.close()
+
+
+def test_opencode_file_with_two_distinct_session_ids_produces_two_session_rows(
+    tmp_path: Path,
+):
+    """Acceptance criterion 2: one sessions row per distinct session id in a file."""
+    events = tmp_path / "two_sessions.ndjson"
+    events.write_text(
+        "\n".join(
+            [
+                '{"id":"a","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","sessionID":"s1","type":"tool","tool":"bash","callID":"c1","state":{"status":"completed","input":{"command":"echo a"},"output":"a","time":{"start":1000,"end":1100}}},"time":1100}}',
+                '{"id":"b","type":"message.part.updated","properties":{"sessionID":"s2","part":{"id":"p2","sessionID":"s2","type":"tool","tool":"bash","callID":"c2","state":{"status":"completed","input":{"command":"echo b"},"output":"b","time":{"start":2000,"end":2100}}},"time":2100}}',
+                '{"id":"c","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p3","sessionID":"s1","type":"text","text":"from s1"}}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "two_sessions.duckdb"
+    build([], db_path, opencode_sources=[events])
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT session_id, n_events, n_tool_calls, started_at, ended_at "
+            "FROM sessions ORDER BY session_id"
+        ).fetchall()
+        assert rows == [
+            ("s1", 1, 1, datetime(1970, 1, 1, 0, 0, 1), datetime(1970, 1, 1, 0, 0, 1)),
+            ("s2", 0, 1, datetime(1970, 1, 1, 0, 0, 2), datetime(1970, 1, 1, 0, 0, 2)),
+        ]
+    finally:
+        connection.close()
+
+
+def test_opencode_parts_without_a_session_id_produce_no_session_row_and_do_not_raise(
+    tmp_path: Path,
+):
+    """Acceptance criterion 2: no session id -> no session row, and no exception."""
+    events = tmp_path / "no_session.ndjson"
+    events.write_text(
+        "\n".join(
+            [
+                '{"id":"a","type":"message.part.updated","properties":{"part":{"id":"p1","type":"tool","tool":"bash","callID":"c1","state":{"status":"completed","input":{"command":"echo x"},"output":"x","time":{"start":1000,"end":1100}}},"time":1100}}',
+                '{"id":"b","type":"message.part.updated","properties":{"part":{"id":"p2","type":"text","text":"hello"}}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "no_session.duckdb"
+    build([], db_path, opencode_sources=[events])  # must not raise
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 0
+        assert scalar(connection, "SELECT count(*) FROM events") == 1
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+        assert (
+            scalar(connection, "SELECT count(*) FROM tool_calls WHERE session_id IS NULL")
+            == 1
+        )
+        assert (
+            scalar(connection, "SELECT count(*) FROM events WHERE session_id IS NULL")
+            == 1
+        )
+    finally:
+        connection.close()
+
+
+def test_opencode_rows_null_every_column_without_an_equivalent(tmp_path: Path):
+    """Acceptance criterion 3: columns with no opencode equivalent are NULL, never a placeholder."""
+    db_path = tmp_path / "opencode_nulls.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    connection = connect(db_path, read_only=True)
+    try:
+        session = connection.execute(
+            "SELECT project_dir, cwd, git_branch, cc_version, entrypoint, input_tokens, "
+            "output_tokens, cache_read_tokens, cache_creation_tokens "
+            "FROM sessions WHERE session_id = 'ses_aaa'"
+        ).fetchone()
+        assert session == (None,) * 9
+
+        event = connection.execute(
+            "SELECT ts, role, parent_uuid, depth, is_sidechain, is_meta, permission_mode, "
+            "effort, request_id, message_id, model, cwd, git_branch "
+            "FROM events WHERE session_id = 'ses_aaa' ORDER BY seq LIMIT 1"
+        ).fetchone()
+        assert event == (None,) * 13
+
+        call = connection.execute(
+            "SELECT call_event_id, result_event_id, duration_ms, permission_mode, cwd, "
+            "is_sidechain, parent_tool_use_id, mcp_server "
+            "FROM tool_calls WHERE session_id = 'ses_ddd'"
+        ).fetchone()
+        # duration_ms is no longer a "no equivalent" column: the part's `time`
+        # object populates it (4000 -> 4100 is 100 ms) since issue #83.
+        assert call == (None, None, 100, None, None, None, None, None)
+    finally:
+        connection.close()
+
+
+def test_opencode_source_files_counts_match_inserted_rows(tmp_path: Path):
+    """Acceptance criterion 5: source_files counts equal the rows actually inserted."""
+    db_path = tmp_path / "opencode_sf.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    connection = connect(db_path, read_only=True)
+    try:
+        n_events, n_tool_calls = connection.execute(
+            "SELECT n_events, n_tool_calls FROM source_files"
+        ).fetchone()
+        assert n_events == scalar(connection, "SELECT count(*) FROM events")
+        assert n_tool_calls == scalar(connection, "SELECT count(*) FROM tool_calls")
+        assert (n_events, n_tool_calls) == (3, 3)
+    finally:
+        connection.close()
+
+
+def test_opencode_build_leaves_recall_calls_unchanged(tmp_path: Path):
+    """Acceptance criterion 6: opencode recall_calls are exactly what they were before #83.
+
+    The recall extraction is untouched by this change; pinning every recall row
+    here means an accidental perturbation of the recall path fails the suite
+    rather than hiding in prose.
+    """
+    db_path = tmp_path / "opencode_recall.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE])
+    file_key = str(OPENCODE_FIXTURE.resolve())
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT recall_id, session_id, source, seq, ts, call_id, query, output, "
+            "output_truncated, followup_text, followup_truncated, overlap_count, "
+            "overlap_tokens FROM recall_calls ORDER BY recall_id"
+        ).fetchall()
+        assert rows == [
+            (
+                f"{file_key}:call_2",
+                "ses_aaa",
+                "opencode",
+                3,
+                datetime(1970, 1, 1, 0, 0, 1),
+                "call_2",
+                "denial pattern anchoring",
+                "Use anchored prefix matching for denial_pattern_x9 tokens.",
+                False,
+                "Applying denial_pattern_x9 as documented in the recall output.",
+                False,
+                1,
+                '["denial_pattern_x9"]',
+            ),
+            (
+                f"{file_key}:call_5",
+                "ses_bbb",
+                "opencode",
+                5,
+                datetime(1970, 1, 1, 0, 0, 2),
+                "call_5",
+                "unrelated topic",
+                "Consider orphaned_snippet_zz for edge cases.",
+                False,
+                "Proceeding with the standard approach and ignoring that suggestion.",
+                False,
+                0,
+                "[]",
+            ),
+        ]
+    finally:
+        connection.close()
+
+
+def test_opencode_completed_call_with_empty_output_is_not_pending(tmp_path: Path):
+    """A completed opencode tool part with no output must not read as 'pending'.
+
+    The parser only emits parts whose state is 'completed', so the call is
+    terminal; 'pending' would claim it was interrupted.  It classifies as
+    'ok' with NULL result_text instead.
+    """
+    events = tmp_path / "empty_output.ndjson"
+    events.write_text(
+        '{"id":"a","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","sessionID":"s1","type":"tool","tool":"bash","callID":"c1","state":{"status":"completed","input":{"command":"true"},"time":{"start":1000,"end":1100}}},"time":1100}}',
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "empty_output.duckdb"
+    build([], db_path, opencode_sources=[events])
+    connection = connect(db_path, read_only=True)
+    try:
+        outcome, result_text, is_error = connection.execute(
+            "SELECT outcome, result_text, is_error FROM tool_calls WHERE tool_use_id = 'c1'"
+        ).fetchone()
+        assert outcome == "ok"
+        assert result_text is None
+        assert is_error is False
+    finally:
+        connection.close()
+
+
+def test_opencode_error_state_produces_an_error_row(tmp_path: Path):
+    """Acceptance criterion: a part with state.status == 'error' lands as a
+    tool_calls row with is_error True, outcome 'error', the failure message in
+    result_text, and duration_ms from the part's time object."""
+    events = tmp_path / "error_state.ndjson"
+    events.write_text(
+        '{"id":"a","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","sessionID":"s1","type":"tool","tool":"bash","callID":"c_err","state":{"status":"error","input":{"command":"exit 1"},"error":"exit code 1","time":{"start":1000,"end":1500}}},"time":1500}}',
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "opencode_error.duckdb"
+    build([], db_path, opencode_sources=[events])
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT outcome, is_error, result_text, result_truncated, duration_ms, ts "
+            "FROM tool_calls WHERE tool_use_id = 'c_err'"
+        ).fetchone()
+        assert row is not None
+        outcome, is_error, result_text, result_truncated, duration_ms, ts = row
+        assert outcome == "error"
+        assert is_error is True
+        assert result_text == "exit code 1"
+        assert result_truncated is False
+        assert duration_ms == 500
+        assert ts == datetime(1970, 1, 1, 0, 0, 1)
+    finally:
+        connection.close()
+
+
+def test_opencode_failed_call_with_empty_output_is_error_not_pending(tmp_path: Path):
+    """Acceptance criterion: a failed part with no output classifies as 'error',
+    never 'pending' -- has_result is forced by is_error the way the Codex path
+    forces it."""
+    events = tmp_path / "error_empty.ndjson"
+    events.write_text(
+        '{"id":"a","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","sessionID":"s1","type":"tool","tool":"bash","callID":"c_e","state":{"status":"error","input":{"command":"exit 2"},"time":{"start":1000,"end":1000}}},"time":1000}}',
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "opencode_error_empty.duckdb"
+    build([], db_path, opencode_sources=[events])
+    connection = connect(db_path, read_only=True)
+    try:
+        outcome, is_error, result_text = connection.execute(
+            "SELECT outcome, is_error, result_text FROM tool_calls WHERE tool_use_id = 'c_e'"
+        ).fetchone()
+        assert outcome == "error"
+        assert is_error is True
+        assert result_text is None  # no output and no error message
+    finally:
+        connection.close()
+
+
+def test_opencode_completed_call_still_ok_with_duration(tmp_path: Path):
+    """Acceptance criterion: a completed part still produces is_error False /
+    outcome 'ok' exactly as before -- and now carries duration_ms."""
+    events = tmp_path / "still_ok.ndjson"
+    events.write_text(
+        '{"id":"a","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","sessionID":"s1","type":"tool","tool":"bash","callID":"c_ok","state":{"status":"completed","input":{"command":"true"},"output":"done","time":{"start":1000,"end":1200}}},"time":1200}}',
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "opencode_still_ok.duckdb"
+    build([], db_path, opencode_sources=[events])
+    connection = connect(db_path, read_only=True)
+    try:
+        outcome, is_error, duration_ms = connection.execute(
+            "SELECT outcome, is_error, duration_ms FROM tool_calls WHERE tool_use_id = 'c_ok'"
+        ).fetchone()
+        assert outcome == "ok"
+        assert is_error is False
+        assert duration_ms == 200
+    finally:
+        connection.close()
+
+
+def test_opencode_pending_and_running_parts_produce_no_row(tmp_path: Path):
+    """Acceptance criterion: pending/running parts still produce no tool_calls
+    row -- unfinished is not failed, and is not ingested."""
+    events = tmp_path / "unfinished.ndjson"
+    events.write_text(
+        "\n".join(
+            [
+                '{"id":"a","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","sessionID":"s1","type":"tool","tool":"bash","callID":"c_p","state":{"status":"pending","input":{"command":"wait"}}}}}',
+                '{"id":"b","type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p2","sessionID":"s1","type":"tool","tool":"bash","callID":"c_r","state":{"status":"running","input":{"command":"sleep"}}}}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "opencode_unfinished.duckdb"
+    build([], db_path, opencode_sources=[events])
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 0
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 0
+    finally:
+        connection.close()
+
+
+def test_opencode_bulk_and_row_by_row_inserts_produce_identical_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The opencode insert path survives the bulk route with identical rows."""
+    bulk_db = tmp_path / "oc_bulk.duckdb"
+    row_db = tmp_path / "oc_row.duckdb"
+    monkeypatch.setattr(build_module, "BULK_INSERT_MIN_ROWS", 1)
+    assert build([], bulk_db, opencode_sources=[OPENCODE_FIXTURE]).n_bulk_fallbacks == 0
+    monkeypatch.setattr(build_module, "BULK_INSERT_MIN_ROWS", 10**9)
+    build([], row_db, opencode_sources=[OPENCODE_FIXTURE])
+    # source_files is excluded the same way the Claude bulk test excludes it:
+    # its built_at is a wall-clock stamp that differs between two builds.
+    for table, order in (
+        ("sessions", "session_id"),
+        ("events", "seq"),
+        ("tool_calls", "seq"),
+    ):
+        assert dump(bulk_db, table, order) == dump(row_db, table, order), table
+
+
+def test_two_builds_of_the_same_opencode_bytes_give_the_same_main_table_rows(
+    tmp_path: Path,
+):
+    """Determinism extends to the tables issue #83 now fills."""
+    first, second = tmp_path / "oc_first.duckdb", tmp_path / "oc_second.duckdb"
+    build([], first, opencode_sources=[OPENCODE_FIXTURE])
+    build([], second, opencode_sources=[OPENCODE_FIXTURE])
+    for table, order in (
+        ("sessions", "session_id"),
+        ("events", "seq"),
+        ("tool_calls", "seq"),
+    ):
+        assert dump(first, table, order) == dump(second, table, order), table
+
+
 # ---------------------------------------------------------------- overlap distinctive-shape rule
 
 
@@ -1548,13 +1927,19 @@ def test_a_mixed_build_ingests_both_formats_without_disturbing_the_other(tmp_pat
     db_path = tmp_path / "mixed.duckdb"
     result = build([FIXTURES], db_path, opencode_sources=[OPENCODE_FIXTURE])
     assert result.n_files == 5  # the 4 existing fixtures + the opencode one
-    assert result.n_sessions == TOTAL_SESSIONS  # unaffected: opencode never touches `sessions`
-    assert result.n_events == TOTAL_EVENTS
-    assert result.n_tool_calls == TOTAL_TOOL_CALLS
+    # Since issue #83 the opencode fixture contributes its own rows: 3 sessions
+    # (one per distinct session id in the file), 3 text-chunk events, and 3
+    # completed tool parts.
+    assert result.n_sessions == TOTAL_SESSIONS + 3
+    assert result.n_events == TOTAL_EVENTS + 3
+    assert result.n_tool_calls == TOTAL_TOOL_CALLS + 3
     assert result.n_recall_calls == 2  # only from the opencode fixture
 
     connection = connect(db_path, read_only=True)
     try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == TOTAL_SESSIONS + 3
+        assert scalar(connection, "SELECT count(*) FROM events") == TOTAL_EVENTS + 3
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == TOTAL_TOOL_CALLS + 3
         assert scalar(connection, "SELECT count(*) FROM recall_calls") == 2
         assert scalar(connection, "SELECT count(*) FROM source_files") == 5
     finally:
@@ -2589,7 +2974,9 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
     Claude fills both columns from real event ids, so they resolve.  Codex
     fills both with NULL, because the item_completed id space never meets the
     event id space -- so a non-null value that fails to resolve is always a
-    defect (a synthetic id asserting a link the data does not have).  The
+    defect (a synthetic id asserting a link the data does not have).  Since
+    issue #83 opencode does the same: its event stream does not link completed
+    tool parts to events rows, so both columns are NULL there too.  The
     invariant is checked across a database built from more than one source,
     so a future source that writes unresolvable ids fails here.
     """
@@ -2617,12 +3004,18 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
     )
 
     db_path = tmp_path / "link_invariant.duckdb"
-    build([FIXTURES], db_path, codex_sources=[codex_dir])
+    build(
+        [FIXTURES],
+        db_path,
+        codex_sources=[codex_dir],
+        opencode_sources=[OPENCODE_FIXTURE],
+    )
 
     connection = connect(db_path, read_only=True)
     try:
         # The database really does contain rows from more than one source:
-        # Claude rows carry resolvable ids, Codex rows carry NULL.
+        # Claude rows carry resolvable ids, Codex rows carry NULL, and opencode
+        # rows carry NULL too.
         assert scalar(
             connection,
             "SELECT count(*) FROM tool_calls WHERE call_event_id IS NOT NULL",
@@ -2631,6 +3024,20 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
             connection,
             "SELECT count(*) FROM tool_calls WHERE call_event_id IS NULL",
         ) > 0
+        assert (
+            scalar(
+                connection,
+                "SELECT count(*) FROM tool_calls WHERE source = 'opencode'",
+            )
+            == 3
+        )
+        assert (
+            scalar(
+                connection,
+                "SELECT count(*) FROM events WHERE source = 'opencode'",
+            )
+            == 3
+        )
 
         for column in ("call_event_id", "result_event_id"):
             orphans = connection.execute(

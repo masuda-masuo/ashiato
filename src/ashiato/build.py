@@ -85,6 +85,7 @@ from ashiato.schema import (
     REQUIRED_VIEWS,
     SCHEMA_SQL,
     SOURCE_CODEX,
+    SOURCE_OPENCODE,
     TABLES,
     column_names,
     insert_sql,
@@ -630,6 +631,182 @@ def _insert_parsed(
     )
 
 
+def _opencode_session_rows(parsed: ParsedOpenCodeFile) -> list[tuple[object, ...]]:
+    """One ``sessions`` row per distinct session id a file's parts carry.
+
+    A parsed opencode file is not one session: every tool part and text part
+    carries its own ``sessionID``, and the ids can differ within one
+    ``events.ndjson``, so one file can contribute several ``sessions`` rows --
+    or none, when nothing in it carries a session id.  A part with no session
+    id must not fabricate a session row, so only ids that actually appear are
+    emitted, in first-appearance order across tool calls then text chunks.
+
+    A session's ``started_at`` / ``ended_at`` are the min / max of the
+    timestamps the file actually provides for it (the tool parts' ``ts`` --
+    text chunks carry no timestamp at all), both NULL when no call of that
+    session carries one.  ``n_events`` / ``n_tool_calls`` count the rows this
+    file inserts for that session.
+    """
+    session_ids: list[str] = []
+    seen: set[str] = set()
+    for call in parsed.tool_calls:
+        if call.session_id is not None and call.session_id not in seen:
+            seen.add(call.session_id)
+            session_ids.append(call.session_id)
+    for chunk in parsed.text_chunks:
+        if chunk.session_id is not None and chunk.session_id not in seen:
+            seen.add(chunk.session_id)
+            session_ids.append(chunk.session_id)
+
+    rows: list[tuple[object, ...]] = []
+    for session_id in session_ids:
+        calls = [call for call in parsed.tool_calls if call.session_id == session_id]
+        chunks = [chunk for chunk in parsed.text_chunks if chunk.session_id == session_id]
+        timestamps = [call.ts for call in calls if call.ts is not None]
+        rows.append(
+            _session_row(
+                Session(
+                    session_id=session_id,
+                    file_path=parsed.file_path,
+                    source=SOURCE_OPENCODE,
+                    project_dir=None,
+                    cwd=None,
+                    git_branch=None,
+                    cc_version=None,
+                    entrypoint=None,
+                    started_at=min(timestamps) if timestamps else None,
+                    ended_at=max(timestamps) if timestamps else None,
+                    n_events=len(chunks),
+                    n_tool_calls=len(calls),
+                    input_tokens=None,  # type: ignore[arg-type]  # token counts are NULL for opencode
+                    output_tokens=None,  # type: ignore[arg-type]
+                    cache_read_tokens=None,  # type: ignore[arg-type]
+                    cache_creation_tokens=None,  # type: ignore[arg-type]
+                )
+            )
+        )
+    return rows
+
+
+def _opencode_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
+    """Map an ``OpenCodeTextChunk`` to an ``Event``-shaped row for insertion.
+
+    ``event_id`` is synthesised and file-path-scoped, the same way the Codex
+    path's is.  ``ts`` is NULL: an opencode text part carries no timestamp at
+    all.  Every column opencode has no value for -- ``role``, ``parent_uuid``,
+    ``depth``, ``is_sidechain``, ``is_meta``, the permission/effort fields,
+    ``model``, ``cwd``, ``git_branch`` -- is NULL, never a placeholder.
+    """
+    from ashiato.opencode import OpenCodeTextChunk as _OTC
+
+    assert isinstance(chunk, _OTC)
+    event_id = f"opencode:text:{chunk.file_path}:{chunk.seq}"
+    return _event_row(
+        Event(
+            event_id=event_id,
+            session_id=chunk.session_id,
+            file_path=chunk.file_path,
+            source=SOURCE_OPENCODE,
+            seq=chunk.seq,
+            ts=None,
+            type="text",
+            role=None,
+            parent_uuid=None,
+            depth=None,  # type: ignore[arg-type]  # no parent tree in opencode -> NULL
+            is_sidechain=None,  # type: ignore[arg-type]  # no subagent concept -> NULL
+            is_meta=None,  # type: ignore[arg-type]  # no role/developer signal -> NULL
+            permission_mode=None,
+            effort=None,
+            request_id=None,
+            message_id=None,
+            model=None,
+            cwd=None,
+            git_branch=None,
+            text=chunk.text,
+            raw=chunk.text,
+        )
+    )
+
+
+def _opencode_tool_call_to_row(call: object) -> list[object]:
+    """Map an ``OpenCodeToolCall`` to a ``ToolCall``-shaped row for insertion.
+
+    ``outcome`` goes through the shared :func:`classify_outcome` -- no second
+    classifier.  The parser only emits terminal parts, so ``has_result`` is
+    True for every opencode call even when the state carries no output --
+    that is what keeps a failed call with empty output classified as 'error'
+    rather than 'pending', the same force the Codex path applies with
+    ``has_result or is_error`` -- and ``is_error`` is derived from the part's
+    own terminal state: an ``error`` state is a real failed call, and its
+    failure message (under the ``error`` key) lands in ``result_text`` when
+    the state carries no ``output``.
+
+    ``call_event_id`` / ``result_event_id`` are NULL: the opencode event
+    stream does not link its terminal tool parts to ``events`` rows, so any
+    id written here would be a reference that resolves to nothing (the defect
+    issue #75 removed from the Codex path).
+    """
+    from ashiato.opencode import OpenCodeToolCall as _OTC
+
+    assert isinstance(call, _OTC)
+    tool_name: str | None = call.tool
+    tool_kind, mcp_server = split_tool_name(tool_name)
+    tool_input = call.input
+    input_json: str | None = (
+        None if tool_input is None else json.dumps(tool_input, ensure_ascii=False, default=str)
+    )
+    output: str | None = call.output
+    error: str | None = call.error
+    is_error = call.status == "error"
+
+    # The parser only emits terminal parts, so every call has a result by
+    # construction -- has_result is True even when the state carries no
+    # output, exactly as before.  That is also what keeps a failed call with
+    # empty output classified as 'error' rather than 'pending' (the force
+    # the Codex path applies with ``has_result or is_error``): is_error is
+    # derived from the part's own terminal state.
+    outcome = classify_outcome(
+        has_result=True,
+        result_text=output or error or "",
+        is_error=is_error,
+    )
+
+    result_source = output if output is not None else error
+    result_text: str | None = None
+    result_truncated = False
+    if result_source is not None:
+        if len(result_source) > DEFAULT_RESULT_TEXT_LIMIT:
+            result_text = result_source[:DEFAULT_RESULT_TEXT_LIMIT]
+            result_truncated = True
+        else:
+            result_text = result_source
+
+    return [
+        call.call_id,          # tool_use_id
+        call.session_id,
+        call.file_path,
+        SOURCE_OPENCODE,       # source
+        call.seq,
+        call.ts,               # ts
+        None,                  # call_event_id
+        None,                  # result_event_id
+        tool_name,
+        tool_kind,
+        mcp_server,
+        input_json,
+        summarize_input(tool_name, tool_input),
+        outcome,
+        is_error,
+        result_text,
+        result_truncated,
+        call.duration_ms,      # duration_ms
+        None,                  # permission_mode
+        None,                  # cwd
+        None,                  # is_sidechain
+        None,                  # parent_tool_use_id
+    ]
+
+
 def _insert_opencode_parsed(
     connection: duckdb.DuckDBPyConnection,
     parsed: ParsedOpenCodeFile,
@@ -642,11 +819,32 @@ def _insert_opencode_parsed(
 ) -> None:
     """The opencode counterpart of :func:`_insert_parsed`.
 
-    Only ``recall_calls`` and ``source_files`` are touched: general-purpose
-    ingestion of opencode events into ``sessions`` / ``events`` / ``tool_calls``
-    is out of scope, so those counts are honestly zero rather than borrowed
-    from a table this format never populates.
+    Unlike Claude and Codex, one file is not one session: ``sessions`` gets
+    one row per distinct session id the file's parts carry (or none when
+    nothing does), ``events`` gets one row per assistant text chunk (with
+    NULL ``ts`` -- opencode text parts carry none), and ``tool_calls`` gets
+    one row per terminal tool part.  ``source_files.n_events`` /
+    ``n_tool_calls`` reflect the rows actually inserted, not a hardcoded
+    zero.
     """
+    _insert_rows(
+        connection,
+        "sessions",
+        _opencode_session_rows(parsed),
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "events",
+        [_opencode_text_chunk_to_event(chunk) for chunk in parsed.text_chunks],
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "tool_calls",
+        [_opencode_tool_call_to_row(call) for call in parsed.tool_calls],
+        scratch=scratch,
+    )
     _insert_rows(
         connection,
         "recall_calls",
@@ -662,8 +860,8 @@ def _insert_opencode_parsed(
                 stat.st_size,
                 stat.st_mtime,
                 content_hash,
-                0,
-                0,
+                len(parsed.text_chunks),    # n_events
+                len(parsed.tool_calls),     # n_tool_calls
                 parsed.n_parse_errors,
                 built_at,
             )
@@ -1174,6 +1372,9 @@ def build(
 
                 result.n_processed += 1
                 result.n_recall_calls += len(recall_rows)
+                result.n_sessions += len(_opencode_session_rows(parsed_oc))
+                result.n_events += len(parsed_oc.text_chunks)
+                result.n_tool_calls += len(parsed_oc.tool_calls)
                 result.n_parse_errors += parsed_oc.n_parse_errors
 
             for path in cursor_files:

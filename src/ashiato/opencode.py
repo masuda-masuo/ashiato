@@ -7,12 +7,17 @@ and a malformed line -- or an event type this module does not model -- is
 skipped and counted, not fatal, the same discipline as a truncated Claude
 Code transcript line.
 
-Only what the recall-followup view needs is extracted: *completed* tool-call
+Only what the recall-followup view needs is extracted: terminal tool-call
 parts (whichever tool -- the recall filter is applied downstream, by
 :mod:`ashiato.recall`) and assistant text, both needed to build the
-post-recall "what did the session do next" evidence.  A *pending* tool part
-carries no output yet and is not modelled at all; only the record on its
-``completed`` state produces anything.  Assistant text streams as many
+post-recall "what did the session do next" evidence.  A tool part is
+terminal when its state is ``completed`` *or* ``error``: an ``error`` state
+is as final as a ``completed`` one -- it carries the failure message under
+``error`` and the same ``time`` timing -- and dropping it would erase real
+failures from ``tool_calls`` (the defect issue #66 removed from the Codex
+path).  A *pending* or *running* tool part carries no output yet and is not
+modelled at all; only the record on one of the terminal states produces
+anything.  Assistant text streams as many
 ``message.part.delta`` events per part (roughly one per LLM token) and/or as
 ``message.part.updated`` snapshots of the same part; both are coalesced here
 into one :class:`OpenCodeTextChunk` per part -- see :func:`parse_file` for
@@ -26,6 +31,7 @@ skipped like any other unmodelled type.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,7 +45,13 @@ _EVENT_PART_DELTA = "message.part.delta"
 
 @dataclass(slots=True)
 class OpenCodeToolCall:
-    """One *completed* tool-call part; a pending one produces no instance."""
+    """One terminal tool-call part (``completed`` or ``error``).
+
+    ``pending`` and ``running`` parts produce no instance -- they are
+    genuinely unfinished, not failed.  An ``error`` part carries its failure
+    message in ``error`` and its duration in ``duration_ms``, exactly the way
+    a ``completed`` part carries its output.
+    """
 
     call_id: str
     session_id: str | None
@@ -49,6 +61,15 @@ class OpenCodeToolCall:
     tool: str | None
     input: dict | None
     output: str | None
+    #: The part's terminal state, one of ``"completed"`` / ``"error"`` -- the
+    #: insert path derives ``is_error`` from it.
+    status: str = "completed"
+    #: The failure message from the ``error`` key when the state is ``error``.
+    error: str | None = None
+    #: Tool-part duration in milliseconds, from the state's ``time`` object
+    #: (``end - start``, both epoch milliseconds); ``None`` when the object's
+    #: shape cannot be converted confidently.
+    duration_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -95,6 +116,45 @@ def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _as_output(value: object) -> str | None:
+    """A tool part's output as text.
+
+    Strings pass through unchanged.  Anything else is serialised as compact
+    JSON: a structured tool result (an MCP tool returning an object, say) is
+    real data, and dropping it the way :func:`_as_str` would is the same
+    kind of silent loss issue #66 removed from the Codex path.  ``None``
+    (a state with no ``output`` key at all) stays ``None``.  Every value in
+    an ``events.ndjson`` record came from JSON, so serialising cannot fail.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _duration_ms(time_obj: dict) -> int | None:
+    """Tool-part duration in milliseconds, from the state's ``time`` object.
+
+    opencode writes ``time`` as ``{"start": ..., "end": ...}`` epoch
+    milliseconds -- the same values :func:`parse_epoch_millis` reads as the
+    call's ``ts`` -- so ``end - start`` converts confidently for both
+    terminal states.  A shape this module has not seen (a missing, boolean or
+    non-numeric ``start`` / ``end``, for example) is left as ``None`` rather
+    than guessed at, the same discipline :func:`ashiato.codex._duration_to_ms`
+    applies.
+    """
+    start = time_obj.get("start")
+    end = time_obj.get("end")
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return None
+    if isinstance(end, bool) or not isinstance(end, (int, float)):
+        return None
+    if not math.isfinite(start) or not math.isfinite(end):
+        return None
+    return int(end - start)
+
+
 def parse_epoch_millis(value: object) -> datetime | None:
     """Epoch milliseconds to a naive UTC datetime; ``None`` when unparseable."""
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -135,9 +195,18 @@ def _read_records(path: Path) -> tuple[list[tuple[int, dict]], int]:
 def _tool_call(
     *, file_path: str, seq: int, properties: dict, part: dict
 ) -> OpenCodeToolCall | None:
-    """A completed tool part, or ``None`` for a pending one or one with no state."""
+    """A terminal tool part (``completed`` or ``error``), or ``None``.
+
+    ``pending`` and ``running`` states are genuinely unfinished -- the part
+    is still waiting or streaming -- so they produce no call, the same way a
+    part with no state at all does.  An ``error`` state is as terminal as
+    ``completed``: it carries the failure message under ``error`` and the
+    same ``time`` timing, and dropping it would erase real failures from
+    ``tool_calls``.
+    """
     state = _as_dict(part.get("state"))
-    if state.get("status") != "completed":
+    status = state.get("status")
+    if status not in ("completed", "error"):
         return None
     call_id = _as_str(part.get("callID")) or _as_str(part.get("id")) or f"{file_path}:{seq}"
     time_obj = _as_dict(state.get("time"))
@@ -151,20 +220,23 @@ def _tool_call(
         ts=ts,
         tool=_as_str(part.get("tool")),
         input=tool_input if isinstance(tool_input, dict) else None,
-        output=_as_str(state.get("output")),
+        output=_as_output(state.get("output")),
+        status=status,
+        error=_as_str(state.get("error")),
+        duration_ms=_duration_ms(time_obj),
     )
 
 
 def parse_file(path: str | Path) -> ParsedOpenCodeFile:
-    """Parse one events.ndjson file into completed tool calls and text chunks.
+    """Parse one events.ndjson file into terminal tool calls and text chunks.
 
     A file with no parseable lines yields empty lists -- a normal outcome,
     not an error, the same as an empty Claude Code transcript.
 
-    A completed tool part is recorded at most once per (sessionID, callID); if
-    a stream carries the same part's completed state more than once, the last
-    occurrence wins.  On streams without such duplicates the output is identical
-    to a simple append.
+    A terminal tool part (``completed`` or ``error``) is recorded at most once
+    per (sessionID, callID); if a stream carries the same part's terminal
+    state more than once, the last occurrence wins.  On streams without such
+    duplicates the output is identical to a simple append.
 
     Assistant text is coalesced per (sessionID, partID) into one
     :class:`OpenCodeTextChunk`, rather than one chunk per raw event:
@@ -198,8 +270,8 @@ def parse_file(path: str | Path) -> ParsedOpenCodeFile:
     file_path = str(path.resolve())
     records, n_parse_errors = _read_records(path)
 
-    # A completed tool part is keyed by (sessionID, callID); if the same part's
-    # completed state is ever carried twice, the LAST occurrence wins (later
+    # A terminal tool part is keyed by (sessionID, callID); if the same part's
+    # terminal state is ever carried twice, the LAST occurrence wins (later
     # state supersedes earlier) so the same call never becomes two rows.
     seen_calls: dict[tuple[str | None, str], OpenCodeToolCall] = {}
     call_order: list[tuple[str | None, str]] = []

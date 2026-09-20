@@ -173,7 +173,22 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: the new value is provenance, not re-derivation -- but ``CREATE TABLE IF
 #: NOT EXISTS`` leaves an older database without the column, so a rebuild is
 #: required all the same.
-FORMAT_VERSION = 11
+#: Version 12 = opencode ``events.ndjson`` files now populate ``sessions`` /
+#: ``events`` / ``tool_calls`` (issue #83): one ``sessions`` row per distinct
+#: session id in the file, one ``events`` row per assistant text chunk, and
+#: one ``tool_calls`` row per completed tool part.  The same opencode source
+#: bytes yield different rows than version 11 (which wrote no such rows), so
+#: existing databases must be rebuilt.
+#: Version 13 = opencode ``tool_calls`` derivation changed (issue #83): a
+#: tool part in the ``error`` terminal state now produces a row with
+#: ``is_error`` True and ``outcome`` 'error' (its failure message from the
+#: ``error`` key lands in ``result_text``), ``duration_ms`` is populated from
+#: the part's ``time`` object for both terminal states, and non-string tool
+#: outputs are serialised instead of dropped.  The same opencode source bytes
+#: yield different rows than version 12 (which dropped error parts, NULLed
+#: ``duration_ms`` and lost non-string outputs), so existing databases must
+#: be rebuilt.
+FORMAT_VERSION = 13
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
