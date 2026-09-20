@@ -43,7 +43,7 @@ import duckdb
 
 from ashiato.codex import ParsedCodexFile
 from ashiato.codex import parse_file as parse_codex_file
-from ashiato.cursor import ParsedCursorFile
+from ashiato.cursor import ParsedCursorFile, parse_chat_meta
 from ashiato.cursor import parse_file as parse_cursor_file
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.opencode import parse_file as parse_opencode_file
@@ -76,6 +76,7 @@ from ashiato.schema import (
     FORMAT_VERSION,
     INFO_TABLES,
     META_CODEX_SOURCES_KEY,
+    META_CURSOR_CHATS_SOURCES_KEY,
     META_CURSOR_SOURCES_KEY,
     META_FORMAT_KEY,
     META_OPENCODE_SOURCES_KEY,
@@ -99,6 +100,11 @@ DEFAULT_SOURCE = Path("~/.claude/projects")
 
 #: Where Codex keeps its sessions.
 DEFAULT_CODEX_SOURCE = Path("~/.codex/sessions")
+
+#: The chats layout Cursor keeps next to its agent transcripts: one small
+#: ``meta.json`` per session, exactly two directories below the chats root
+#: (``~/.cursor/chats/<workspace-hash>/<session-uuid>/meta.json``).
+CURSOR_CHATS_META_PATTERN = "*/*/meta.json"
 
 #: Below this many rows the temp file costs more than the row-by-row insert.
 BULK_INSERT_MIN_ROWS = 8
@@ -128,6 +134,17 @@ class BuildResult:
     n_recall_calls: int = 0
     n_parse_errors: int = 0
     n_bulk_fallbacks: int = 0
+    #: The ``--cursor-chats-source`` join, when that flag was given: how many
+    #: ``meta.json`` files were read, how many *distinct* Cursor sessions a
+    #: meta actually updated (two metas may name the same session -- two roots
+    #: pointing at the same session is a normal invocation), and how many
+    #: Cursor sessions were left without a matching meta.  All three are 0
+    #: when no chats source was given -- a silent half-match is the failure
+    #: mode these numbers exist to expose ("162 of 163 matched" vs "3 of 163
+    #: matched").
+    n_chat_metas_read: int = 0
+    n_chat_metas_matched: int = 0
+    n_cursor_sessions_unmatched: int = 0
     missing_sources: list[str] = field(default_factory=list)
     unreadable_files: list[str] = field(default_factory=list)
     failed_files: list[str] = field(default_factory=list)
@@ -150,6 +167,7 @@ class DatabaseInfo:
     sources: list[tuple[str, int]] | None = None
     opencode_sources: list[tuple[str, int]] | None = None
     cursor_sources: list[tuple[str, int]] | None = None
+    cursor_chats_sources: list[tuple[str, int]] | None = None
     codex_sources: list[tuple[str, int]] | None = None
     #: Number of files under the recorded roots that are not in source_files,
     #: or have a different size/mtime.  ``None`` when roots are unknown.
@@ -290,6 +308,7 @@ def create_schema(
     sources: Sequence[str | Path] | None = None,
     opencode_sources: Sequence[str | Path] | None = None,
     cursor_sources: Sequence[str | Path] | None = None,
+    cursor_chats_sources: Sequence[str | Path] | None = None,
     codex_sources: Sequence[str | Path] | None = None,
 ) -> None:
     """Create the tables, format marker, views, and recorded roots on a fresh database.
@@ -308,14 +327,15 @@ def create_schema(
     ashiato tables with no marker, and the next build would refuse an empty,
     perfectly rebuildable file.
 
-    When *sources*, *opencode_sources*, or *cursor_sources* are provided, they
-    are resolved to absolute paths and stored in :data:`META_TABLE` as JSON
-    arrays under :data:`META_SOURCES_KEY`, :data:`META_OPENCODE_SOURCES_KEY`,
-    and :data:`META_CURSOR_SOURCES_KEY`.  A root that matched no files is still
-    recorded -- it explains an absence.  When any sequence is ``None`` (the
-    default), the corresponding key is not written, preserving whatever value
-    may already be in the table (for callers that only create the schema
-    without a full build).
+    When *sources*, *opencode_sources*, *cursor_sources*, *cursor_chats_sources*,
+    or *codex_sources* are provided, they are resolved to absolute paths and
+    stored in :data:`META_TABLE` as JSON arrays under :data:`META_SOURCES_KEY`,
+    :data:`META_OPENCODE_SOURCES_KEY`, :data:`META_CURSOR_SOURCES_KEY`,
+    :data:`META_CURSOR_CHATS_SOURCES_KEY`, and :data:`META_CODEX_SOURCES_KEY`.
+    A root that matched no files is still recorded -- it explains an absence.
+    When any sequence is ``None`` (the default), the corresponding key is not
+    written, preserving whatever value may already be in the table (for
+    callers that only create the schema without a full build).
     """
     existing = {
         row[0]
@@ -352,6 +372,12 @@ def create_schema(
             connection.execute(
                 f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
                 [META_CURSOR_SOURCES_KEY, json.dumps(resolved)],
+            )
+        if cursor_chats_sources is not None:
+            resolved = [str(Path(s).expanduser().resolve()) for s in cursor_chats_sources]
+            connection.execute(
+                f'INSERT OR REPLACE INTO "{META_TABLE}" (key, value) VALUES (?, ?)',
+                [META_CURSOR_CHATS_SOURCES_KEY, json.dumps(resolved)],
             )
         if codex_sources is not None:
             resolved = [str(Path(s).expanduser().resolve()) for s in codex_sources]
@@ -518,6 +544,18 @@ def iter_cursor_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list
     so the two source lists never see each other's files in practice.
     """
     return _iter_sources(sources, "*.jsonl")
+
+
+def iter_cursor_chat_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
+    """(Cursor chat ``meta.json`` files, sources that do not exist).
+
+    Directories are searched recursively for ``*/*/meta.json`` -- the shape
+    under ``~/.cursor/chats/<workspace-hash>/<session-uuid>/meta.json``,
+    where the directory two levels down is the session.  Cursor's other
+    ``meta.json`` files (project metadata etc.) live elsewhere and are never
+    matched by the two-level pattern.
+    """
+    return _iter_sources(sources, CURSOR_CHATS_META_PATTERN)
 
 
 def iter_codex_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
@@ -1073,6 +1111,83 @@ def _insert_cursor_parsed(
     )
 
 
+def _apply_cursor_chat_metas(
+    connection: duckdb.DuckDBPyConnection,
+    meta_files: Sequence[Path],
+    result: BuildResult,
+) -> None:
+    """Join ``--cursor-chats-source`` metas onto the ingested Cursor sessions.
+
+    Every ``meta.json`` under the chats roots is re-read and re-applied on
+    every build -- the files are too few and too small to track incrementally,
+    and the UPDATE is idempotent, so a changed meta is picked up even when the
+    transcript it belongs to was skipped as unchanged.  A meta whose
+    ``session_id`` matches a Cursor session already ingested from a transcript
+    fills ``sessions.cwd`` / ``events.cwd`` / ``tool_calls.cwd`` from the
+    meta's ``cwd`` and ``sessions.started_at`` / ``ended_at`` from
+    ``createdAtMs`` / ``updatedAtMs`` (naive UTC, the same convention as
+    ``built_at``).  ``events.ts`` and ``tool_calls.ts`` stay NULL: no
+    per-message timestamp exists anywhere in the store, and interpolating one
+    from the session bounds would put an estimate in a column the other
+    sources fill with a measurement.  A meta with no matching transcript
+    session creates nothing, and a transcript session with no meta keeps its
+    NULL ``cwd`` -- neither is an error; both are counted on *result* so a
+    silent half-match cannot hide.
+
+    Two metas can name the same session (two roots pointing at the same
+    session is a normal invocation, not an error), so the matched count is
+    derived from the *set* of sessions a meta actually updated, never from
+    the number of meta files -- one duplicate plus one genuinely unmatched
+    session must read as 1 matched / 1 unmatched, not as 0 unmatched.  A
+    value is never overwritten with ``None`` either: ``cwd``,
+    ``started_at`` and ``ended_at`` are written only when the parsed meta
+    actually carries them, so a later, emptier meta cannot null out what an
+    earlier one filled.  A session whose metas carry no value for a column
+    keeps NULL there, as before.
+    """
+    cursor_session_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT DISTINCT session_id FROM sessions WHERE source = ?", [SOURCE_CURSOR]
+        ).fetchall()
+    }
+    result.n_chat_metas_read = len(meta_files)
+    matched_ids: set[str] = set()
+    for path in meta_files:
+        meta = parse_chat_meta(path)
+        if meta is None or meta.session_id not in cursor_session_ids:
+            continue
+        assignments: list[str] = []
+        params: list[object] = []
+        if meta.cwd is not None:
+            assignments.append("cwd = ?")
+            params.append(meta.cwd)
+        if meta.created_at is not None:
+            assignments.append("started_at = ?")
+            params.append(meta.created_at.replace(tzinfo=None))
+        if meta.updated_at is not None:
+            assignments.append("ended_at = ?")
+            params.append(meta.updated_at.replace(tzinfo=None))
+        if assignments:
+            connection.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} "
+                "WHERE session_id = ? AND source = ?",
+                [*params, meta.session_id, SOURCE_CURSOR],
+            )
+            matched_ids.add(meta.session_id)
+        if meta.cwd is not None:
+            connection.execute(
+                "UPDATE events SET cwd = ? WHERE session_id = ? AND source = ?",
+                [meta.cwd, meta.session_id, SOURCE_CURSOR],
+            )
+            connection.execute(
+                "UPDATE tool_calls SET cwd = ? WHERE session_id = ? AND source = ?",
+                [meta.cwd, meta.session_id, SOURCE_CURSOR],
+            )
+    result.n_chat_metas_matched = len(matched_ids)
+    result.n_cursor_sessions_unmatched = len(cursor_session_ids - matched_ids)
+
+
 def _codex_tool_call_to_row(call: object) -> list[object]:
     """Map a ``CodexToolCall`` to a ``ToolCall``-shaped row for insertion.
 
@@ -1389,6 +1504,7 @@ def build(
     *,
     opencode_sources: Sequence[str | Path] = (),
     cursor_sources: Sequence[str | Path] = (),
+    cursor_chats_sources: Sequence[str | Path] = (),
     codex_sources: Sequence[str | Path] = (),
     kaiba_db_path: str | Path | None = None,
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
@@ -1396,14 +1512,24 @@ def build(
 ) -> BuildResult:
     """Parse every transcript under *sources* / *opencode_sources* / *cursor_sources*
     / *codex_sources*.
+
+    *cursor_chats_sources* is the optional ``--cursor-chats-source`` join: the
+    ``meta.json`` files under those roots fill ``cwd`` and the session times
+    of the Cursor sessions that match (see :func:`_apply_cursor_chat_metas`).
+    Nothing is scanned for chat metas by default.
     """
     result = BuildResult(db_path=str(Path(db_path).expanduser()))
     claude_files, claude_missing = iter_transcripts(sources)
     opencode_files, opencode_missing = iter_opencode_sources(opencode_sources)
     cursor_files, cursor_missing = iter_cursor_sources(cursor_sources)
+    cursor_chat_files, cursor_chat_missing = iter_cursor_chat_sources(cursor_chats_sources)
     codex_files, codex_missing = iter_codex_sources(codex_sources)
-    result.missing_sources = claude_missing + opencode_missing + cursor_missing + codex_missing
-    result.n_files = len(claude_files) + len(opencode_files) + len(cursor_files) + len(codex_files)
+    result.missing_sources = (
+        claude_missing + opencode_missing + cursor_missing + cursor_chat_missing + codex_missing
+    )
+    result.n_files = (
+        len(claude_files) + len(opencode_files) + len(cursor_files) + len(codex_files)
+    )
 
     kaiba_recalls_by_query: dict[str, list[tuple[datetime | None, str]]] = {}
     if cursor_files:
@@ -1428,6 +1554,7 @@ def build(
             sources=sources,
             opencode_sources=opencode_sources,
             cursor_sources=cursor_sources,
+            cursor_chats_sources=cursor_chats_sources,
             codex_sources=codex_sources,
         )
         known = _known_sources(connection)
@@ -1642,6 +1769,9 @@ def build(
                 result.n_recall_calls += len(recall_rows)
                 result.n_tool_calls += len(parsed_codex.tool_calls)
                 result.n_parse_errors += parsed_codex.n_parse_errors
+
+            if cursor_chat_files:
+                _apply_cursor_chat_metas(connection, cursor_chat_files, result)
     finally:
         connection.close()
     return result
@@ -1681,6 +1811,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
         sources = _read_meta_json_list(connection, META_SOURCES_KEY)
         opencode_sources = _read_meta_json_list(connection, META_OPENCODE_SOURCES_KEY)
         cursor_sources = _read_meta_json_list(connection, META_CURSOR_SOURCES_KEY)
+        cursor_chats_sources = _read_meta_json_list(connection, META_CURSOR_CHATS_SOURCES_KEY)
         codex_sources = _read_meta_json_list(connection, META_CODEX_SOURCES_KEY)
 
         # If no roots recorded, return early with None for roots and gap
@@ -1688,6 +1819,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
             sources is None
             and opencode_sources is None
             and cursor_sources is None
+            and cursor_chats_sources is None
             and codex_sources is None
         ):
             return DatabaseInfo(
@@ -1698,6 +1830,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
                 sources=None,
                 opencode_sources=None,
                 cursor_sources=None,
+                cursor_chats_sources=None,
                 codex_sources=None,
                 freshness_gap=None,
             )
@@ -1707,6 +1840,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
         source_counts = _count_files_per_root(known, sources or [])
         opencode_counts = _count_files_per_root(known, opencode_sources or [])
         cursor_counts = _count_files_per_root(known, cursor_sources or [])
+        cursor_chats_counts = _count_files_per_root(known, cursor_chats_sources or [])
         codex_counts = _count_files_per_root(known, codex_sources or [])
 
         # Compute freshness gap
@@ -1726,6 +1860,7 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
             sources=source_counts,
             opencode_sources=opencode_counts,
             cursor_sources=cursor_counts,
+            cursor_chats_sources=cursor_chats_counts,
             codex_sources=codex_counts,
             freshness_gap=freshness_gap,
         )

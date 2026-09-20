@@ -63,3 +63,20 @@ def test_every_subcommand_is_documented_in_readme() -> None:
         "Add a README entry (an 'ashiato <name>' synopsis line or a "
         "'<name>' bullet) for each, or remove them from _build_arg_parser."
     )
+
+
+def test_cursor_gaps_are_attributed_to_the_export_not_to_cursor() -> None:
+    """Issue #87: the README's Cursor row must not claim Cursor records no
+    tool results or no timestamps -- those are gaps of the agent-transcript
+    *export*, and Cursor's own undocumented chats store holds both.
+    """
+    text = README.read_text(encoding="utf-8")
+    # The two false claims are gone.
+    assert "Cursor records no tool result whatsoever" not in text
+    assert "Cursor records no timestamps at all" not in text
+    # Both gaps are now attributed to the export, and the store that does
+    # hold the data is named, along with what is read from it today.
+    assert "the agent-transcript export records no timestamps" in text
+    assert "the export records no tool result whatsoever" in text
+    assert "~/.cursor/chats/<workspace-hash>/<session-uuid>/" in text
+    assert "meta.json" in text

@@ -322,7 +322,13 @@ def test_format_version_is_unchanged():
     # tool_calls row per tool_use block with outcome / is_error NULL -- the
     # format records no tool result at all) -- the same Cursor source bytes
     # yield rows where version 13 derived none, so a rebuild is required.
-    assert FORMAT_VERSION == 14
+    # Bumped to 15 by issue #87: with `--cursor-chats-source` given, Cursor
+    # sessions now carry cwd (sessions/events/tool_calls) and the session
+    # times (started_at/ended_at) read from the undocumented chats meta.json
+    # -- the same Cursor source bytes yield different rows than version 14
+    # (which left all three cwd columns and the session times NULL), so a
+    # rebuild is required.
+    assert FORMAT_VERSION == 15
 
 
 # ---------------------------------------------------------------- read-only discipline
