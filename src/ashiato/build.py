@@ -412,7 +412,7 @@ def _compute_freshness_gap(
     sources: list[str],
     opencode_sources: list[str],
     cursor_sources: list[str],
-    codex_sources: list[str] = [],
+    codex_sources: list[str],
 ) -> int:
     """Count files under roots that are not in source_files or have different size/mtime.
 
@@ -1025,7 +1025,9 @@ def build(
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
 ) -> BuildResult:
-    """Parse every transcript under *sources* / *opencode_sources* / *cursor_sources* / *codex_sources*."""
+    """Parse every transcript under *sources* / *opencode_sources* / *cursor_sources*
+    / *codex_sources*.
+    """
     result = BuildResult(db_path=str(Path(db_path).expanduser()))
     claude_files, claude_missing = iter_transcripts(sources)
     opencode_files, opencode_missing = iter_opencode_sources(opencode_sources)
@@ -1307,7 +1309,12 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
         codex_sources = _read_meta_json_list(connection, META_CODEX_SOURCES_KEY)
 
         # If no roots recorded, return early with None for roots and gap
-        if sources is None and opencode_sources is None and cursor_sources is None and codex_sources is None:
+        if (
+            sources is None
+            and opencode_sources is None
+            and cursor_sources is None
+            and codex_sources is None
+        ):
             return DatabaseInfo(
                 db_path=str(path),
                 table_counts=counts,
@@ -1329,7 +1336,11 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
 
         # Compute freshness gap
         freshness_gap = _compute_freshness_gap(
-            connection, sources or [], opencode_sources or [], cursor_sources or [], codex_sources or []
+            connection,
+            sources or [],
+            opencode_sources or [],
+            cursor_sources or [],
+            codex_sources or [],
         )
 
         return DatabaseInfo(

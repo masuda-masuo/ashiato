@@ -27,7 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
 
-from ashiato.codex import CodexToolCall, ParsedCodexFile
+from ashiato.codex import ParsedCodexFile
 from ashiato.cursor import CursorToolCall, ParsedCursorFile
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, ParsedFile
@@ -464,7 +464,13 @@ def extract_from_codex(
         activity.setdefault(chunk.session_id, []).append(_Activity(chunk.seq, chunk.text))
     for call in parsed.tool_calls:
         text = " ".join(
-            part for part in (call.tool_name, json.dumps(call.input) if call.input else None, call.output) if part
+            part
+            for part in (
+                call.tool_name,
+                json.dumps(call.input) if call.input else None,
+                call.output,
+            )
+            if part
         )
         if text:
             activity.setdefault(call.session_id, []).append(_Activity(call.seq, text))

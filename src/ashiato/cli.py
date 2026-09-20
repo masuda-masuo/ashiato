@@ -113,7 +113,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         dest="codex_source",
         metavar="DIR",
-        help=f"directory searched recursively for Codex session *.jsonl (repeatable; default {DEFAULT_CODEX_SOURCE})",
+        help=(
+            f"directory searched recursively for Codex session *.jsonl "
+            f"(repeatable; default {DEFAULT_CODEX_SOURCE})"
+        ),
     )
     build_parser.add_argument(
         "--kaiba-db",
