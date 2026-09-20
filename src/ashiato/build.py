@@ -62,6 +62,7 @@ from ashiato.parser import (
     summarize_input,
 )
 from ashiato.recall import (
+    CURSOR_MCP_TOOL_NAME,
     RECALL_CALL_COLUMNS,
     RecallCall,
     extract_from_claude,
@@ -85,6 +86,7 @@ from ashiato.schema import (
     REQUIRED_VIEWS,
     SCHEMA_SQL,
     SOURCE_CODEX,
+    SOURCE_CURSOR,
     SOURCE_OPENCODE,
     TABLES,
     column_names,
@@ -870,6 +872,129 @@ def _insert_opencode_parsed(
     )
 
 
+def _cursor_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
+    """Map a ``CursorTextChunk`` to an ``Event``-shaped row for insertion.
+
+    ``event_id`` is synthesised and file-path-scoped, the same way the
+    opencode and Codex paths' are -- ``seq`` alone does not distinguish two
+    text blocks of one assistant message, so ``block_index`` is part of the
+    id (the parser can emit several text chunks from one transcript line).
+    ``ts`` is NULL: a Cursor transcript records no timestamp at all, and
+    ``seq`` / ``block_index`` already order the blocks within a file.  Every
+    column Cursor has no value for -- ``role``, ``parent_uuid``, ``depth``,
+    ``is_sidechain``, ``is_meta``, the permission/effort fields, ``model``,
+    ``cwd``, ``git_branch`` -- is NULL, never a placeholder.
+    """
+    from ashiato.cursor import CursorTextChunk as _CTC
+
+    assert isinstance(chunk, _CTC)
+    event_id = f"cursor:text:{chunk.file_path}:{chunk.seq}:{chunk.block_index}"
+    return _event_row(
+        Event(
+            event_id=event_id,
+            session_id=chunk.session_id,
+            file_path=chunk.file_path,
+            source=SOURCE_CURSOR,
+            seq=chunk.seq,
+            ts=None,
+            type="text",
+            role=None,
+            parent_uuid=None,
+            depth=None,  # type: ignore[arg-type]  # no parent tree in Cursor -> NULL
+            is_sidechain=None,  # type: ignore[arg-type]  # no subagent concept -> NULL
+            is_meta=None,  # type: ignore[arg-type]  # no role/developer signal -> NULL
+            permission_mode=None,
+            effort=None,
+            request_id=None,
+            message_id=None,
+            model=None,
+            cwd=None,
+            git_branch=None,
+            text=chunk.text,
+            raw=chunk.text,
+        )
+    )
+
+
+def _cursor_tool_call_to_row(call: object) -> list[object]:
+    """Map a ``CursorToolCall`` to a ``ToolCall``-shaped row for insertion.
+
+    ``outcome`` is NULL and ``is_error`` is NULL, deliberately -- *not* what
+    :func:`classify_outcome` would return for these calls.  A Cursor tool_use
+    block records no result at all: no output, no status, nothing, so feeding
+    that absence to ``classify_outcome`` yields ``'pending'`` for every call.
+    ``'pending'`` means "the session ended mid-call" -- a claim about the
+    session, not about the call -- and a later reader would take the whole
+    Cursor corpus to be sessions that were constantly interrupted.  The
+    format recording nothing is not the same as the call not finishing.
+    ``hygiene`` counts ``outcome = 'pending'`` as ``pending_tool_call`` and
+    ``nominate`` gates on ``outcome = 'error'``; a NULL is invisible to both,
+    which is exactly right for a call whose fate is genuinely unknown -- it is
+    neither evidence of failure nor evidence of success.  ``is_error = False``
+    would be the same mistake in a different column: a call with unknown fate
+    is not a call known to have succeeded.  ``ts`` is NULL for the same reason
+    -- do not fabricate an ordering -- and ``seq`` / ``block_index`` already
+    give within-file order.  ``result_text`` / ``result_truncated`` are NULL
+    too: there is no recorded result to store or truncate.
+
+    ``tool_name`` is the recorded block name.  Cursor calls every MCP tool
+    through one block name, ``CallMcpTool``, and records which MCP tool it is
+    in the input (``server`` / ``toolName``) instead of in the name, so the
+    mcp/``split_tool_name`` spelling the other sources use does not apply;
+    ``mcp_server`` is read straight out of the recorded input.  ``input`` and
+    ``input_summary`` come from the recorded input as with every other source.
+
+    ``call_event_id`` / ``result_event_id`` are NULL: Cursor does not link a
+    tool_use block to any ``events`` row (it records no result event at all),
+    so the issue #75 invariant -- every non-null id resolves to an ``events``
+    row -- holds rather than being satisfied with a synthetic id.
+    """
+    from ashiato.cursor import CursorToolCall as _CTC
+
+    assert isinstance(call, _CTC)
+    tool_input = call.input
+    input_json: str | None = (
+        None if tool_input is None
+        else json.dumps(tool_input, ensure_ascii=False, default=str)
+    )
+
+    # CallMcpTool blocks name the real tool in the input, not the block name.
+    tool_kind = "builtin"
+    mcp_server: str | None = None
+    if call.name == CURSOR_MCP_TOOL_NAME and isinstance(tool_input, dict):
+        server = tool_input.get("server")
+        tool_name = tool_input.get("toolName")
+        if isinstance(server, str) or isinstance(tool_name, str):
+            tool_kind = "mcp"
+        if isinstance(server, str):
+            mcp_server = server
+
+    return [
+        call.call_id,          # tool_use_id
+        call.session_id,
+        call.file_path,
+        SOURCE_CURSOR,         # source
+        call.seq,
+        None,                  # ts -- Cursor records none; seq/block_index order within a file
+        None,                  # call_event_id
+        None,                  # result_event_id
+        call.name,             # tool_name -- the recorded block name
+        tool_kind,
+        mcp_server,
+        input_json,
+        summarize_input(call.name, tool_input),
+        None,                  # outcome -- unknown fate, never 'pending' or 'ok'
+        None,                  # is_error -- unknown fate, never False
+        None,                  # result_text -- no recorded result
+        None,                  # result_truncated -- no recorded result
+        None,                  # duration_ms
+        None,                  # permission_mode
+        None,                  # cwd
+        None,                  # is_sidechain
+        None,                  # parent_tool_use_id
+    ]
+
+
 def _insert_cursor_parsed(
     connection: duckdb.DuckDBPyConnection,
     parsed: ParsedCursorFile,
@@ -882,9 +1007,47 @@ def _insert_cursor_parsed(
 ) -> None:
     """The Cursor counterpart of :func:`_insert_parsed` / :func:`_insert_opencode_parsed`.
 
-    Same scope as opencode: only ``recall_calls`` and ``source_files`` are
-    touched, never ``sessions`` / ``events`` / ``tool_calls``.
+    Unlike opencode, one file *is* one session: ``ParsedCursorFile`` carries a
+    file-level ``session_id`` (the transcript file name's uuid stem), so one
+    ``sessions`` row per file, one ``events`` row per assistant text chunk,
+    and one ``tool_calls`` row per tool_use block, all with ``source =
+    'cursor'``.  ``ts`` stays NULL everywhere -- Cursor records no timestamp
+    at all -- and ``source_files.n_events`` / ``n_tool_calls`` reflect the
+    rows actually inserted, not a hardcoded zero.  The kaiba-ledger join
+    feeds ``recall_calls`` only: the main tables are built purely from what
+    the transcript records.
     """
+    session = Session(
+        session_id=parsed.session_id,
+        file_path=parsed.file_path,
+        source=SOURCE_CURSOR,
+        project_dir=None,
+        cwd=None,
+        git_branch=None,
+        cc_version=None,
+        entrypoint=None,
+        started_at=None,
+        ended_at=None,
+        n_events=len(parsed.text_chunks),
+        n_tool_calls=len(parsed.tool_calls),
+        input_tokens=None,  # type: ignore[arg-type]  # token counts are NULL for Cursor
+        output_tokens=None,  # type: ignore[arg-type]
+        cache_read_tokens=None,  # type: ignore[arg-type]
+        cache_creation_tokens=None,  # type: ignore[arg-type]
+    )
+    _insert_rows(connection, "sessions", [_session_row(session)], scratch=scratch)
+    _insert_rows(
+        connection,
+        "events",
+        [_cursor_text_chunk_to_event(chunk) for chunk in parsed.text_chunks],
+        scratch=scratch,
+    )
+    _insert_rows(
+        connection,
+        "tool_calls",
+        [_cursor_tool_call_to_row(call) for call in parsed.tool_calls],
+        scratch=scratch,
+    )
     _insert_rows(
         connection,
         "recall_calls",
@@ -900,8 +1063,8 @@ def _insert_cursor_parsed(
                 stat.st_size,
                 stat.st_mtime,
                 content_hash,
-                0,
-                0,
+                len(parsed.text_chunks),    # n_events
+                len(parsed.tool_calls),     # n_tool_calls
                 parsed.n_parse_errors,
                 built_at,
             )
@@ -1425,6 +1588,9 @@ def build(
 
                 result.n_processed += 1
                 result.n_recall_calls += len(recall_rows)
+                result.n_sessions += 1
+                result.n_events += len(parsed_cur.text_chunks)
+                result.n_tool_calls += len(parsed_cur.tool_calls)
                 result.n_parse_errors += parsed_cur.n_parse_errors
 
             for path in codex_files:
