@@ -254,7 +254,11 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                             # A failed call with no result: its error message is
                             # the only output it has.
                             res = error
-                        tool_name = f"mcp__{server}__{tool_n}" if server and tool_n else (tool_n or "McpTool")
+                        tool_name = (
+                            f"mcp__{server}__{tool_n}"
+                            if server and tool_n
+                            else (tool_n or "McpTool")
+                        )
                         tool_calls.append(
                             CodexToolCall(
                                 call_id=str(item_id),
