@@ -31,6 +31,7 @@ from ashiato.codex import ParsedCodexFile
 from ashiato.cursor import CursorToolCall, ParsedCursorFile
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, ParsedFile
+from ashiato.schema import SOURCE_CLAUDE_CODE, SOURCE_CODEX, SOURCE_CURSOR, SOURCE_OPENCODE
 
 #: Tool names that identify a kaiba recall call, one per source format.
 CLAUDE_RECALL_TOOL = "mcp__kaiba__recall"
@@ -43,12 +44,6 @@ CODEX_RECALL_TOOL = "mcp__kaiba__recall"
 CURSOR_MCP_TOOL_NAME = "CallMcpTool"
 CURSOR_RECALL_SERVER = "kaiba"
 CURSOR_RECALL_TOOL = "recall"
-
-#: Values ``recall_calls.source`` takes.
-SOURCE_CLAUDE_CODE = "claude_code"
-SOURCE_OPENCODE = "opencode"
-SOURCE_CURSOR = "cursor"
-SOURCE_CODEX = "codex"
 
 #: How much of a session's post-recall activity is scanned for "was this
 #: used" evidence: whichever bound is hit first.  Generous on purpose --

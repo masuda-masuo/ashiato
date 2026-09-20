@@ -18,8 +18,18 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
   repositories once (`gh repo list <owner> --limit 200 --json name`) and checks
   issue/PR references through the `gh` CLI; the only data that leaves the
   machine is the owner name and `owner/repo/number` — never transcript text.
-- **Nothing is dropped.** Every parsed line keeps its verbatim JSON in `events.raw`, so
-  anything this schema does not model is still there to query.
+- **Source coverage is per format, not unconditional.** Which tables a transcript format
+  populates, and what `events.raw` holds there, differs per source -- a count over
+  `tool_calls` means "Claude Code plus Codex", never "all four agents":
+
+  | source | populates | `events.raw` holds |
+  | --- | --- | --- |
+  | Claude Code | `sessions`, `events`, `tool_calls`, `recall_calls` | the verbatim JSON of the transcript line -- nothing a Claude transcript contains is dropped |
+  | Codex | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted message text (not the source line) for text events; the verbatim item JSON for `context_compaction` rows -- lifecycle, turn-context and token-usage records are not modelled at all |
+  | opencode | `recall_calls` | no `events` rows: only recall calls are ingested |
+  | Cursor | `recall_calls` | no `events` rows: only recall calls are ingested |
+
+  `source_files` (per-file bookkeeping) is populated by all four.
 
 ## Install
 
@@ -461,6 +471,7 @@ tool_calls (table)
   tool_use_id                   VARCHAR
   session_id                    VARCHAR
   file_path                     VARCHAR
+  source                        VARCHAR
   seq                           BIGINT
   ts                            TIMESTAMP
   call_event_id                 VARCHAR
@@ -570,10 +581,11 @@ classify these rows by `status` instead.
 
 ### `sessions` — one row per transcript file
 
-`session_id`, `file_path`, `project_dir`, `cwd`, `git_branch`, `cc_version`, `entrypoint`,
+`session_id`, `file_path`, `source`, `project_dir`, `cwd`, `git_branch`, `cc_version`, `entrypoint`,
 `started_at`, `ended_at`, `n_events`, `n_tool_calls`, `input_tokens`, `output_tokens`,
 `cache_read_tokens`, `cache_creation_tokens`.
 
+`source` records which transcript format produced the session (`claude_code` or `codex`).
 `cwd` / `git_branch` / `cc_version` / `entrypoint` are the last non-null value seen in the
 file. Token counts are **deduplicated by `request_id`** before summing: the same `usage`
 object is repeated across several lines of one request, and summing naively inflates totals
@@ -581,10 +593,11 @@ by roughly 2–3.5×. Lines with no `request_id` are counted once each.
 
 ### `events` — one row per JSONL line
 
-`event_id`, `session_id`, `file_path`, `seq`, `ts`, `type`, `role`, `parent_uuid`, `depth`,
+`event_id`, `session_id`, `file_path`, `source`, `seq`, `ts`, `type`, `role`, `parent_uuid`, `depth`,
 `is_sidechain`, `is_meta`, `permission_mode`, `effort`, `request_id`, `message_id`, `model`,
 `cwd`, `git_branch`, `text`, `raw`.
 
+`source` records which transcript format produced the row (`claude_code` or `codex`).
 `event_id` comes from `uuid`; record types that carry no uuid (`file-history-snapshot`,
 `mode`, `ai-title`, …) get a synthesized `"{file_path}:{lineno}"`. `depth` is ancestry depth
 along `parent_uuid`, computed once per node and reused by its descendants — real corpora
@@ -592,11 +605,12 @@ reach chains ~2,400 deep, so the walk is both memoized and iterative.
 
 ### `tool_calls` — one row per tool invocation and its outcome
 
-`tool_use_id`, `session_id`, `file_path`, `seq`, `ts`, `call_event_id`, `result_event_id`,
+`tool_use_id`, `session_id`, `file_path`, `source`, `seq`, `ts`, `call_event_id`, `result_event_id`,
 `tool_name`, `tool_kind`, `mcp_server`, `input`, `input_summary`, `outcome`, `is_error`,
 `result_text`, `result_truncated`, `duration_ms`, `permission_mode`, `cwd`, `is_sidechain`,
 `parent_tool_use_id`.
 
+`source` records which transcript format produced the call (`claude_code` or `codex`).
 Built by joining each `tool_use` block to its `tool_result` on `tool_use_id`; the call is on
 an assistant line and the result on a later user line. `seq`, `ts`, `permission_mode`, `cwd`
 and `is_sidechain` come from the calling event. `input` is a DuckDB `JSON` column, so

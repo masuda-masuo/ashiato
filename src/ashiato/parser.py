@@ -19,6 +19,8 @@ from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ashiato.schema import SOURCE_CLAUDE_CODE
+
 #: Prefixes that identify a tool result as a permission denial rather than a
 #: real failure: a result is a denial only when its text, after stripping
 #: leading whitespace, *starts* with one of these -- a successful result that
@@ -75,6 +77,7 @@ class Event:
     event_id: str
     session_id: str | None
     file_path: str
+    source: str
     seq: int
     ts: datetime | None
     type: str | None
@@ -101,6 +104,7 @@ class ToolCall:
     tool_use_id: str
     session_id: str | None
     file_path: str
+    source: str
     seq: int
     ts: datetime | None
     call_event_id: str
@@ -127,6 +131,7 @@ class Session:
 
     session_id: str | None
     file_path: str
+    source: str
     project_dir: str | None
     cwd: str | None
     git_branch: str | None
@@ -417,6 +422,7 @@ def _build_event(
         event_id=uuid or f"{file_path}:{seq}",
         session_id=session_id_of(record) or fallback_session_id,
         file_path=file_path,
+        source=SOURCE_CLAUDE_CODE,
         seq=seq,
         ts=parse_timestamp(record.get("timestamp")),
         type=_as_str(record.get("type")),
@@ -495,6 +501,7 @@ def _build_tool_calls(
                     tool_use_id=tool_use_id,
                     session_id=event.session_id,
                     file_path=event.file_path,
+                    source=SOURCE_CLAUDE_CODE,
                     seq=event.seq,
                     ts=event.ts,
                     call_event_id=event.event_id,
@@ -575,6 +582,7 @@ def _build_session(
     return Session(
         session_id=session_id,
         file_path=file_path,
+        source=SOURCE_CLAUDE_CODE,
         project_dir=path.parent.name or None,
         cwd=last["cwd"],
         git_branch=last["gitBranch"],

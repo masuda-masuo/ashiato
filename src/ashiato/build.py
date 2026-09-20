@@ -84,6 +84,7 @@ from ashiato.schema import (
     RECALL_FOLLOWUPS_SQL,
     REQUIRED_VIEWS,
     SCHEMA_SQL,
+    SOURCE_CODEX,
     TABLES,
     column_names,
     insert_sql,
@@ -780,6 +781,7 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
         call.call_id,         # tool_use_id
         call.session_id,
         call.file_path,
+        SOURCE_CODEX,         # source
         call.seq,
         call.ts,               # ts
         call_event_id,
@@ -812,6 +814,7 @@ def _codex_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
         event_id=event_id,
         session_id=chunk.session_id,
         file_path=chunk.file_path,
+        source=SOURCE_CODEX,
         seq=chunk.seq,
         ts=chunk.ts,
         type="text",
@@ -848,6 +851,7 @@ def _codex_event_to_row(event: object) -> tuple[object, ...]:
         event_id=event_id,
         session_id=event.session_id,
         file_path=event.file_path,
+        source=SOURCE_CODEX,
         seq=event.seq,
         ts=event.ts,
         type=event.type,
@@ -890,6 +894,7 @@ def _insert_codex_parsed(
     session = Session(
         session_id=parsed.session_id,
         file_path=parsed.file_path,
+        source=SOURCE_CODEX,
         project_dir=None,
         cwd=None,
         git_branch=None,
