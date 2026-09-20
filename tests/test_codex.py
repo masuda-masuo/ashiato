@@ -319,6 +319,102 @@ def test_parse_codex_command_completed_carries_cwd(tmp_path: Path):
     assert parsed.tool_calls[0].status == "completed"
     assert parsed.tool_calls[0].exit_code == 0
     assert parsed.tool_calls[0].cwd is None
+
+
+def test_parse_codex_cwd_file_uri_is_normalised(tmp_path: Path):
+    """A CommandExecution cwd written as a file:// URI becomes a plain path."""
+    jsonl_file = _write_items(tmp_path, "cwd-uri.jsonl", [
+        {
+            "type": "CommandExecution",
+            "id": "uri-1",
+            "command": "pwd",
+            "cwd": "file:///a/b",
+            "stdout": "/a/b\n",
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].cwd == "/a/b"
+
+
+def test_parse_codex_cwd_plain_path_stored_unchanged(tmp_path: Path):
+    """A cwd that is already a plain filesystem path is stored as-is."""
+    jsonl_file = _write_items(tmp_path, "cwd-plain.jsonl", [
+        {
+            "type": "CommandExecution",
+            "id": "plain-1",
+            "command": "pwd",
+            "cwd": "/a/b",
+            "stdout": "/a/b\n",
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert parsed.tool_calls[0].cwd == "/a/b"
+
+
+def test_parse_codex_cwd_file_uri_percent_encoding_decodes(tmp_path: Path):
+    """A file:// URI with percent-encoding decodes to the correct path.
+
+    String surgery (``replace("file://", "")``) would leave ``%20`` and
+    percent-encoded non-ASCII bytes in place; urllib decodes them, so a path
+    containing a space or a non-ASCII character comes out correctly.
+    """
+    jsonl_file = _write_items(tmp_path, "cwd-pct.jsonl", [
+        {
+            "type": "CommandExecution",
+            "id": "pct-1",
+            "command": "pwd",
+            "cwd": "file:///work/My%20Project",
+            "stdout": "/work/My Project\n",
+        },
+        {
+            "type": "CommandExecution",
+            "id": "pct-2",
+            "command": "pwd",
+            "cwd": "file:///home/masuda/dev/%E3%81%82",
+            "stdout": "/home/masuda/dev/\u3042\n",
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert parsed.tool_calls[0].cwd == "/work/My Project"
+    assert parsed.tool_calls[1].cwd == "/home/masuda/dev/\u3042"
+
+
+def test_parse_codex_cwd_never_raises_or_guesses(tmp_path: Path):
+    """Non-string, empty, and non-file-scheme cwd values stay None.
+
+    A non-string and an empty string cannot be a path; a URI with a scheme
+    other than ``file:`` (e.g. https) cannot be decoded into a filesystem
+    path without guessing, so all three map to None rather than a mangled
+    value -- and none of them raises.
+    """
+    jsonl_file = _write_items(tmp_path, "cwd-bad.jsonl", [
+        {
+            "type": "CommandExecution",
+            "id": "bad-1",
+            "command": "pwd",
+            "cwd": 42,
+            "stdout": "/a\n",
+        },
+        {
+            "type": "CommandExecution",
+            "id": "bad-2",
+            "command": "pwd",
+            "cwd": "",
+            "stdout": "/a\n",
+        },
+        {
+            "type": "CommandExecution",
+            "id": "bad-3",
+            "command": "pwd",
+            "cwd": "https://example.com/work",
+            "stdout": "/a\n",
+        },
+    ])
+    parsed = parse_file(jsonl_file)
+    assert [call.cwd for call in parsed.tool_calls] == [None, None, None]
+
+
 def test_parse_codex_live_message_items(tmp_path: Path):
     """Live-shaped response_item with message payload (output_text/input_text)."""
     jsonl_file = tmp_path / "live-message.jsonl"

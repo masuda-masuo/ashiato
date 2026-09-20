@@ -394,7 +394,11 @@ class TestNormalizeCommand:
 
 class TestFormatVersion:
     def test_format_version_is_unchanged(self) -> None:
-        assert FORMAT_VERSION == 8
+        # Bumped to 9 by issues #72/#73: Codex CommandExecution cwd is now
+        # normalised from a file:// URI to a plain path, and Codex
+        # recall_calls rows carry the call's timestamp instead of NULL --
+        # same source bytes yield different rows, so a rebuild is required.
+        assert FORMAT_VERSION == 9
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

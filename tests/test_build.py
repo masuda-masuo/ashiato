@@ -3242,3 +3242,126 @@ def test_codex_build_item_completed_plus_response_item_one_event_row(tmp_path: P
         assert text2 == "User message"
     finally:
         connection2.close()
+
+
+# ---------------------------------------------------------------- recall_calls (codex)
+
+
+def _write_codex_recall_session(
+    path: Path, session_id: str, calls: list[tuple[str | None, dict]]
+) -> None:
+    """Write a Codex JSONL session of item_completed payloads with record
+    timestamps: each call is a (timestamp or None, item) pair."""
+    lines: list[dict] = [
+        {"type": "session_meta", "payload": {"id": session_id}},
+    ]
+    for timestamp, item in calls:
+        line: dict = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": session_id,
+                "item": item,
+            },
+        }
+        if timestamp is not None:
+            line["timestamp"] = timestamp
+        lines.append(line)
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+
+def test_codex_recall_calls_carry_the_call_timestamp(tmp_path: Path):
+    """A Codex recall row's ts is the call's own timestamp; a call with no
+    parseable timestamp still produces a row with ts null."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_recall_session(
+        codex_dir / "recall-ts.jsonl",
+        "codex-recall-ts",
+        [
+            (
+                "2026-09-05T10:00:00Z",
+                {
+                    "type": "McpToolCall",
+                    "id": "recall-ts-1",
+                    "server": "kaiba",
+                    "tool": "recall",
+                    "arguments": {"query": "backoff retry"},
+                    "result": "use anchored_backoff_v7",
+                },
+            ),
+            (
+                None,
+                {
+                    "type": "McpToolCall",
+                    "id": "recall-ts-2",
+                    "server": "kaiba",
+                    "tool": "recall",
+                    "arguments": {"query": "other"},
+                    "result": "answer",
+                },
+            ),
+        ],
+    )
+
+    db_path = tmp_path / "codex_recall_ts.duckdb"
+    result = build([], db_path, codex_sources=[codex_dir])
+    assert result.n_recall_calls == 2
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT call_id, ts FROM recall_calls ORDER BY call_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("recall-ts-1", datetime(2026, 9, 5, 10, 0, 0)),
+        ("recall-ts-2", None),
+    ]
+
+
+def test_codex_recall_ts_lands_in_a_time_window(tmp_path: Path):
+    """A time-windowed query over recall_calls spanning a known Codex recall
+    returns it.
+
+    Before issue #73 every Codex recall row had ts NULL, and NULL fails every
+    comparison -- so any window (``ashiato recalls --since``, ``WHERE ts
+    BETWEEN ...``) silently dropped all Codex recalls.  This pins the fixed
+    behaviour: the recall is findable in time.
+    """
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_recall_session(
+        codex_dir / "recall-window.jsonl",
+        "codex-recall-win",
+        [
+            (
+                "2026-09-05T10:00:00Z",
+                {
+                    "type": "McpToolCall",
+                    "id": "recall-win-1",
+                    "server": "kaiba",
+                    "tool": "recall",
+                    "arguments": {"query": "flaky retry"},
+                    "result": "anchored_backoff_v7",
+                },
+            ),
+        ],
+    )
+
+    db_path = tmp_path / "codex_recall_window.duckdb"
+    result = build([], db_path, codex_sources=[codex_dir])
+    assert result.n_recall_calls == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT call_id, query FROM recall_calls WHERE ts BETWEEN ? AND ?",
+            [datetime(2026, 9, 5, 9, 0, 0), datetime(2026, 9, 5, 11, 0, 0)],
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [("recall-win-1", "flaky retry")]
