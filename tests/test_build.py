@@ -2651,7 +2651,7 @@ def test_codex_build_inserts_events_for_text_chunks(tmp_path: Path):
             "SELECT text, ts, role FROM events ORDER BY seq"
         ).fetchall()
         assert rows[0][0] == "Hello world"
-        assert rows[0][2] == "assistant"
+        assert rows[0][2] == "unknown"
         assert rows[1][0] == "Second message"
     finally:
         connection.close()
@@ -2966,3 +2966,279 @@ def test_codex_build_new_item_types_tolerate_malformed_instances(tmp_path: Path)
         ) == 1
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------- codex #65/#67: role, is_meta, event_id
+
+
+def _write_codex_session_with_roles(
+    path: Path,
+    session_id: str,
+    *,
+    messages: list[dict],
+    timestamps: list[str] | None = None,
+) -> None:
+    """Write a Codex JSONL with response_item messages carrying role."""
+    lines: list[dict] = []
+    ts_list = timestamps or []
+    meta: dict = {"type": "session_meta", "payload": {"id": session_id}}
+    if ts_list:
+        meta["timestamp"] = ts_list[0]
+    lines.append(meta)
+
+    for i, msg in enumerate(messages):
+        ts = ts_list[i + 1] if i + 1 < len(ts_list) else None
+        ev: dict = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": f"msg-{i}",
+                "role": msg["role"],
+                "content": [{"type": "output_text", "text": msg["text"]}],
+            },
+        }
+        if ts:
+            ev["timestamp"] = ts
+        lines.append(ev)
+
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+
+def test_codex_build_role_and_is_meta(tmp_path: Path):
+    """Codex text events carry the real role from the JSONL; developer is is_meta."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_roles(
+        codex_dir / "role.jsonl",
+        "codex-role-1",
+        messages=[
+            {"role": "assistant", "text": "I can help with that."},
+            {"role": "user", "text": "Please fix the bug."},
+            {"role": "developer", "text": "<environment_context>...</environment_context>"},
+        ],
+        timestamps=[
+            "2026-09-05T10:00:00Z",
+            "2026-09-05T10:00:01Z",
+            "2026-09-05T10:00:02Z",
+            "2026-09-05T10:00:03Z",
+        ],
+    )
+
+    db_path = tmp_path / "codex_role.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT text, role, is_meta FROM events ORDER BY seq"
+        ).fetchall()
+        assert len(rows) == 3
+        assert rows[0] == ("I can help with that.", "assistant", False)
+        assert rows[1] == ("Please fix the bug.", "user", False)
+        assert rows[2] == (
+            "<environment_context>...</environment_context>",
+            "developer",
+            True,
+        )
+    finally:
+        connection.close()
+
+
+def test_codex_build_unknown_role_fallback(tmp_path: Path):
+    """A text chunk with role=None gets fallback 'unknown' and is_meta=False."""
+    from ashiato.build import _codex_text_chunk_to_event
+    from ashiato.codex import CodexTextChunk
+    from ashiato.parser import EVENT_COLUMNS
+
+    chunk = CodexTextChunk(
+        session_id="s1",
+        file_path="/data/sessions/f.jsonl",
+        seq=5,
+        ts=None,
+        text="fallback role test",
+        role=None,
+    )
+    row = _codex_text_chunk_to_event(chunk)
+    role_idx = list(EVENT_COLUMNS).index("role")
+    is_meta_idx = list(EVENT_COLUMNS).index("is_meta")
+    assert row[role_idx] == "unknown"
+    assert row[is_meta_idx] is False
+
+
+def test_codex_build_event_id_includes_file_path(tmp_path: Path):
+    """Two files with a text chunk at the same seq produce different event_ids."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_roles(
+        codex_dir / "session_a.jsonl",
+        "codex-a",
+        messages=[{"role": "assistant", "text": "file A msg"}],
+        timestamps=["2026-09-05T10:00:00Z", "2026-09-05T10:00:01Z"],
+    )
+    _write_codex_session_with_roles(
+        codex_dir / "session_b.jsonl",
+        "codex-b",
+        messages=[{"role": "assistant", "text": "file B msg"}],
+        timestamps=["2026-09-05T10:00:00Z", "2026-09-05T10:00:01Z"],
+    )
+
+    db_path = tmp_path / "codex_eid.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        ids = connection.execute(
+            "SELECT event_id FROM events ORDER BY file_path"
+        ).fetchall()
+        assert len(ids) == 2
+        assert ids[0][0] != ids[1][0]
+    finally:
+        connection.close()
+
+
+def test_codex_build_event_id_deterministic(tmp_path: Path):
+    """Parsing the same file twice produces identical event_ids."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_roles(
+        codex_dir / "det.jsonl",
+        "codex-det",
+        messages=[{"role": "assistant", "text": "deterministic"}],
+        timestamps=["2026-09-05T10:00:00Z", "2026-09-05T10:00:01Z"],
+    )
+
+    db1 = tmp_path / "det1.duckdb"
+    build([], db1, codex_sources=[codex_dir])
+    db2 = tmp_path / "det2.duckdb"
+    build([], db2, codex_sources=[codex_dir])
+
+    conn1 = connect(db1, read_only=True)
+    try:
+        ids1 = conn1.execute("SELECT event_id FROM events ORDER BY seq").fetchall()
+    finally:
+        conn1.close()
+    conn2 = connect(db2, read_only=True)
+    try:
+        ids2 = conn2.execute("SELECT event_id FROM events ORDER BY seq").fetchall()
+    finally:
+        conn2.close()
+
+    assert ids1 == ids2
+
+
+def test_codex_build_item_completed_plus_response_item_one_event_row(tmp_path: Path):
+    """An item_completed of type AgentMessage (or UserMessage) that carries the
+    same text as a response_item message produces only one event row — the
+    parser does not match AgentMessage/UserMessage in item_completed, so only
+    the response_item path contributes a chunk.
+
+    Note: AgentResponse in item_completed *is* matched by the parser and would
+    produce a second row, but that shape does not appear in the real corpus for
+    dedup scenarios (the doubled-row path was ruled out of scope here).
+    """
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    path = codex_dir / "dedup_build.jsonl"
+    lines = [
+        {"timestamp": "2026-09-05T10:00:00Z", "type": "session_meta", "payload": {"id": "dedup-b1"}},
+        {
+            "timestamp": "2026-09-05T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "dedup-b1",
+                "item": {
+                    "type": "AgentMessage",
+                    "id": "msg-dedup-1",
+                    "content": [
+                        {"type": "output_text", "text": "Duplicate message"},
+                    ],
+                },
+            },
+        },
+        {
+            "timestamp": "2026-09-05T10:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-dedup",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Duplicate message"},
+                ],
+            },
+        },
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+    db_path = tmp_path / "codex_dedup_build.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        ev_count = scalar(connection, "SELECT count(*) FROM events")
+        assert ev_count == 1
+        role, text = connection.execute(
+            "SELECT role, text FROM events ORDER BY seq"
+        ).fetchone()
+        assert role == "assistant"
+        assert text == "Duplicate message"
+    finally:
+        connection.close()
+
+    # --- second case: UserMessage shape (separate dir so build doesn't pick up case 1) ---
+    codex_dir2 = tmp_path / "codex2"
+    codex_dir2.mkdir()
+    path2 = codex_dir2 / "dedup_build_user.jsonl"
+    lines2 = [
+        {"timestamp": "2026-09-05T10:00:00Z", "type": "session_meta", "payload": {"id": "dedup-b2"}},
+        {
+            "timestamp": "2026-09-05T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "dedup-b2",
+                "item": {
+                    "type": "UserMessage",
+                    "id": "msg-dedup-u1",
+                    "content": [
+                        {"type": "input_text", "text": "User message"},
+                    ],
+                },
+            },
+        },
+        {
+            "timestamp": "2026-09-05T10:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-dedup-u",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "User message"},
+                ],
+            },
+        },
+    ]
+    with open(path2, "w", encoding="utf-8") as f:
+        for line in lines2:
+            f.write(json.dumps(line) + "\n")
+
+    db_path2 = tmp_path / "codex_dedup_build_user.duckdb"
+    build([], db_path2, codex_sources=[codex_dir2])
+
+    connection2 = connect(db_path2, read_only=True)
+    try:
+        ev_count2 = scalar(connection2, "SELECT count(*) FROM events")
+        assert ev_count2 == 1
+        role2, text2 = connection2.execute(
+            "SELECT role, text FROM events ORDER BY seq"
+        ).fetchone()
+        assert role2 == "user"
+        assert text2 == "User message"
+    finally:
+        connection2.close()

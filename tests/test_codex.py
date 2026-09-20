@@ -376,6 +376,11 @@ def test_parse_codex_live_message_items(tmp_path: Path):
     # All have timestamps
     for chunk in parsed.text_chunks:
         assert chunk.ts is not None
+    # Roles are carried through from the payload
+    assert parsed.text_chunks[0].role == "assistant"
+    assert parsed.text_chunks[1].role == "user"
+    assert parsed.text_chunks[2].role == "developer"
+
 def _write_items(tmp_path: Path, name: str, items: list[dict]) -> Path:
     """Write one Codex session file whose item_completed payloads are *items*."""
     jsonl_file = tmp_path / name
@@ -544,3 +549,113 @@ def test_parse_codex_unknown_item_type_is_dropped_silently(tmp_path: Path):
     assert len(parsed.text_chunks) == 0
     assert len(parsed.events) == 0
     assert parsed.n_parse_errors == 0
+
+
+def test_parse_codex_role_fallback_for_missing_role(tmp_path: Path):
+    """A response_item message with no role still produces a chunk with role=None."""
+    jsonl_file = tmp_path / "no-role.jsonl"
+    lines = [
+        {"timestamp": "2026-09-05T10:00:00Z", "type": "session_meta", "payload": {"id": "no-role-1"}},
+        {
+            "timestamp": "2026-09-05T10:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-norole",
+                "content": [
+                    {"type": "output_text", "text": "No role here"},
+                ],
+            },
+        },
+    ]
+    with open(jsonl_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.text_chunks) == 1
+    assert parsed.text_chunks[0].role is None
+    assert parsed.text_chunks[0].text == "No role here"
+
+
+def test_parse_codex_role_fallback_for_non_string_role(tmp_path: Path):
+    """A response_item message with a non-string role still produces a chunk."""
+    jsonl_file = tmp_path / "bad-role.jsonl"
+    lines = [
+        {"timestamp": "2026-09-05T10:00:00Z", "type": "session_meta", "payload": {"id": "bad-role-1"}},
+        {
+            "timestamp": "2026-09-05T10:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-badrole",
+                "role": 42,
+                "content": [
+                    {"type": "output_text", "text": "Bad role value"},
+                ],
+            },
+        },
+    ]
+    with open(jsonl_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.text_chunks) == 1
+    # Non-string role is preserved as-is; build layer applies fallback
+    assert parsed.text_chunks[0].role == 42
+    assert parsed.text_chunks[0].text == "Bad role value"
+
+
+def test_parse_codex_item_completed_plus_response_item_dedup(tmp_path: Path):
+    """An item_completed of type AgentMessage (or UserMessage) that carries the
+    same text as a response_item message must produce exactly one text chunk —
+    from the response_item path only.
+
+    The parser does not match AgentMessage/UserMessage in item_completed, so
+    that path contributes no chunk.  (AgentResponse *is* matched and would
+    produce a second chunk, but that shape does not appear in real dedup
+    scenarios and was ruled out of scope here.)
+    """
+    jsonl_file = tmp_path / "dedup.jsonl"
+    lines = [
+        {"timestamp": "2026-09-05T10:00:00Z", "type": "session_meta", "payload": {"id": "dedup-1"}},
+        # item_completed AgentMessage — parser does NOT match this type
+        {
+            "timestamp": "2026-09-05T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "dedup-1",
+                "item": {
+                    "type": "AgentMessage",
+                    "id": "msg-dedup-1",
+                    "content": [
+                        {"type": "output_text", "text": "Hello from agent"},
+                    ],
+                },
+            },
+        },
+        # response_item message — parser DOES match this
+        {
+            "timestamp": "2026-09-05T10:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-dedup",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Hello from agent"},
+                ],
+            },
+        },
+    ]
+    with open(jsonl_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+    parsed = parse_file(jsonl_file)
+    assert len(parsed.text_chunks) == 1
+    chunk = parsed.text_chunks[0]
+    assert chunk.role == "assistant"
+    assert chunk.text == "Hello from agent"

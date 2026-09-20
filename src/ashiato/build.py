@@ -803,7 +803,8 @@ def _codex_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     from ashiato.codex import CodexTextChunk as _CTC
 
     assert isinstance(chunk, _CTC)
-    event_id = f"codex:text:{chunk.seq}"
+    event_id = f"codex:text:{chunk.file_path}:{chunk.seq}"
+    role = chunk.role if isinstance(chunk.role, str) else "unknown"
     return _event_row(Event(
         event_id=event_id,
         session_id=chunk.session_id,
@@ -811,11 +812,11 @@ def _codex_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
         seq=chunk.seq,
         ts=chunk.ts,
         type="text",
-        role="assistant",
+        role=role,
         parent_uuid=None,
         depth=0,
         is_sidechain=False,
-        is_meta=False,
+        is_meta=(role == "developer"),
         permission_mode=None,
         effort=None,
         request_id=None,

@@ -135,7 +135,11 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: Version 7 = Codex parser now ingests collab/delegation item types
 #: (CollabAgentToolCall, SubAgentActivity) and the response_item path for
 #: messages; 348 rows from a real Codex session where version 6 produced 304.
-FORMAT_VERSION = 7
+#: Version 8 = codex text events now carry the real role from the JSONL
+#: (issue #65), ``is_meta`` is True for developer messages, and
+#: ``event_id`` includes the file path to avoid cross-session collisions
+#: (issue #67).
+FORMAT_VERSION = 8
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
