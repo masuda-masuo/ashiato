@@ -398,7 +398,11 @@ class TestFormatVersion:
         # normalised from a file:// URI to a plain path, and Codex
         # recall_calls rows carry the call's timestamp instead of NULL --
         # same source bytes yield different rows, so a rebuild is required.
-        assert FORMAT_VERSION == 9
+        # Bumped to 10 by issue #75: Codex tool_calls rows now carry NULL
+        # call_event_id / result_event_id instead of synthetic ids that never
+        # resolved to an events row -- same source bytes yield different rows,
+        # so a rebuild is required.
+        assert FORMAT_VERSION == 10
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

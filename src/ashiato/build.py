@@ -750,14 +750,17 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
     error_ok = status_completed or not (isinstance(call.error, str) and call.error != "")
     is_error = not (status_ok and exit_code_ok and error_ok)
 
-    # Stable synthetic event ids derived from call_id/seq so they are
-    # non-NULL and deterministic (Claude always has call_event_id).
-    call_event_id = f"codex:{call.call_id}"
-    result_event_id = f"codex:{call.call_id}:result" if has_result else None
+    # Codex tool calls carry no link to an events row.  The item_completed
+    # items this parser consumes use a different id space from the model-facing
+    # response_item call_id (measured: zero overlap on a real session), so any
+    # id synthesised here would be a reference that resolves to nothing, for
+    # every row, always.  NULL says "this source does not link calls to
+    # events", which is true.
+    call_event_id = None
+    result_event_id = None
 
     # A failed call is a terminal state, never 'pending' -- even when it has
-    # no output at all.  result_event_id above stays output-based, so event id
-    # synthesis is unchanged.
+    # no output at all.
     outcome = classify_outcome(
         has_result=has_result or is_error,
         result_text=output or "",

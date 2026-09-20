@@ -145,7 +145,14 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: carry the call's own timestamp instead of NULL.  The same source bytes
 #: yield different rows than version 8, so existing databases must be
 #: rebuilt.
-FORMAT_VERSION = 9
+#: Version 10 = Codex ``tool_calls`` rows no longer carry synthetic
+#: ``call_event_id`` / ``result_event_id`` values (issue #75).  The
+#: ``item_completed`` id space this parser consumes never meets the event id
+#: space -- measured 5626 Codex rows with 5626 unresolvable ``call_event_id``
+#: values and 5319 unresolvable ``result_event_id`` values -- so both columns
+#: are now NULL for Codex.  The same source bytes yield different rows than
+#: version 9, so existing databases must be rebuilt.
+FORMAT_VERSION = 10
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental

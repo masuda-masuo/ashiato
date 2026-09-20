@@ -533,6 +533,16 @@ not a bug -- and an item type this parser does not know is always dropped
 silently, never raised on, so a future Codex version's new item type cannot
 break a build.
 
+Codex `tool_calls` rows carry no link to an event row: both `call_event_id`
+and `result_event_id` are NULL.  The `item_completed` item stream this parser
+consumes uses a different id space from the model-facing `response_item`
+`call_id` (measured: 5626 Codex tool_calls rows and 5626 unresolvable
+synthetic ids before this change), so no real event id can be recovered from
+what this parser sees.  Recovering the link means re-keying Codex tool calls
+off the `response_item` stream, which is a separate and much larger change
+(issue #74's territory); a NULL that is explained is a decision, an
+unexplained one would be a gap.
+
 `AgentMessage` and `UserMessage` are additionally skipped on the
 `item_completed` path because Codex records each message **twice**: once as an
 `item_completed` item and once as a top-level `response_item`.  The

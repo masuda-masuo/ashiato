@@ -2458,8 +2458,14 @@ def test_codex_tool_calls_replaced_on_rebuild(tmp_path: Path):
         connection.close()
 
 
-def test_codex_tool_call_call_event_id_nonnull(tmp_path: Path):
-    """call_event_id and result_event_id are stable, non-NULL derived ids."""
+def test_codex_tool_call_event_ids_are_null(tmp_path: Path):
+    """call_event_id and result_event_id are NULL for Codex tool calls.
+
+    The item_completed items this parser consumes use a different id space
+    from the model-facing response_item call_id, so no real event id can be
+    recovered here; a synthetic id would be a reference that resolves to
+    nothing.  NULL says the source does not link calls to events.
+    """
     codex_dir = tmp_path / "codex"
     codex_dir.mkdir()
     _write_codex_session(
@@ -2485,10 +2491,73 @@ def test_codex_tool_call_call_event_id_nonnull(tmp_path: Path):
         ).fetchone()
         assert row is not None
         call_event_id, result_event_id = row
-        assert call_event_id is not None
-        assert call_event_id.startswith("codex:")
-        assert result_event_id is not None
-        assert result_event_id.startswith("codex:")
+        assert call_event_id is None
+        assert result_event_id is None
+    finally:
+        connection.close()
+
+
+def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
+    """Every non-null call_event_id / result_event_id resolves to an events row.
+
+    Claude fills both columns from real event ids, so they resolve.  Codex
+    fills both with NULL, because the item_completed id space never meets the
+    event id space -- so a non-null value that fails to resolve is always a
+    defect (a synthetic id asserting a link the data does not have).  The
+    invariant is checked across a database built from more than one source,
+    so a future source that writes unresolvable ids fails here.
+    """
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "session.jsonl",
+        "codex-s1",
+        [
+            {
+                "type": "CommandExecution",
+                "id": "exec-1",
+                "command": "echo x",
+                "stdout": "x",
+            },
+            {
+                "type": "call_mcp_tool",
+                "id": "mcp-1",
+                "server": "sunaba",
+                "tool": "publish",
+                "arguments": {"files": ["f.py"]},
+                "result": "ok",
+            },
+        ],
+    )
+
+    db_path = tmp_path / "link_invariant.duckdb"
+    build([FIXTURES], db_path, codex_sources=[codex_dir])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        # The database really does contain rows from more than one source:
+        # Claude rows carry resolvable ids, Codex rows carry NULL.
+        assert scalar(
+            connection,
+            "SELECT count(*) FROM tool_calls WHERE call_event_id IS NOT NULL",
+        ) > 0
+        assert scalar(
+            connection,
+            "SELECT count(*) FROM tool_calls WHERE call_event_id IS NULL",
+        ) > 0
+
+        for column in ("call_event_id", "result_event_id"):
+            orphans = connection.execute(
+                f"""
+                SELECT tc.tool_use_id, tc.{column}
+                FROM tool_calls tc
+                LEFT JOIN events e ON e.event_id = tc.{column}
+                WHERE tc.{column} IS NOT NULL AND e.event_id IS NULL
+                """
+            ).fetchall()
+            assert orphans == [], (
+                f"tool_calls.{column} values with no events row: {orphans}"
+            )
     finally:
         connection.close()
 
