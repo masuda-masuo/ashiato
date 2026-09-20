@@ -418,7 +418,13 @@ class TestFormatVersion:
         # time object for both terminal states, and non-string tool outputs
         # are serialised instead of dropped -- the same opencode source bytes
         # yield different rows than version 12, so a rebuild is required.
-        assert FORMAT_VERSION == 13
+        # Bumped to 14 by issue #85: Cursor agent-transcript files now
+        # populate sessions / events / tool_calls (one session row per file,
+        # one event row per text chunk, one tool_calls row per tool_use block
+        # with outcome / is_error NULL -- the format records no tool result at
+        # all) -- the same Cursor source bytes yield rows where version 13
+        # derived none, so a rebuild is required.
+        assert FORMAT_VERSION == 14
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

@@ -2149,7 +2149,15 @@ def test_a_missing_kaiba_db_does_not_fail_the_build(tmp_path: Path):
     assert row == (None, None)
 
 
-def test_cursor_never_touches_sessions_events_or_tool_calls(tmp_path: Path):
+def test_cursor_transcript_populates_sessions_events_and_tool_calls(tmp_path: Path):
+    """Acceptance criterion 1: rows in all three main tables, source = 'cursor'.
+
+    Previously Cursor files were ingested into ``recall_calls`` only and
+    ``source_files.n_events`` / ``n_tool_calls`` were hardcoded 0; issue #85
+    makes them a full insert path like opencode and Codex.  One file is one
+    session: ``ParsedCursorFile`` carries a file-level session id (the
+    transcript file name's uuid stem), so one ``sessions`` row per file.
+    """
     transcript_dir = tmp_path / "cursor"
     transcript_dir.mkdir()
     _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
@@ -2158,15 +2166,261 @@ def test_cursor_never_touches_sessions_events_or_tool_calls(tmp_path: Path):
 
     db_path = tmp_path / "cursor.duckdb"
     result = build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
-    assert result.n_sessions == 0
-    assert result.n_events == 0
-    assert result.n_tool_calls == 0
+    assert result.n_sessions == 1
+    assert result.n_events == 1
+    assert result.n_tool_calls == 1
+    assert result.n_recall_calls == 1
 
     connection = connect(db_path, read_only=True)
     try:
-        assert scalar(connection, "SELECT count(*) FROM sessions") == 0
-        assert scalar(connection, "SELECT count(*) FROM events") == 0
-        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 0
+        sessions = connection.execute(
+            "SELECT session_id, source, started_at, ended_at, n_events, n_tool_calls "
+            "FROM sessions"
+        ).fetchall()
+        # One session per file, named by the file-name uuid stem; ts is NULL
+        # everywhere, so started_at/ended_at are NULL too.
+        assert sessions == [("sess1", "cursor", None, None, 1, 1)]
+
+        events = connection.execute(
+            "SELECT event_id, session_id, source, seq, ts, type, text "
+            "FROM events ORDER BY seq"
+        ).fetchall()
+        assert len(events) == 1
+        assert events[0][0].startswith("cursor:text:")
+        assert events[0][1] == "sess1"
+        assert events[0][2] == "cursor"
+        assert events[0][3] == 2
+        assert events[0][4] is None  # ts is NULL -- Cursor records none
+        assert events[0][5] == "text"
+        assert events[0][6] == "Let me check kaiba first."
+
+        calls = connection.execute(
+            "SELECT tool_use_id, session_id, source, seq, tool_name, mcp_server "
+            "FROM tool_calls ORDER BY tool_use_id"
+        ).fetchall()
+        assert len(calls) == 1
+        assert calls[0][1] == "sess1" and calls[0][2] == "cursor"
+        # The one tool_use block sits at block_index 1 (the text block is 0),
+        # so its synthesised call id is "seq:block_index".
+        assert calls[0][3] == 2
+        assert calls[0][0] == "2:1"
+        assert calls[0][4] == "CallMcpTool"
+        assert calls[0][5] == "kaiba"
+    finally:
+        connection.close()
+
+
+def test_cursor_tool_call_outcome_and_is_error_are_null(tmp_path: Path):
+    """Acceptance criterion 2: outcome IS NULL and is_error IS NULL -- not 'pending', not False.
+
+    Cursor records a ``tool_use`` block but never its result -- no output, no
+    status, nothing -- so a call's fate is genuinely unknown.  'pending'
+    would claim the session ended mid-call, and is_error=False would claim a
+    known success.  NULL is invisible to both hygiene's ``pending_tool_call``
+    count and nominate's ``outcome = 'error'`` gate, which is exactly right
+    for a call whose fate is unknown.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT outcome, is_error, result_text, result_truncated FROM tool_calls"
+        ).fetchall()
+        assert rows == [(None, None, None, None)]
+    finally:
+        connection.close()
+
+
+def test_cursor_ts_is_null_and_seq_orders_within_a_file(tmp_path: Path):
+    """Acceptance criterion 3: ts is NULL on Cursor events and tool calls.
+
+    No timestamp is fabricated: Cursor records none, and ``seq`` /
+    ``block_index`` already order the rows within a file.  This holds even
+    when the kaiba-ledger join populated a timestamp on the recall row -- the
+    join feeds ``recall_calls`` only, never the main tables.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(
+            connection, "SELECT count(*) FROM events WHERE ts IS NOT NULL"
+        ) == 0
+        assert scalar(
+            connection, "SELECT count(*) FROM tool_calls WHERE ts IS NOT NULL"
+        ) == 0
+        # The recall row's ts comes from the kaiba join and is not NULL -- the
+        # point is that it never leaks into the main tables.
+        assert (
+            scalar(connection, "SELECT count(*) FROM recall_calls WHERE ts IS NOT NULL")
+            == 1
+        )
+        assert (
+            scalar(connection, "SELECT count(*) FROM sessions WHERE started_at IS NOT NULL")
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_cursor_rows_null_every_column_without_an_equivalent(tmp_path: Path):
+    """Acceptance criterion 4: unrecorded columns are NULL, never a placeholder.
+
+    A plausible value cannot be told apart from a measured one, so
+    ``duration_ms``, ``cwd``, token counts, ``permission_mode``,
+    ``is_sidechain``, ``role``, ``parent_uuid`` and friends are all NULL --
+    not 0, not False.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    connection = connect(db_path, read_only=True)
+    try:
+        session = connection.execute(
+            "SELECT project_dir, cwd, git_branch, cc_version, entrypoint, input_tokens, "
+            "output_tokens, cache_read_tokens, cache_creation_tokens "
+            "FROM sessions WHERE session_id = 'sess1'"
+        ).fetchone()
+        assert session == (None,) * 9
+
+        event = connection.execute(
+            "SELECT role, parent_uuid, depth, is_sidechain, is_meta, permission_mode, "
+            "effort, request_id, message_id, model, cwd, git_branch "
+            "FROM events WHERE session_id = 'sess1'"
+        ).fetchone()
+        assert event == (None,) * 12
+
+        calls = connection.execute(
+            "SELECT call_event_id, result_event_id, duration_ms, permission_mode, cwd, "
+            "is_sidechain, parent_tool_use_id "
+            "FROM tool_calls ORDER BY tool_use_id"
+        ).fetchall()
+        assert calls == [(None,) * 7]
+    finally:
+        connection.close()
+
+
+def test_cursor_recall_calls_are_unchanged(tmp_path: Path):
+    """Acceptance criterion 5: Cursor recall_calls are byte-identical to before issue #85.
+
+    The kaiba-ledger reconstruction is untouched by this change; pinning the
+    whole recall row here means an accidental perturbation of the recall path
+    -- or of the reconstructed ts -- fails the suite rather than hiding in
+    prose.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    file_key = str((transcript_dir / "sess1.jsonl").resolve())
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT recall_id, session_id, source, seq, ts, call_id, query, output, "
+            "output_truncated, followup_text, followup_truncated, overlap_count, "
+            "overlap_tokens FROM recall_calls"
+        ).fetchall()
+        assert rows == [
+            (
+                f"{file_key}:2:1",
+                "sess1",
+                "cursor",
+                2,
+                datetime(2026, 8, 20, 10, 0),  # reconstructed from the kaiba ledger
+                "2:1",
+                "denial_pattern_x9",
+                "Use anchored prefix matching for denial_pattern_x9 tokens.",
+                False,
+                None,  # no activity on strictly later lines
+                False,
+                0,
+                "[]",
+            ),
+        ]
+    finally:
+        connection.close()
+
+
+def test_cursor_kaiba_join_is_unreachable_from_the_main_tables(tmp_path: Path):
+    """Acceptance criterion 6: the kaiba-db join cannot reach the main-table insert path.
+
+    ``_insert_cursor_parsed`` builds sessions/events/tool_calls rows purely
+    from the transcript's own shapes (``CursorToolCall`` / ``CursorTextChunk``,
+    which carry no ts and no output) and hands the kaiba-joined ``RecallCall``
+    rows to ``recall_calls`` alone.  Observable consequence: a recall call
+    whose output/ts were reconstructed from the ledger still produces a
+    tool_calls row with NULL result_text and NULL ts.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    connection = connect(db_path, read_only=True)
+    try:
+        # The recall call itself: its recall_calls row carries the joined
+        # output and ts...
+        recall = connection.execute(
+            "SELECT output, ts FROM recall_calls WHERE call_id = '2:1'"
+        ).fetchone()
+        assert recall == (
+            "Use anchored prefix matching for denial_pattern_x9 tokens.",
+            datetime(2026, 8, 20, 10, 0),
+        )
+        # ...but the same call's tool_calls row does not: no result_text, no
+        # ts, no outcome -- the join did not leak into the main table.
+        call = connection.execute(
+            "SELECT result_text, ts, outcome, is_error FROM tool_calls "
+            "WHERE tool_use_id = '2:1'"
+        ).fetchone()
+        assert call == (None, None, None, None)
+    finally:
+        connection.close()
+
+
+def test_cursor_source_files_counts_match_inserted_rows(tmp_path: Path):
+    """Acceptance criterion 8: source_files counts equal the rows actually inserted."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    kaiba_path = tmp_path / "kaiba.db"
+    _make_kaiba_recalls_db(kaiba_path)
+
+    db_path = tmp_path / "cursor.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], kaiba_db_path=kaiba_path)
+    connection = connect(db_path, read_only=True)
+    try:
+        n_events, n_tool_calls = connection.execute(
+            "SELECT n_events, n_tool_calls FROM source_files"
+        ).fetchone()
+        assert n_events == scalar(connection, "SELECT count(*) FROM events")
+        assert n_tool_calls == scalar(connection, "SELECT count(*) FROM tool_calls")
+        assert (n_events, n_tool_calls) == (1, 1)
     finally:
         connection.close()
 
@@ -2976,9 +3230,12 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
     event id space -- so a non-null value that fails to resolve is always a
     defect (a synthetic id asserting a link the data does not have).  Since
     issue #83 opencode does the same: its event stream does not link completed
-    tool parts to events rows, so both columns are NULL there too.  The
-    invariant is checked across a database built from more than one source,
-    so a future source that writes unresolvable ids fails here.
+    tool parts to events rows, so both columns are NULL there too.  Since
+    issue #85 Cursor does the same: a tool_use block is never linked to an
+    events row (Cursor records no result event at all), so both columns are
+    NULL for Cursor as well.  The invariant is checked across a database
+    built from more than one source, so a future source that writes
+    unresolvable ids fails here.
     """
     codex_dir = tmp_path / "codex"
     codex_dir.mkdir()
@@ -3002,6 +3259,9 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
             },
         ],
     )
+    cursor_dir = tmp_path / "cursor"
+    cursor_dir.mkdir()
+    _write_cursor_transcript(cursor_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
 
     db_path = tmp_path / "link_invariant.duckdb"
     build(
@@ -3009,13 +3269,14 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
         db_path,
         codex_sources=[codex_dir],
         opencode_sources=[OPENCODE_FIXTURE],
+        cursor_sources=[cursor_dir],
     )
 
     connection = connect(db_path, read_only=True)
     try:
         # The database really does contain rows from more than one source:
         # Claude rows carry resolvable ids, Codex rows carry NULL, and opencode
-        # rows carry NULL too.
+        # rows carry NULL too.  Cursor rows are present and carry NULL as well.
         assert scalar(
             connection,
             "SELECT count(*) FROM tool_calls WHERE call_event_id IS NOT NULL",
@@ -3037,6 +3298,20 @@ def test_every_non_null_call_event_id_resolves_to_an_event(tmp_path: Path):
                 "SELECT count(*) FROM events WHERE source = 'opencode'",
             )
             == 3
+        )
+        assert (
+            scalar(
+                connection,
+                "SELECT count(*) FROM tool_calls WHERE source = 'cursor'",
+            )
+            == 1
+        )
+        assert (
+            scalar(
+                connection,
+                "SELECT count(*) FROM events WHERE source = 'cursor'",
+            )
+            == 1
         )
 
         for column in ("call_event_id", "result_event_id"):

@@ -188,7 +188,17 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: yield different rows than version 12 (which dropped error parts, NULLed
 #: ``duration_ms`` and lost non-string outputs), so existing databases must
 #: be rebuilt.
-FORMAT_VERSION = 13
+#: Version 14 = Cursor agent-transcript files now populate ``sessions`` /
+#: ``events`` / ``tool_calls`` (issue #85): one ``sessions`` row per file (a
+#: Cursor transcript carries a file-level session id), one ``events`` row per
+#: assistant text chunk, and one ``tool_calls`` row per ``tool_use`` block --
+#: with ``outcome`` and ``is_error`` NULL, because Cursor records no tool
+#: result at all (no output, no status) and a call whose fate is genuinely
+#: unknown must not read as 'pending' (interrupted) or 'ok' (succeeded).  The
+#: same Cursor source bytes yield rows where version 13 derived none (its
+#: ``source_files.n_events`` / ``n_tool_calls`` were hardcoded 0), so
+#: existing databases must be rebuilt.
+FORMAT_VERSION = 14
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
