@@ -402,7 +402,12 @@ class TestFormatVersion:
         # call_event_id / result_event_id instead of synthetic ids that never
         # resolved to an events row -- same source bytes yield different rows,
         # so a rebuild is required.
-        assert FORMAT_VERSION == 10
+        # Bumped to 11 by issue #81: sessions / events / tool_calls gained a
+        # source column labelling which transcript format produced each row;
+        # the rows are the same ones version 10 derived, but CREATE TABLE IF
+        # NOT EXISTS leaves older databases without the column, so a rebuild
+        # is required.
+        assert FORMAT_VERSION == 11
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

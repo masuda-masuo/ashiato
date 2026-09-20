@@ -122,6 +122,92 @@ def test_schema_column_order_matches_the_dataclasses(built):
         assert actual == list(columns), table
 
 
+# ---------------------------------------------------------------- source column
+
+
+def test_source_column_labels_claude_rows_and_keeps_columns_in_place(built):
+    """Every Claude row carries 'claude_code', and fields *after* `source` still hold their value.
+
+    ``source`` sits right after ``file_path`` in all three tables, so a row
+    builder that returns one element too few -- or in the wrong order -- would
+    silently shift every later column instead of raising.  Reading the rows
+    back by column name and asserting a field positioned after ``source``
+    catches exactly that.
+    """
+    _, connection = built
+    rows = connection.execute(
+        "SELECT session_id, source, project_dir, cwd FROM sessions ORDER BY session_id"
+    ).fetchall()
+    assert len(rows) == TOTAL_SESSIONS
+    assert all(row[1] == "claude_code" for row in rows)
+    assert all(row[2] == "fixtures" for row in rows)  # project_dir, after source
+
+    row = connection.execute(
+        "SELECT event_id, source, seq, type, role FROM events WHERE event_id = 'u1'"
+    ).fetchone()
+    assert row == ("u1", "claude_code", 1, "user", "user")  # seq/type/role, after source
+
+    row = connection.execute(
+        "SELECT tool_use_id, source, seq, tool_name, outcome FROM tool_calls "
+        "WHERE tool_use_id = 'toolu_ok_1'"
+    ).fetchone()
+    # seq/tool_name/outcome, after source
+    assert row == ("toolu_ok_1", "claude_code", 2, "Bash", "ok")
+
+
+def test_source_column_labels_codex_rows_and_keeps_columns_in_place(tmp_path: Path):
+    """Every Codex row carries 'codex', and fields *after* `source` still hold their value."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session_with_timeline(
+        codex_dir / "sess.jsonl",
+        "codex-src-1",
+        tool_calls=[
+            {"type": "CommandExecution", "id": "exec-1", "command": "pwd", "stdout": "/work"},
+        ],
+        text_chunks=["Hello from Codex"],
+        timestamps=[
+            "2026-09-05T10:00:00Z",
+            "2026-09-05T10:00:01Z",
+            "2026-09-05T10:00:02Z",
+        ],
+    )
+    db_path = tmp_path / "codex_source.duckdb"
+    build([], db_path, codex_sources=[codex_dir])
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT session_id, source, started_at, n_tool_calls FROM sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "codex-src-1"
+        assert row[1] == "codex"
+        assert row[2] is not None  # started_at, after source
+        assert row[3] == 1  # n_tool_calls, after source
+
+        row = connection.execute(
+            "SELECT event_id, source, seq, role, text FROM events"
+        ).fetchone()
+        assert row is not None
+        assert row[0].startswith("codex:text:")
+        assert row[1] == "codex"
+        assert row[2] == 3  # seq, after source
+        assert row[3] == "unknown"  # role, after source (item_completed path carries none)
+        assert row[4] == "Hello from Codex"  # text, after source
+
+        row = connection.execute(
+            "SELECT tool_use_id, source, seq, tool_name, outcome FROM tool_calls"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "exec-1"
+        assert row[1] == "codex"
+        assert row[2] == 2  # seq, after source
+        assert row[3] == "Bash"  # tool_name, after source
+        assert row[4] == "ok"  # outcome, after source
+    finally:
+        connection.close()
+
+
 def test_build_creates_parent_directories(tmp_path: Path):
     target = tmp_path / "deep" / "nested" / "ashiato.duckdb"
     build([FIXTURES], target)
@@ -2662,20 +2748,22 @@ def test_codex_build_inserts_session_row(tmp_path: Path):
         sess_count = scalar(connection, "SELECT count(*) FROM sessions")
         assert sess_count == 1
 
-        row = connection.execute("SELECT * FROM sessions").fetchone()
+        row = connection.execute(
+            "SELECT session_id, source, started_at, ended_at, n_events, n_tool_calls, "
+            "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens "
+            "FROM sessions"
+        ).fetchone()
         assert row is not None
-        # session_id, file_path, project_dir, cwd, git_branch, cc_version, entrypoint,
-        # started_at, ended_at, n_events, n_tool_calls, input_tokens, output_tokens,
-        # cache_read_tokens, cache_creation_tokens
         assert row[0] == "codex-sess-1"  # session_id
-        assert row[7] is not None  # started_at
-        assert row[8] is not None  # ended_at
-        assert row[9] == 0  # n_events (no text chunks)
-        assert row[10] == 1  # n_tool_calls
-        assert row[11] == 500  # input_tokens
-        assert row[12] == 200  # output_tokens
-        assert row[13] == 100  # cache_read_tokens
-        assert row[14] == 0  # cache_creation_tokens (Codex has none)
+        assert row[1] == "codex"  # source -- new in issue #81
+        assert row[2] is not None  # started_at
+        assert row[3] is not None  # ended_at
+        assert row[4] == 0  # n_events (no text chunks)
+        assert row[5] == 1  # n_tool_calls
+        assert row[6] == 500  # input_tokens
+        assert row[7] == 200  # output_tokens
+        assert row[8] == 100  # cache_read_tokens
+        assert row[9] == 0  # cache_creation_tokens (Codex has none)
     finally:
         connection.close()
 

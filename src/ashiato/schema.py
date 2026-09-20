@@ -22,9 +22,22 @@ from typing import Any
 
 Column = tuple[str, str]
 
+#: Values the ``source`` column takes -- the transcript format that produced a
+#: row.  Declared here, next to the column they populate, and shared by
+#: :mod:`ashiato.recall` (``recall_calls.source``), :mod:`ashiato.parser`
+#: (Claude Code rows) and :mod:`ashiato.build` (Codex rows), so the four
+#: modules that write them cannot drift apart.  ``recall_calls.source``
+#: already stored these exact values before ``sessions`` / ``events`` /
+#: ``tool_calls`` gained the column (issue #81), so they are frozen.
+SOURCE_CLAUDE_CODE = "claude_code"
+SOURCE_OPENCODE = "opencode"
+SOURCE_CURSOR = "cursor"
+SOURCE_CODEX = "codex"
+
 SESSION_TABLE: tuple[Column, ...] = (
     ("session_id", "VARCHAR"),
     ("file_path", "VARCHAR"),
+    ("source", "VARCHAR"),
     ("project_dir", "VARCHAR"),
     ("cwd", "VARCHAR"),
     ("git_branch", "VARCHAR"),
@@ -44,6 +57,7 @@ EVENT_TABLE: tuple[Column, ...] = (
     ("event_id", "VARCHAR"),
     ("session_id", "VARCHAR"),
     ("file_path", "VARCHAR"),
+    ("source", "VARCHAR"),
     ("seq", "BIGINT"),
     ("ts", "TIMESTAMP"),
     ("type", "VARCHAR"),
@@ -67,6 +81,7 @@ TOOL_CALL_TABLE: tuple[Column, ...] = (
     ("tool_use_id", "VARCHAR"),
     ("session_id", "VARCHAR"),
     ("file_path", "VARCHAR"),
+    ("source", "VARCHAR"),
     ("seq", "BIGINT"),
     ("ts", "TIMESTAMP"),
     ("call_event_id", "VARCHAR"),
@@ -152,7 +167,13 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: values and 5319 unresolvable ``result_event_id`` values -- so both columns
 #: are now NULL for Codex.  The same source bytes yield different rows than
 #: version 9, so existing databases must be rebuilt.
-FORMAT_VERSION = 10
+#: Version 11 = ``sessions`` / ``events`` / ``tool_calls`` rows now carry a
+#: ``source`` column labelling which transcript format produced them
+#: (issue #81).  The rows themselves are the same ones version 10 derived --
+#: the new value is provenance, not re-derivation -- but ``CREATE TABLE IF
+#: NOT EXISTS`` leaves an older database without the column, so a rebuild is
+#: required all the same.
+FORMAT_VERSION = 11
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
