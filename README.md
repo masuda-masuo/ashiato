@@ -1,5 +1,7 @@
 # ashiato
 
+[![CI](https://github.com/masuda-masuo/ashiato/actions/workflows/ci.yml/badge.svg)](https://github.com/masuda-masuo/ashiato/actions/workflows/ci.yml)
+
 Trace what your coding agent actually did — deterministic analysis of Claude Code session logs.
 
 `ashiato` reads Claude Code session transcripts (`~/.claude/projects/**/*.jsonl`) and turns
@@ -783,5 +785,8 @@ be absent: missing values become NULL rather than exceptions.
 ruff check .
 pytest -q
 ```
+
+CI runs `ruff check .` and the full `pytest` suite on Python 3.11 and 3.12 for every
+push and pull request.
 
 Fixtures under `tests/fixtures/` are synthetic — no real transcript is ever committed.
