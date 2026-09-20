@@ -435,8 +435,10 @@ def test_build_reports_recall_calls_from_an_opencode_source(
     )
     out = capsys.readouterr().out
     assert "2 recall calls" in out
-    # The pre-existing counts are untouched by the opencode source.
-    assert "3 sessions, 70 events, 7 tool calls" in out
+    # Since issue #83 the opencode fixture contributes its own rows: 3 more
+    # sessions (one per distinct session id), 3 text-chunk events, and 3
+    # completed tool parts on top of the Claude fixtures' counts.
+    assert "6 sessions, 73 events, 10 tool calls" in out
 
 
 def test_recalls_prints_the_view(recall_db: Path, capsys: pytest.CaptureFixture[str]):

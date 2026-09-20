@@ -304,8 +304,20 @@ def test_format_version_is_unchanged():
     # issue #81: sessions / events / tool_calls gained a source column
     # labelling which transcript format produced each row; the rows are the
     # same ones version 10 derived, but CREATE TABLE IF NOT EXISTS leaves
-    # older databases without the column, so a rebuild is required.
-    assert FORMAT_VERSION == 11
+    # older databases without the column, so a rebuild is required.  Bumped
+    # to 12 by issue #83: opencode events.ndjson files now populate
+    # sessions / events / tool_calls (one session row per distinct session id,
+    # one event row per text chunk, one tool_calls row per completed tool
+    # part) -- the same opencode source bytes yield rows where version 11
+    # derived none, so a rebuild is required.  Bumped to 13 by issue #83:
+    # opencode tool parts in the `error` terminal state now produce
+    # tool_calls rows with is_error True / outcome 'error' (the failure
+    # message from the `error` key lands in result_text), duration_ms is
+    # populated from the part's time object for both terminal states, and
+    # non-string tool outputs are serialised instead of dropped -- the same
+    # opencode source bytes yield different rows than version 12, so a
+    # rebuild is required.
+    assert FORMAT_VERSION == 13
 
 
 # ---------------------------------------------------------------- read-only discipline

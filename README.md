@@ -26,7 +26,7 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
   | --- | --- | --- |
   | Claude Code | `sessions`, `events`, `tool_calls`, `recall_calls` | the verbatim JSON of the transcript line -- nothing a Claude transcript contains is dropped |
   | Codex | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted message text (not the source line) for text events; the verbatim item JSON for `context_compaction` rows -- lifecycle, turn-context and token-usage records are not modelled at all |
-  | opencode | `recall_calls` | no `events` rows: only recall calls are ingested |
+  | opencode | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since opencode text parts carry no timestamp; one `sessions` row per distinct session id in the file (tool parts and text parts carry their own); one `tool_calls` row per *terminal* tool part -- `completed` or `error`, with the failure message in `result_text` and `duration_ms` from the part's `time`; job lifecycle events and `pending`/`running` tool parts are not modelled at all |
   | Cursor | `recall_calls` | no `events` rows: only recall calls are ingested |
 
   `source_files` (per-file bookkeeping) is populated by all four.

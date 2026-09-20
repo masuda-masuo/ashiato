@@ -355,3 +355,162 @@ def test_token_sized_deltas_yield_a_followup_text_with_contiguous_sentences(tmp_
     assert followup_text == "No prior findings stored. Emit kaiba next."
     # not one token per line: no embedded newlines from delta-per-line evidence
     assert "\n" not in followup_text
+
+
+# ---------------------------------------------------------------- error terminal state (issue #83)
+
+
+def _tool_event(*, session_id: str, part_id: str, call_id: str, state: dict, tool: str = "bash") -> dict:
+    return {
+        "id": f"evt_{part_id}",
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": session_id,
+            "part": {
+                "id": part_id,
+                "sessionID": session_id,
+                "type": "tool",
+                "tool": tool,
+                "callID": call_id,
+                "state": state,
+            },
+        },
+    }
+
+
+def test_an_error_state_produces_a_call_carrying_status_and_message(tmp_path: Path):
+    """A part with state.status == 'error' is terminal: it yields one call with
+    the failure message from the 'error' key and the duration from 'time'."""
+    path = tmp_path / "error_state.ndjson"
+    records = [
+        _tool_event(
+            session_id="ses_err",
+            part_id="prt_err",
+            call_id="call_err",
+            tool="bash",
+            state={
+                "status": "error",
+                "input": {"command": "exit 1"},
+                "error": "exit code 1",
+                "time": {"start": 1000, "end": 1500},
+            },
+        )
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+    parsed = parse_file(path)
+    assert len(parsed.tool_calls) == 1
+    call = parsed.tool_calls[0]
+    assert call.status == "error"
+    assert call.error == "exit code 1"
+    assert call.output is None
+    assert call.duration_ms == 500
+    assert call.tool == "bash"
+    assert call.input == {"command": "exit 1"}
+
+
+def test_running_and_pending_states_produce_no_call(tmp_path: Path):
+    """'running' and 'pending' are genuinely unfinished, not failed: no call."""
+    path = tmp_path / "unfinished.ndjson"
+    records = [
+        _tool_event(
+            session_id="ses_u",
+            part_id="prt_r",
+            call_id="call_r",
+            state={"status": "running", "input": {"command": "sleep"}},
+        ),
+        _tool_event(
+            session_id="ses_u",
+            part_id="prt_p",
+            call_id="call_p",
+            state={"status": "pending", "input": {"command": "wait"}},
+        ),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+    parsed = parse_file(path)
+    assert parsed.tool_calls == []
+
+
+def test_a_completed_state_carries_status_and_duration(tmp_path: Path):
+    """A completed state still parses, and now carries status and duration too."""
+    path = tmp_path / "completed_duration.ndjson"
+    records = [
+        _tool_event(
+            session_id="ses_c",
+            part_id="prt_c",
+            call_id="call_c",
+            tool="kaiba_recall",
+            state={
+                "status": "completed",
+                "input": {"query": "q"},
+                "output": "an answer",
+                "time": {"start": 2000, "end": 2500},
+            },
+        )
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+    parsed = parse_file(path)
+    assert len(parsed.tool_calls) == 1
+    call = parsed.tool_calls[0]
+    assert call.status == "completed"
+    assert call.error is None
+    assert call.output == "an answer"
+    assert call.duration_ms == 500
+
+
+def test_a_time_shape_that_cannot_convert_leaves_duration_none(tmp_path: Path):
+    """A 'time' object without numeric epoch-millisecond start/end is left as
+    None rather than guessed at (criterion: unverifiable shapes stay NULL)."""
+    path = tmp_path / "odd_time.ndjson"
+    records = [
+        _tool_event(
+            session_id="ses_t",
+            part_id="prt_t",
+            call_id="call_t",
+            state={
+                "status": "completed",
+                "input": {"command": "echo"},
+                "output": "x",
+                "time": {"start": "soon", "end": 2500},
+            },
+        ),
+        _tool_event(
+            session_id="ses_t",
+            part_id="prt_t2",
+            call_id="call_t2",
+            state={
+                "status": "error",
+                "input": {"command": "boom"},
+                "error": "boom",
+                "time": {"secs": 1, "nanos": 0},
+            },
+        ),
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+    parsed = parse_file(path)
+    assert len(parsed.tool_calls) == 2
+    assert all(call.duration_ms is None for call in parsed.tool_calls)
+    # ts still resolves from the part's own start when it is numeric.
+    assert parsed.tool_calls[0].ts is None  # 'soon' is not epoch millis
+
+
+def test_a_non_string_output_is_serialised_not_dropped(tmp_path: Path):
+    """A structured tool output is real data: serialised as JSON (the way the
+    Codex path serialises input) instead of vanishing."""
+    path = tmp_path / "structured_output.ndjson"
+    records = [
+        _tool_event(
+            session_id="ses_s",
+            part_id="prt_s",
+            call_id="call_s",
+            state={
+                "status": "completed",
+                "input": {"query": "x"},
+                "output": {"files": ["a.py", "b.py"]},
+                "time": {"start": 1000, "end": 1000},
+            },
+        )
+    ]
+    path.write_text(_ndjson(records), encoding="utf-8")
+    parsed = parse_file(path)
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].output == '{"files": ["a.py", "b.py"]}'
