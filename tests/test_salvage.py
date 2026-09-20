@@ -293,8 +293,12 @@ def test_format_version_is_unchanged():
     # Bumped to 7 by issue #68: Codex parser now ingests collab/delegation
     # item types and the response_item path for messages.  Bumped to 8 by
     # issues #65/#67: codex text events carry the real role, is_meta for
-    # developer messages, and a file-path-scoped event_id.
-    assert FORMAT_VERSION == 8
+    # developer messages, and a file-path-scoped event_id.  Bumped to 9 by
+    # issues #72/#73: Codex CommandExecution cwd is now normalised from a
+    # file:// URI to a plain path, and Codex recall_calls rows carry the
+    # call's timestamp instead of NULL -- same source bytes yield different
+    # rows, so a rebuild is required.
+    assert FORMAT_VERSION == 9
 
 
 # ---------------------------------------------------------------- read-only discipline

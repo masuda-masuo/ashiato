@@ -139,7 +139,13 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: (issue #65), ``is_meta`` is True for developer messages, and
 #: ``event_id`` includes the file path to avoid cross-session collisions
 #: (issue #67).
-FORMAT_VERSION = 8
+#: Version 9 = Codex derivation semantics changed (issues #72/#73): a
+#: ``CommandExecution`` cwd that Codex wrote as a ``file://`` URI is now
+#: stored as a plain filesystem path, and Codex ``recall_calls`` rows now
+#: carry the call's own timestamp instead of NULL.  The same source bytes
+#: yield different rows than version 8, so existing databases must be
+#: rebuilt.
+FORMAT_VERSION = 9
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental

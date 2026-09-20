@@ -12,6 +12,8 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from ashiato.parser import parse_timestamp
 
@@ -114,6 +116,31 @@ def _read_records(path: Path) -> tuple[list[tuple[int, dict]], int]:
                 continue
             records.append((seq, record))
     return records, n_errors
+
+
+def _uri_to_path(value: object) -> str | None:
+    """Normalise a Codex ``CommandExecution.cwd`` to a filesystem path.
+
+    Codex writes the working directory as a ``file://`` URI, while every other
+    place it records the same directory (``turn_context.payload.cwd``,
+    ``session_meta.payload.cwd``) uses a plain path -- so this normalises to
+    the spelling the source itself already uses elsewhere.  Parsing with
+    :func:`urllib.parse.urlparse` plus :func:`urllib.request.url2pathname`
+    decodes percent-encoding, which string surgery (``replace("file://", "")``)
+    does not: a path containing a space or a non-ASCII character must survive
+    intact.  A plain filesystem path is stored unchanged; a non-string, an
+    empty string, or a URI with any scheme other than ``file:`` is left as
+    ``None`` rather than guessed at.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme == "file":
+        return url2pathname(parsed.path) or None
+    if parsed.scheme:
+        # Some other URI scheme: decoding it would be a guess, not a path.
+        return None
+    return value
 
 
 def _duration_to_ms(value: object) -> int | None:
@@ -241,7 +268,7 @@ def parse_file(path: str | Path) -> ParsedCodexFile:
                                 status=item.get("status"),
                                 exit_code=item.get("exit_code"),
                                 duration_ms=_duration_to_ms(item.get("duration")),
-                                cwd=item.get("cwd") if isinstance(item.get("cwd"), str) else None,
+                                cwd=_uri_to_path(item.get("cwd")),
                             )
                         )
                     elif item_type in ("McpToolCall", "call_mcp_tool"):

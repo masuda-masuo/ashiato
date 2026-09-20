@@ -458,7 +458,12 @@ def extract_from_cursor(
 def extract_from_codex(
     parsed: ParsedCodexFile, *, result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT
 ) -> list[RecallCall]:
-    """Completed kaiba recall calls from Codex session files."""
+    """Completed kaiba recall calls from Codex session files.
+
+    ``ts`` is the call's own timestamp (``CodexToolCall.ts``, already parsed
+    from the record); a call whose record carried no parseable timestamp keeps
+    it null, exactly like the other sources.
+    """
     activity: dict[str | None, list[_Activity]] = {}
     for chunk in parsed.text_chunks:
         activity.setdefault(chunk.session_id, []).append(_Activity(chunk.seq, chunk.text))
@@ -501,7 +506,7 @@ def extract_from_codex(
                 file_path=call.file_path,
                 source=SOURCE_CODEX,
                 seq=call.seq,
-                ts=None,
+                ts=call.ts,
                 call_id=call.call_id,
                 query=query,
                 output=output,
