@@ -7,13 +7,20 @@ discipline as a truncated Claude Code or opencode transcript line.
 
 A Cursor transcript is one JSON object per line, one file per agent session
 (``~/.cursor/projects/<project>/agent-transcripts/<id>/<id>.jsonl`` on a
-machine that has them).  There are no ``tool_result`` blocks anywhere: the
-transcript records what the agent said and what it called, never what came
-back -- reconstructing the recall *output* from kaiba's own ledger is
+machine that has them).  The transcript has no ``tool_result`` blocks: it
+records what the agent said and what it called, never what came back --
+reconstructing the recall *output* from kaiba's own ledger is
 :mod:`ashiato.recall`'s job, not this module's.  There is also no per-line
 timestamp or id; the file name's uuid stem is the only session identifier,
 and a tool call's identity is synthesised from its position (line number,
 block index) rather than read off the record.
+
+Next to the transcripts, Cursor keeps ``~/.cursor/chats/<workspace-hash>/<session-uuid>/``
+-- an undocumented local store holding a small ``meta.json`` per session plus
+a ``store.db`` with the full conversation.  :func:`parse_chat_meta` reads the
+``meta.json`` half: the session's working directory and its start/end times.
+The ``store.db`` half (tool results, user and system turns) is deliberately
+not read yet (issue #87).
 
 Only what the recall-followup view needs is modelled: every assistant
 ``text`` block, and every ``tool_use`` block (whichever tool -- the recall
@@ -28,6 +35,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 _BLOCK_TYPE_TEXT = "text"
@@ -67,6 +75,25 @@ class ParsedCursorFile:
     tool_calls: list[CursorToolCall]
     text_chunks: list[CursorTextChunk]
     n_parse_errors: int
+
+
+@dataclass(slots=True)
+class ChatMeta:
+    """One parsed ``meta.json`` from ``~/.cursor/chats/<workspace-hash>/<session-uuid>/``.
+
+    The file itself carries no session id -- the directory it sits in names
+    the session -- and the times are epoch milliseconds (UTC).  ``cwd`` /
+    ``created_at`` / ``updated_at`` / ``has_conversation`` are ``None`` when
+    the file is missing, malformed, or lacks the field in the right type:
+    this is an undocumented format, so an unreadable meta must never take a
+    build down.
+    """
+
+    session_id: str
+    cwd: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+    has_conversation: bool | None
 
 
 def _read_records(path: Path) -> tuple[list[tuple[int, dict]], int]:
@@ -170,4 +197,61 @@ def parse_file(path: str | Path) -> ParsedCursorFile:
         tool_calls=tool_calls,
         text_chunks=text_chunks,
         n_parse_errors=n_parse_errors,
+    )
+
+
+def _meta_field_ms(value: object) -> datetime | None:
+    """Epoch milliseconds (UTC) as a timezone-aware datetime, else ``None``.
+
+    Only JSON numbers count as a time; a string, a bool, or any other type is
+    a wrong type and reads as ``None``.  An out-of-range value is ``None``
+    too -- a corrupt meta must never raise.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def parse_chat_meta(path: str | Path) -> ChatMeta | None:
+    """Parse one Cursor chat ``meta.json`` into a :class:`ChatMeta`.
+
+    ``session_id`` is the *parent directory name* -- the file has no id of
+    its own, and the directory *is* the session.  When even that is unusable
+    (a ``meta.json`` sitting in a filesystem root), ``None`` is returned.
+
+    A pure function of the file bytes and its directory name: no clock, no
+    network.  A missing file, malformed JSON, a missing key or a wrong type
+    yields ``None`` for that field, never an exception -- this is an
+    undocumented format, and a meta file a future Cursor version writes
+    differently must not take a build down.
+    """
+    path = Path(path)
+    session_id = path.parent.name
+    if not session_id:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = None
+    cwd: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    has_conversation: bool | None = None
+    if isinstance(data, dict):
+        cwd_value = data.get("cwd")
+        cwd = cwd_value if isinstance(cwd_value, str) else None
+        created_at = _meta_field_ms(data.get("createdAtMs"))
+        updated_at = _meta_field_ms(data.get("updatedAtMs"))
+        conversation = data.get("hasConversation")
+        has_conversation = conversation if isinstance(conversation, bool) else None
+    return ChatMeta(
+        session_id=session_id,
+        cwd=cwd,
+        created_at=created_at,
+        updated_at=updated_at,
+        has_conversation=has_conversation,
     )

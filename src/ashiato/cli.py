@@ -109,6 +109,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="directory searched recursively for Cursor agent-transcript *.jsonl (repeatable)",
     )
     build_parser.add_argument(
+        "--cursor-chats-source",
+        action="append",
+        dest="cursor_chats_source",
+        metavar="DIR",
+        help=(
+            "directory searched recursively for Cursor chat meta.json files "
+            "(*/*/meta.json under ~/.cursor/chats; repeatable; nothing is scanned by default)"
+        ),
+    )
+    build_parser.add_argument(
         "--codex-source",
         action="append",
         dest="codex_source",
@@ -761,6 +771,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     sources = args.source or [str(DEFAULT_SOURCE)]
     opencode_sources = args.opencode_source or []
     cursor_sources = args.cursor_source or []
+    cursor_chats_sources = args.cursor_chats_source or []
     codex_sources = args.codex_source or []
     kaiba_db_path = Path(args.kaiba_db).expanduser() if args.kaiba_db else None
     db_path = _resolve_db(args.db)
@@ -770,6 +781,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
             db_path,
             opencode_sources=opencode_sources,
             cursor_sources=cursor_sources,
+            cursor_chats_sources=cursor_chats_sources,
             codex_sources=codex_sources,
             kaiba_db_path=kaiba_db_path,
         )
@@ -796,6 +808,13 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
         f"{result.n_files} found",
         file=out,
     )
+    if cursor_chats_sources:
+        print(
+            f"cursor chats: {result.n_chat_metas_read} meta files read, "
+            f"{result.n_chat_metas_matched} matched a session, "
+            f"{result.n_cursor_sessions_unmatched} sessions unmatched",
+            file=out,
+        )
     print(
         f"rows: {result.n_sessions} sessions, {result.n_events} events, "
         f"{result.n_tool_calls} tool calls, {result.n_recall_calls} recall calls",
@@ -803,7 +822,6 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     )
     print(f"unparseable lines skipped: {result.n_parse_errors}", file=out)
     return 0
-
 
 def _run_sql(args: argparse.Namespace, out: Any, err: Any) -> int:
     return _run_query(_resolve_db(args.db), args.query, [], args.format, out, err)
@@ -921,6 +939,7 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
         info.sources is None
         and info.opencode_sources is None
         and info.cursor_sources is None
+        and info.cursor_chats_sources is None
         and info.codex_sources is None
     ):
         print(
@@ -933,6 +952,7 @@ def _run_info(args: argparse.Namespace, out: Any, err: Any) -> int:
         _print_roots("  sources", info.sources or [], out)
         _print_roots("  opencode_sources", info.opencode_sources or [], out)
         _print_roots("  cursor_sources", info.cursor_sources or [], out)
+        _print_roots("  cursor_chats_sources", info.cursor_chats_sources or [], out)
         _print_roots("  codex_sources", info.codex_sources or [], out)
 
     # Freshness gap

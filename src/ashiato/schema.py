@@ -198,7 +198,15 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: same Cursor source bytes yield rows where version 13 derived none (its
 #: ``source_files.n_events`` / ``n_tool_calls`` were hardcoded 0), so
 #: existing databases must be rebuilt.
-FORMAT_VERSION = 14
+#: Version 15 = Cursor sessions now carry ``cwd`` and session times from the
+#: undocumented ``~/.cursor/chats/<workspace-hash>/<session-uuid>/meta.json``
+#: when ``--cursor-chats-source`` is given (issue #87): ``sessions.cwd`` /
+#: ``events.cwd`` / ``tool_calls.cwd`` are filled from the meta's ``cwd``,
+#: and ``sessions.started_at`` / ``ended_at`` from its ``createdAtMs`` /
+#: ``updatedAtMs``.  The same Cursor source bytes yield different rows than
+#: version 14 (which left all three ``cwd`` columns and the session times
+#: NULL), so existing databases must be rebuilt.
+FORMAT_VERSION = 15
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
@@ -216,6 +224,7 @@ META_FORMAT_KEY = "format_version"
 META_SOURCES_KEY = "sources"
 META_OPENCODE_SOURCES_KEY = "opencode_sources"
 META_CURSOR_SOURCES_KEY = "cursor_sources"
+META_CURSOR_CHATS_SOURCES_KEY = "cursor_chats_sources"
 META_CODEX_SOURCES_KEY = "codex_sources"
 
 META_SCHEMA_SQL = (

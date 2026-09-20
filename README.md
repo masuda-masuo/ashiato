@@ -29,7 +29,7 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
   | Claude Code | `sessions`, `events`, `tool_calls`, `recall_calls` | the verbatim JSON of the transcript line -- nothing a Claude transcript contains is dropped |
   | Codex | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted message text (not the source line) for text events; the verbatim item JSON for `context_compaction` rows -- lifecycle, turn-context and token-usage records are not modelled at all |
   | opencode | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since opencode text parts carry no timestamp; one `sessions` row per distinct session id in the file (tool parts and text parts carry their own); one `tool_calls` row per *terminal* tool part -- `completed` or `error`, with the failure message in `result_text` and `duration_ms` from the part's `time`; job lifecycle events and `pending`/`running` tool parts are not modelled at all |
-  | Cursor | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since Cursor records no timestamps at all (`seq` / `block_index` order the rows within a file instead); one `sessions` row per file (a Cursor transcript file is one session -- its file-name uuid stem); one `tool_calls` row per `tool_use` block, but with `outcome` and `is_error` NULL -- Cursor records no tool result whatsoever (no `tool_result` blocks, ever), and a call whose fate is genuinely unknown must not read as interrupted (`pending`) or as succeeded (`ok`) |
+  | Cursor | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since the agent-transcript export records no timestamps at all (`seq` / `block_index` order the rows within a file instead); one `sessions` row per file (a Cursor transcript file is one session -- its file-name uuid stem); one `tool_calls` row per `tool_use` block, but with `outcome` and `is_error` NULL -- the export records no tool result whatsoever (no `tool_result` blocks, ever), and a call whose fate is genuinely unknown must not read as interrupted (`pending`) or as succeeded (`ok`). Neither gap is Cursor's: its own undocumented local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`) holds both, with `cwd` and session times read from its `meta.json` as of this change and tool results not yet read (issue #87) |
 
   `source_files` (per-file bookkeeping) is populated by all four.
 
@@ -83,6 +83,14 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   ledger instead (see `recall_calls` below). A kaiba db that does not exist or cannot be
   read does not fail the build -- affected rows simply get `NULL` `output` / `ts`, and
   `build` prints one line saying so.
+- `--cursor-chats-source` is repeatable and is searched recursively for `*/*/meta.json`
+  Cursor chat metadata (`~/.cursor/chats/<workspace-hash>/<session-uuid>/meta.json` on a
+  machine that has them -- Cursor's undocumented local store, one small JSON file per
+  session). For every chat meta whose session id matches a Cursor session ingested from
+  a transcript, the build fills `sessions.cwd`, `events.cwd` and `tool_calls.cwd` from
+  the meta's `cwd`, and `sessions.started_at` / `ended_at` from its `createdAtMs` /
+  `updatedAtMs`. Nothing is scanned for chat metadata by default -- pass
+  `--cursor-chats-source` to opt in.
 - `--codex-source` is repeatable and is searched recursively for `*.jsonl` Codex
   session files (`~/.codex/sessions` on a machine that has them). A separate list
   for the same reason as the others: Codex keeps its own directory tree, so a
@@ -657,8 +665,10 @@ concatenation of the same session's activity on strictly later lines -- assistan
 and other completed tool calls -- the same "strictly later line" rule `denial_followups`
 uses, so a call issued in parallel with the recall is never mistaken for a reaction to it.
 
-Cursor is a special case: its transcripts carry no tool results at all (no `tool_result`
-blocks, ever), so `output` and `ts` cannot come from the transcript the way they do for
+Cursor is a special case: its agent-transcript export carries no tool results at all (no
+`tool_result` blocks, ever) -- the tool results Cursor does keep live in its undocumented
+local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`) and are not read yet
+(issue #87) -- so `output` and `ts` cannot come from the transcript the way they do for
 the other two sources. Instead they are reconstructed from kaiba's own `recalls` ledger
 (`~/.kaiba/kaiba.db`, read via `--kaiba-db`): the n-th occurrence of a query *within one
 Cursor transcript file* pairs with the n-th `agent = 'cursor'` row for that query, ordered

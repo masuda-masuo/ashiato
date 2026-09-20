@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
@@ -24,6 +24,7 @@ from ashiato.build import (
     create_schema,
     database_info,
     default_db_path,
+    iter_cursor_chat_sources,
     iter_cursor_sources,
     iter_opencode_sources,
     iter_transcripts,
@@ -2558,6 +2559,458 @@ def test_cli_build_reports_a_missing_kaiba_db(tmp_path: Path, capsys: pytest.Cap
     )
     err = capsys.readouterr().err
     assert "no kaiba db at" in err
+
+# ---------------------------------------------------------------- cursor chats meta (issue #87)
+
+#: Known epoch-millisecond values, matching tests/test_cursor.py.
+CHAT_CREATED_MS = 1788692232863
+CHAT_UPDATED_MS = 1788692482316
+
+NORMAL_CHAT_META = {
+    "schemaVersion": 1,
+    "createdAtMs": CHAT_CREATED_MS,
+    "hasConversation": True,
+    "updatedAtMs": CHAT_UPDATED_MS,
+    "cwd": "/home/masuda/dev/projects/kairanban",
+}
+
+
+def _write_cursor_chat_meta(
+    chats_dir: Path, workspace_hash: str, session_id: str, payload: dict
+) -> Path:
+    """One chats-layout meta: ``<chats>/<workspace-hash>/<session-id>/meta.json``."""
+    session_dir = chats_dir / workspace_hash / session_id
+    session_dir.mkdir(parents=True)
+    path = session_dir / "meta.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _non_cursor_dump(db_path: Path, table: str, order: str) -> list[tuple]:
+    """Every non-Cursor row of *table* -- the rows the chats join must not touch."""
+    connection = connect(db_path, read_only=True)
+    try:
+        return connection.execute(
+            f'SELECT * FROM "{table}" WHERE source != \'cursor\' ORDER BY {order}'
+        ).fetchall()
+    finally:
+        connection.close()
+
+
+def test_iter_cursor_chat_sources_finds_meta_json_two_levels_down(tmp_path: Path):
+    """Only ``*/*/meta.json`` matches: session dirs are two levels below the root."""
+    chats = tmp_path / "chats"
+    (chats / "hash1" / "sess-a").mkdir(parents=True)
+    (chats / "hash1" / "sess-a" / "meta.json").write_text("{}", encoding="utf-8")
+    (chats / "hash2" / "sess-b").mkdir(parents=True)
+    (chats / "hash2" / "sess-b" / "meta.json").write_text("{}", encoding="utf-8")
+    # A meta.json at the wrong depth must not be picked up: one level down,
+    # and at the root itself.
+    (chats / "x").mkdir()
+    (chats / "x" / "meta.json").write_text("{}", encoding="utf-8")
+    (chats / "meta.json").write_text("{}", encoding="utf-8")
+
+    files, missing = iter_cursor_chat_sources([chats])
+    assert sorted(f.parent.parent.name for f in files) == ["hash1", "hash2"]
+    assert missing == []
+
+
+def test_cursor_chats_fill_cwd_and_session_times(tmp_path: Path):
+    """Criterion 3+4: cwd on all three tables, session times from epoch-ms, ts stays NULL."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+
+    db_path = tmp_path / "chats.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_read == 1
+    assert result.n_chat_metas_matched == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        session = connection.execute(
+            "SELECT cwd, started_at, ended_at FROM sessions WHERE session_id = 'sess1'"
+        ).fetchone()
+        # Hand-computed UTC conversion of the epoch-ms values.
+        assert session == (
+            "/home/masuda/dev/projects/kairanban",
+            datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(tzinfo=None),
+            datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(tzinfo=None),
+        )
+        assert scalar(
+            connection, "SELECT count(*) FROM events WHERE cwd IS NULL"
+        ) == 0
+        assert scalar(
+            connection, "SELECT count(*) FROM tool_calls WHERE cwd IS NULL"
+        ) == 0
+        # events.ts / tool_calls.ts stay NULL: no per-message timestamp is
+        # interpolated from the session bounds.
+        assert scalar(connection, "SELECT count(*) FROM events WHERE ts IS NOT NULL") == 0
+        assert scalar(
+            connection, "SELECT count(*) FROM tool_calls WHERE ts IS NOT NULL"
+        ) == 0
+    finally:
+        connection.close()
+
+
+def test_unmatched_chat_meta_adds_no_rows(tmp_path: Path):
+    """Criterion 5: a meta whose session matches nothing creates nothing in any table."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_meta(chats, "hash1", "ghost-session", NORMAL_CHAT_META)
+
+    db_path = tmp_path / "unmatched.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_read == 2
+    assert result.n_chat_metas_matched == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 1
+        assert scalar(connection, "SELECT count(*) FROM events") == 1
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+        assert scalar(connection, "SELECT count(*) FROM recall_calls") == 1
+        assert (
+            scalar(connection, "SELECT count(*) FROM sessions WHERE session_id = 'ghost-session'")
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_build_without_cursor_chats_source_is_unchanged(tmp_path: Path):
+    """Criterion 6: without --cursor-chats-source, rows are exactly today's -- NULL cwd."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+
+    db_path = tmp_path / "plain.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir])
+    assert result.n_chat_metas_read == 0
+    assert result.n_chat_metas_matched == 0
+
+    connection = connect(db_path, read_only=True)
+    try:
+        session = connection.execute(
+            "SELECT cwd, started_at, ended_at FROM sessions WHERE session_id = 'sess1'"
+        ).fetchone()
+        assert session == (None, None, None)
+        assert scalar(
+            connection, "SELECT count(*) FROM events WHERE cwd IS NOT NULL"
+        ) == 0
+        assert scalar(
+            connection, "SELECT count(*) FROM tool_calls WHERE cwd IS NOT NULL"
+        ) == 0
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 1
+        assert scalar(connection, "SELECT count(*) FROM events") == 1
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+        assert scalar(connection, "SELECT count(*) FROM recall_calls") == 1
+    finally:
+        connection.close()
+
+
+def test_chat_meta_join_touches_only_cursor_rows(tmp_path: Path):
+    """Criterion 7: other sources' rows are byte-identical with and without the join."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+
+    plain = tmp_path / "plain.duckdb"
+    joined = tmp_path / "joined.duckdb"
+    build([FIXTURES], plain, cursor_sources=[transcript_dir])
+    build([FIXTURES], joined, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+
+    orders = {
+        "sessions": "session_id",
+        "events": "event_id",
+        "tool_calls": "tool_use_id",
+        "recall_calls": "recall_id",
+    }
+    for table, order in orders.items():
+        assert _non_cursor_dump(plain, table, order) == _non_cursor_dump(
+            joined, table, order
+        ), table
+    # The cursor rows differ only in cwd/started_at/ended_at, and only when joined.
+    for db in (plain, joined):
+        connection = connect(db, read_only=True)
+        try:
+            cursor_session = connection.execute(
+                "SELECT cwd, started_at, ended_at FROM sessions WHERE source = 'cursor'"
+            ).fetchone()
+        finally:
+            connection.close()
+        if db == plain:
+            assert cursor_session == (None, None, None)
+        else:
+            assert cursor_session[0] == "/home/masuda/dev/projects/kairanban"
+            assert cursor_session[1] is not None and cursor_session[2] is not None
+
+
+def test_changing_cursor_chats_source_between_builds_reapplies(tmp_path: Path):
+    """Criterion 8: a changed --cursor-chats-source list re-reads and re-applies the metas."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+
+    chats_a = tmp_path / "chats_a"
+    meta_a = dict(NORMAL_CHAT_META, cwd="/project/alpha")
+    _write_cursor_chat_meta(chats_a, "hash1", "sess1", meta_a)
+    chats_b = tmp_path / "chats_b"
+    meta_b = dict(NORMAL_CHAT_META, cwd="/project/beta")
+    _write_cursor_chat_meta(chats_b, "hash2", "sess1", meta_b)
+
+    db_path = tmp_path / "changed.duckdb"
+    first = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats_a])
+    assert first.n_chat_metas_read == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert (
+            connection.execute(
+                "SELECT cwd FROM sessions WHERE session_id = 'sess1'"
+            ).fetchone()[0]
+            == "/project/alpha"
+        )
+    finally:
+        connection.close()
+
+    second = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats_b])
+    assert second.n_chat_metas_read == 1
+    assert second.n_chat_metas_matched == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert (
+            connection.execute(
+                "SELECT cwd FROM sessions WHERE session_id = 'sess1'"
+            ).fetchone()[0]
+            == "/project/beta"
+        )
+        # The changed list is recorded in the meta table, exactly like a
+        # changed --cursor-source list would be.
+        row = connection.execute(
+            "SELECT value FROM ashiato_meta WHERE key = 'cursor_chats_sources'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    assert json.loads(row[0]) == [str(chats_b.resolve())]
+    info = database_info(db_path)
+    assert info.cursor_chats_sources == [(str(chats_b.resolve()), 0)]
+
+
+def test_cursor_chats_join_is_idempotent_on_rebuild(tmp_path: Path):
+    """Re-running a build re-applies the same metas without duplicating anything."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+
+    db_path = tmp_path / "idempotent.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_chat_metas_read == 1
+    assert again.n_chat_metas_matched == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM sessions") == 1
+        assert scalar(connection, "SELECT count(*) FROM events") == 1
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+        assert scalar(connection, "SELECT count(*) FROM recall_calls") == 1
+        assert (
+            connection.execute(
+                "SELECT cwd FROM sessions WHERE session_id = 'sess1'"
+            ).fetchone()[0]
+            == "/home/masuda/dev/projects/kairanban"
+        )
+    finally:
+        connection.close()
+
+
+def test_build_reports_chat_meta_counts(tmp_path: Path):
+    """Criterion 9: read / matched / unmatched-sessions counts on the BuildResult."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    _write_cursor_transcript(transcript_dir / "sess2.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+
+    db_path = tmp_path / "counts.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_read == 1
+    assert result.n_chat_metas_matched == 1
+    # Two Cursor sessions ingested, one meta: one session left unmatched.
+    assert result.n_cursor_sessions_unmatched == 1
+
+
+def test_cli_build_reports_the_chat_meta_join(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """Criterion 9 surfaced where build reports its per-source counts: the CLI line."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    db_path = tmp_path / "cli_chats.duckdb"
+
+    assert (
+        main(
+            [
+                "build",
+                "--cursor-source",
+                str(transcript_dir),
+                "--cursor-chats-source",
+                str(chats),
+                "--db",
+                str(db_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "cursor chats: 1 meta files read, 1 matched a session, 0 sessions unmatched" in out
+    capsys.readouterr()
+
+    # The flag is declared: --help names it.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["build", "--help"])
+    assert excinfo.value.code == 0
+    help_out = capsys.readouterr().out
+    assert "--cursor-chats-source" in help_out
+
+
+def test_duplicate_metas_count_sessions_not_files(tmp_path: Path):
+    """Criterion 1+2: matched counts *distinct sessions*, read still counts files.
+
+    Two roots pointing at the same session is a normal invocation, so two
+    meta files can carry the same ``session_id``.  With two ingested sessions
+    -- one reached by both metas, one reached by none -- the old arithmetic
+    subtracted the *file* count from the *session* count and reported
+    ``0 unmatched``: the reading that says the join is complete.  The fixed
+    counters report 1 matched / 1 unmatched, and ``n_chat_metas_read`` stays
+    a file count of 2.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    _write_cursor_transcript(transcript_dir / "sess2.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_meta(chats, "hash2", "sess1", NORMAL_CHAT_META)
+
+    db_path = tmp_path / "dup.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_read == 2          # files
+    assert result.n_chat_metas_matched == 1       # distinct sessions
+    assert result.n_cursor_sessions_unmatched == 1
+
+
+def test_duplicate_metas_cannot_drive_unmatched_negative(tmp_path: Path):
+    """Criterion 3: matched never exceeds the session count, so unmatched never goes negative."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    for i in range(4):
+        _write_cursor_chat_meta(chats, f"hash{i}", "sess1", NORMAL_CHAT_META)
+
+    db_path = tmp_path / "neg.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_read == 4
+    assert result.n_chat_metas_matched == 1
+    assert result.n_cursor_sessions_unmatched == 0  # never negative
+
+
+def test_an_empty_meta_never_nulls_an_earlier_one(tmp_path: Path):
+    """Criterion 4: a later meta carrying no values must not overwrite with None.
+
+    ``cwd``, ``started_at`` and ``ended_at`` are written only when the parsed
+    meta actually carries them, so whichever meta is visited second -- file
+    iteration order is not a contract -- leaves the first meta's values
+    intact.  Both visitation orders are asserted.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    empty_meta = {"schemaVersion": 1, "hasConversation": True}  # no cwd, no times
+
+    expected = (
+        "/home/masuda/dev/projects/kairanban",
+        datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(tzinfo=None),
+        datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(tzinfo=None),
+    )
+
+    for full_first in (True, False):
+        chats = tmp_path / ("chats_full_first" if full_first else "chats_empty_first")
+        if full_first:
+            _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+            _write_cursor_chat_meta(chats, "hash2", "sess1", empty_meta)
+        else:
+            _write_cursor_chat_meta(chats, "hash1", "sess1", empty_meta)
+            _write_cursor_chat_meta(chats, "hash2", "sess1", NORMAL_CHAT_META)
+
+        db_path = tmp_path / ("full_first.duckdb" if full_first else "empty_first.duckdb")
+        result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+        assert result.n_chat_metas_read == 2
+        assert result.n_chat_metas_matched == 1
+        connection = connect(db_path, read_only=True)
+        try:
+            session = connection.execute(
+                "SELECT cwd, started_at, ended_at FROM sessions WHERE session_id = 'sess1'"
+            ).fetchone()
+        finally:
+            connection.close()
+        assert session == expected, "full_first" if full_first else "empty_first"
+
+
+def test_a_meta_without_cwd_leaves_cwd_null(tmp_path: Path):
+    """Criterion 5: no invention -- a meta that carries no cwd leaves the column NULL.
+
+    The same meta still supplies the session times (so the session counts as
+    matched), and events / tool_calls -- whose only join column is ``cwd`` --
+    stay NULL alongside it.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    no_cwd = {
+        "schemaVersion": 1,
+        "createdAtMs": CHAT_CREATED_MS,
+        "hasConversation": True,
+        "updatedAtMs": CHAT_UPDATED_MS,
+    }
+    _write_cursor_chat_meta(chats, "hash1", "sess1", no_cwd)
+
+    db_path = tmp_path / "no_cwd.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_matched == 1
+    connection = connect(db_path, read_only=True)
+    try:
+        cwd, started_at, ended_at = connection.execute(
+            "SELECT cwd, started_at, ended_at FROM sessions WHERE session_id = 'sess1'"
+        ).fetchone()
+        assert cwd is None
+        assert started_at == datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(
+            tzinfo=None
+        )
+        assert ended_at == datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(
+            tzinfo=None
+        )
+        assert scalar(connection, "SELECT count(*) FROM events WHERE cwd IS NOT NULL") == 0
+        assert scalar(connection, "SELECT count(*) FROM tool_calls WHERE cwd IS NOT NULL") == 0
+    finally:
+        connection.close()
+
 
 # ---------------------------------------------------------------- codex tool_calls
 

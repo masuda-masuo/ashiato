@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ashiato.cursor import CursorTextChunk, CursorToolCall, parse_file
+import pytest
+
+from ashiato.cursor import ChatMeta, CursorTextChunk, CursorToolCall, parse_chat_meta, parse_file
 from ashiato.recall import extract_from_cursor
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -358,3 +360,127 @@ def test_open_kaiba_with_recalls_probe_returns_none_when_table_is_missing(tmp_pa
     usable = open_kaiba(kaiba_path, probe_table="actions")
     assert usable is not None
     usable.close()
+
+
+# ---------------------------------------------------------------- parse_chat_meta
+
+#: Known epoch-millisecond values, shared by the reader tests and the build tests.
+META_CREATED_MS = 1788692232863
+META_UPDATED_MS = 1788692482316
+
+NORMAL_META = (
+    '{"schemaVersion":1,"createdAtMs":1788692232863,"hasConversation":true,'
+    '"updatedAtMs":1788692482316,"cwd":"/home/masuda/dev/projects/kairanban"}'
+)
+
+
+def _write_meta(tmp_path: Path, session_id: str, body: str) -> Path:
+    """One chats-layout meta: ``<chats>/<workspace-hash>/<session-id>/meta.json``."""
+    session_dir = tmp_path / "chats" / "abc123" / session_id
+    session_dir.mkdir(parents=True)
+    path = session_dir / "meta.json"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_session_id_comes_from_the_directory_name_not_the_file(tmp_path: Path):
+    """Criterion 1: the file has no id of its own; the directory *is* the session."""
+    path = _write_meta(tmp_path, "sess-abc", NORMAL_META)
+    meta = parse_chat_meta(path)
+    assert isinstance(meta, ChatMeta)
+    assert meta.session_id == "sess-abc"
+    assert "sess-abc" not in NORMAL_META  # the file contents carry no id
+
+
+def test_parse_chat_meta_returns_aware_utc_datetimes_and_the_rest(tmp_path: Path):
+    """Criterion 1: cwd, both times as timezone-aware UTC datetimes, has_conversation."""
+    path = _write_meta(tmp_path, "sess-abc", NORMAL_META)
+    meta = parse_chat_meta(path)
+    assert meta is not None
+    assert meta.cwd == "/home/masuda/dev/projects/kairanban"
+    assert meta.created_at == datetime.fromtimestamp(META_CREATED_MS / 1000, tz=UTC)
+    assert meta.updated_at == datetime.fromtimestamp(META_UPDATED_MS / 1000, tz=UTC)
+    assert meta.created_at.tzinfo is not None
+    assert meta.created_at.utcoffset() == timedelta(0)  # UTC, not a local offset
+    assert meta.has_conversation is True
+
+
+def test_parse_chat_meta_reads_the_abandoned_session_shape(tmp_path: Path):
+    """A ``hasConversation: false`` meta (no store.db session) still parses cleanly."""
+    path = _write_meta(
+        tmp_path,
+        "sess-empty",
+        '{"schemaVersion":1,"createdAtMs":1787997347653,"hasConversation":false,'
+        '"updatedAtMs":1787997348407,"cwd":"/home/masuda/dev/projects/cursor"}',
+    )
+    meta = parse_chat_meta(path)
+    assert meta is not None
+    assert meta.session_id == "sess-empty"
+    assert meta.has_conversation is False
+    assert meta.cwd == "/home/masuda/dev/projects/cursor"
+
+
+@pytest.mark.parametrize(
+    ("name", "body", "bad_field"),
+    [
+        # Criterion 2, case 1: malformed JSON.
+        ("malformed", "not json at all", "cwd"),
+        # Criterion 2, case 2: an empty file.
+        ("empty", "", "cwd"),
+        # Criterion 2, case 3: a missing cwd key.
+        (
+            "no-cwd",
+            '{"schemaVersion":1,"createdAtMs":1788692232863,"hasConversation":true,'
+            '"updatedAtMs":1788692482316}',
+            "cwd",
+        ),
+        # Criterion 2, case 4: a missing createdAtMs key.
+        (
+            "no-created",
+            '{"schemaVersion":1,"hasConversation":true,"updatedAtMs":1788692482316,'
+            '"cwd":"/home/u"}',
+            "created_at",
+        ),
+        # Criterion 2, case 5: a non-string cwd.
+        (
+            "str-cwd",
+            '{"schemaVersion":1,"createdAtMs":1788692232863,"hasConversation":true,'
+            '"updatedAtMs":1788692482316,"cwd":42}',
+            "cwd",
+        ),
+    ],
+)
+def test_a_bad_meta_field_is_none_and_never_raises(tmp_path: Path, name: str, body: str, bad_field: str):
+    """Criterion 2: five separate cases, each a record with that field None, no exception."""
+    path = _write_meta(tmp_path, name, body)
+    meta = parse_chat_meta(path)
+    assert meta is not None, name
+    assert meta.session_id == name  # the directory name survives the bad file
+    assert getattr(meta, bad_field) is None, name
+
+
+def test_parse_chat_meta_never_raises_on_other_malformed_shapes(tmp_path: Path):
+    """A non-object JSON value, a wrong-time type, and a missing file are None fields too."""
+    path = _write_meta(tmp_path, "array", "[1, 2, 3]")
+    meta = parse_chat_meta(path)
+    assert meta is not None and meta.cwd is None and meta.created_at is None
+
+    path = _write_meta(
+        tmp_path,
+        "str-times",
+        '{"schemaVersion":1,"createdAtMs":"1788692232863","hasConversation":true,'
+        '"updatedAtMs":"1788692482316","cwd":"/home/u"}',
+    )
+    meta = parse_chat_meta(path)
+    assert meta is not None and meta.created_at is None and meta.updated_at is None
+
+    missing = tmp_path / "chats" / "abc123" / "missing" / "meta.json"
+    meta = parse_chat_meta(missing)  # file does not exist: fields None, no exception
+    assert meta is not None
+    assert meta.session_id == "missing"
+    assert meta.cwd is None and meta.created_at is None and meta.updated_at is None
+
+
+def test_no_usable_session_id_returns_none(tmp_path: Path):
+    """A meta.json directly in a filesystem root has no parent name: the whole record is None."""
+    assert parse_chat_meta(Path("/meta.json")) is None
