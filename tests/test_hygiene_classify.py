@@ -20,7 +20,13 @@ import pytest
 
 from ashiato.build import connect
 from ashiato.cli import main
-from ashiato.hygiene import _command_tokens, _shell_tokens, audit, categories_for
+from ashiato.hygiene import (
+    _SEGMENT_SEP,
+    _command_tokens,
+    _shell_tokens,
+    audit,
+    categories_for,
+)
 
 
 def test_shell_tokenizer_resolves_quotes_without_splitting() -> None:
@@ -591,14 +597,64 @@ def test_section_b_shapes_keep_not_classifying() -> None:
     assert categories_for("Grep", "cat /etc/hosts", "ok") == ()
 
 
-def test_nul_in_a_command_cannot_forge_a_separator() -> None:
-    """The segment separator is a NUL sentinel, so a NUL in the persisted text
-    must not act as one: a shell cannot pass NUL in an argument, and a row that
-    somehow carries one must classify exactly as it would without it."""
-    # a lone NUL between commands would split the line if it were a separator
+def test_nul_in_a_command_string_cannot_forge_a_separator() -> None:
+    """A NUL in persisted command *text* must not act as a separator.
+
+    The separator is a NUL sentinel, so the tokenizer drops NULs from its input:
+    a string that carries one classifies exactly as it would without it.  A list
+    argument is deliberately not filtered -- it is either a real argv (which
+    cannot contain NUL) or the already-tokenized output of
+    :func:`_command_tokens`, whose sentinels are the separators and must
+    survive; filtering them once broke every real ``;`` row while every
+    string-level test stayed green.
+    """
     assert categories_for("Bash", "echo hi \x00 cat /etc/hosts", "ok") == ()
     assert categories_for("Bash", "cat /etc/hosts \x00 echo hi", "ok") == ("host_file_hunt",)
-    # the argv form: an element equal to the sentinel is data, not a separator
-    assert categories_for("Bash", ["echo", "hi", "\x00", "cat", "/etc/hosts"], "ok") == ()
     # a command that is nothing but NULs is an empty command
     assert categories_for("Bash", "\x00\x00", "ok") == ()
+
+
+def test_command_tokens_separators_survive_into_categories_for() -> None:
+    """The real pipeline passes :func:`_command_tokens` output (a list) into
+    :func:`categories_for`, so the sentinels it produced must still split."""
+    tokens = _command_tokens(
+        "sleep 90; cd /k && node plugins/kusabi/scripts/kusabi-companion.mjs status 2>&1 | head -3",
+        "VARCHAR",
+        None,
+    )
+    assert _SEGMENT_SEP in tokens
+    assert categories_for("Bash", tokens, "ok") == ("companion_status_poll",)
+
+
+def test_separator_rows_classify_end_to_end_through_audit(tmp_path: Path) -> None:
+    """End to end: the real pipeline reaches ``categories_for`` with the token
+    list from :func:`_command_tokens`, not with a string.
+
+    Every string-level separator test can pass while this layer is broken -- it
+    happened: filtering the tokenizer's sentinels out of a list argument left
+    every real ``;`` row unclassified with the whole suite green.  These are the
+    two most frequent measured shapes from the real corpus.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    _bash_call(
+        "ses-sleep",
+        "sleep 90; cd ~/dev/projects/kusabi && "
+        "node plugins/kusabi/scripts/kusabi-companion.mjs status 2>&1 | head -15",
+        source,
+    )
+    _bash_call("ses-seq", "ls -la; echo ===; cat /etc/hosts", source)
+    _bash_call("ses-newline", "cd /k\nkusabi-companion status\necho done", source)
+
+    db_path = tmp_path / "separators.duckdb"
+    assert main(["build", "--source", str(source), "--db", str(db_path)]) == 0
+    connection = connect(db_path, read_only=True)
+    try:
+        report = audit(connection)
+    finally:
+        connection.close()
+
+    counts = {cat["name"]: cat for cat in report["categories"]}
+    assert counts["companion_status_poll"]["tool_calls"] == 2
+    assert counts["host_file_hunt"]["tool_calls"] == 1
+    assert report["coverage"]["tool_calls"] == 3

@@ -492,12 +492,13 @@ def categories_for(
     """
     matched: list[str] = []
     if tool_name is not None and tool_name.lower() in _SHELL_TOOLS_LOWER:
-        if isinstance(command, str):
-            tokens = _shell_tokens(command)
-        else:
-            # An argv element that happens to be the separator sentinel is
-            # data, not a separator: only the tokenizer emits separators.
-            tokens = [token for token in (command or ()) if token != _SEGMENT_SEP]
+        # A list argument is already tokenized: either a persisted argv list, or
+        # the output of :func:`_command_tokens`, which tokenizes the full
+        # persisted command with :func:`_shell_tokens` and therefore carries
+        # this module's separator sentinels.  Those must survive, so a list is
+        # never filtered -- the sentinel is a NUL, which a real argv cannot
+        # carry, and NULs are dropped from string input by the tokenizer.
+        tokens = _shell_tokens(command) if isinstance(command, str) else list(command or ())
         tokens = _unwrap_shell_wrapper(tokens)
         segments = _split_segments(tokens)
         for segment in segments:
