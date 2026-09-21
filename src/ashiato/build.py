@@ -886,6 +886,8 @@ def _opencode_tool_call_to_row(call: object) -> list[object]:
         result_truncated,
         call.duration_ms,      # duration_ms
         None,                  # permission_mode
+        None,                  # denied_by
+        None,                  # denial_reason
         None,                  # cwd
         None,                  # is_sidechain
         None,                  # parent_tool_use_id
@@ -1191,6 +1193,8 @@ def _cursor_tool_call_to_row(call: object) -> list[object]:
         None,                  # result_truncated -- no recorded result
         None,                  # duration_ms
         None,                  # permission_mode
+        None,                  # denied_by
+        None,                  # denial_reason
         None,                  # cwd
         None,                  # is_sidechain
         None,                  # parent_tool_use_id
@@ -1777,6 +1781,8 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
         result_truncated,
         call.duration_ms,      # duration_ms
         None,                  # permission_mode
+        None,                  # denied_by
+        None,                  # denial_reason
         call.cwd,              # cwd
         False,                 # is_sidechain
         None,                  # parent_tool_use_id

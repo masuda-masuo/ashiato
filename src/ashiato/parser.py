@@ -120,6 +120,8 @@ class ToolCall:
     result_truncated: bool
     duration_ms: int | None
     permission_mode: str | None
+    denied_by: str | None
+    denial_reason: str | None
     cwd: str | None
     is_sidechain: bool
     parent_tool_use_id: str | None
@@ -343,6 +345,61 @@ def classify_outcome(
     return "ok"
 
 
+#: The first denial pattern is a user decline; the second is a classifier block.
+_USER_DENIAL_PATTERN = DENIAL_PATTERNS[0]
+_CLASSIFIER_DENIAL_PATTERN = DENIAL_PATTERNS[1]
+
+#: The fixed advice sentence the harness appends after the reason of every
+#: classifier denial.  It marks where the reason ends; measured verbatim on the
+#: real corpus (72 classifier denials, every one of them carries it).
+_CLASSIFIER_ADVICE_MARKER = "If you have other tasks that don't depend on this action"
+
+#: The reason text the harness writes when it states no reason; stored as NULL.
+_CLASSIFIER_NO_REASON = "No reason provided"
+
+
+def classify_denial(
+    *,
+    result_text: str,
+    outcome: str,
+    denial_patterns: Sequence[str] = DENIAL_PATTERNS,
+) -> tuple[str | None, str | None]:
+    """Return ``(denied_by, denial_reason)`` for a tool call.
+
+    ``denied_by`` is ``'user'`` for a user decline, ``'classifier'`` for a
+    classifier block, and ``None`` when the outcome is not ``'denied'`` or the
+    result text matches neither pattern.
+
+    ``denial_reason`` is the reason text after ``Reason: `` for a classifier
+    denial (trailing sentence punctuation stripped), ``None`` for a user
+    decline, and ``None`` when the message says ``No reason provided``.
+    """
+    if outcome != "denied":
+        return None, None
+    text = result_text.lstrip()
+    if text.startswith(_USER_DENIAL_PATTERN):
+        return "user", None
+    if text.startswith(_CLASSIFIER_DENIAL_PATTERN):
+        # Extract the reason after "Reason: ", up to the fixed advice sentence the
+        # harness appends to every classifier denial.  Cutting at the first period
+        # instead would truncate the real reasons, which are prose containing their
+        # own sentences ("[Merge Without Review] Merging PR #572, which the agent
+        # itself authored, ... ask the user to confirm."); taking everything to the
+        # end of the message instead swallows the advice paragraph into the reason.
+        reason = None
+        idx = text.find("Reason: ")
+        if idx != -1:
+            reason = text[idx + len("Reason: ") :]
+            boilerplate = reason.find(_CLASSIFIER_ADVICE_MARKER)
+            if boilerplate != -1:
+                reason = reason[:boilerplate]
+            reason = reason.strip().rstrip(".").strip() or None
+            if reason == _CLASSIFIER_NO_REASON:
+                reason = None
+        return "classifier", reason
+    return None, None
+
+
 # --------------------------------------------------------------------------
 # depth
 # --------------------------------------------------------------------------
@@ -473,7 +530,21 @@ def _build_tool_calls(
     calls: list[ToolCall] = []
     seen: set[str] = set()
 
+    # Carry-forward: the most recently seen permissionMode from a record that
+    # carries it.  In file order (by seq, not by ts): a permission-mode record
+    # has no timestamp at all.  A tool call before the first observed value
+    # keeps NULL.  Records that carry the field: "permission-mode" records and
+    # "user" records (which carry permissionMode at top level).  "assistant"
+    # records do NOT carry it in the real archive.  "type: mode" records are
+    # a different concept and are ignored.
+    current_permission_mode: str | None = None
+
     for (_, _, record), event in zip(records, events, strict=True):
+        # Carry-forward: update from any record that carries permissionMode.
+        pm = _as_str(record.get("permissionMode"))
+        if pm is not None:
+            current_permission_mode = pm
+
         blocks = _content_blocks(_as_dict(record.get("message")))
         for index, block in enumerate(blocks):
             if block.get("type") != "tool_use":
@@ -496,6 +567,18 @@ def _build_tool_calls(
             if result_event is not None and result_event.ts is not None and event.ts is not None:
                 duration_ms = int((result_event.ts - event.ts).total_seconds() * 1000)
 
+            outcome = classify_outcome(
+                has_result=match is not None,
+                result_text=full_text,
+                is_error=is_error,
+                denial_patterns=denial_patterns,
+            )
+            denied_by, denial_reason = classify_denial(
+                result_text=full_text,
+                outcome=outcome,
+                denial_patterns=denial_patterns,
+            )
+
             calls.append(
                 ToolCall(
                     tool_use_id=tool_use_id,
@@ -515,17 +598,14 @@ def _build_tool_calls(
                         else json.dumps(tool_input, ensure_ascii=False, default=str)
                     ),
                     input_summary=summarize_input(tool_name, tool_input),
-                    outcome=classify_outcome(
-                        has_result=match is not None,
-                        result_text=full_text,
-                        is_error=is_error,
-                        denial_patterns=denial_patterns,
-                    ),
+                    outcome=outcome,
                     is_error=is_error,
                     result_text=(full_text[:result_text_limit] if match else None),
                     result_truncated=len(full_text) > result_text_limit,
                     duration_ms=duration_ms,
-                    permission_mode=event.permission_mode,
+                    permission_mode=current_permission_mode,
+                    denied_by=denied_by,
+                    denial_reason=denial_reason,
                     cwd=event.cwd,
                     is_sidechain=event.is_sidechain,
                     parent_tool_use_id=_as_str(record.get("sourceToolAssistantUUID")),
