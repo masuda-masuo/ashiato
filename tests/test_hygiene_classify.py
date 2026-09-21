@@ -658,3 +658,18 @@ def test_separator_rows_classify_end_to_end_through_audit(tmp_path: Path) -> Non
     assert counts["companion_status_poll"]["tool_calls"] == 2
     assert counts["host_file_hunt"]["tool_calls"] == 1
     assert report["coverage"]["tool_calls"] == 3
+
+
+def test_heredoc_body_line_is_a_known_over_count() -> None:
+    """A heredoc body is not quoted, so a body line beginning with a hunt
+    program reads as an executed command.
+
+    Pinned as a known limitation, not an aspiration: detecting it means tracking
+    heredoc delimiters, which is the shell parser these boundaries exist to
+    avoid.  Sampling the rows this change newly matched on the real corpus found
+    no instance of it.
+    """
+    command = "python3 - <<'EOF'\ncat = 1  # a python line, not a command\nEOF"
+    assert categories_for("Bash", command, "ok") == ("host_file_hunt",)
+    # the same body line inside quotes is correctly not a command
+    assert categories_for("Bash", "python3 -c 'cat = 1'", "ok") == ()

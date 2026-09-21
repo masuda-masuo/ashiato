@@ -60,7 +60,11 @@ independently with the same rules above -- ``_strip_cd_prefix`` and the
 category checks run per segment -- and the row is reported once per matched
 category (never per segment).  Quoting is respected: a ``;`` or newline
 inside single or double quotes stays inside its token and does not split.
-Argv elements are never re-split.
+Argv elements are never re-split.  The one known over-count: a heredoc body
+is not quoted, so a body line that begins with a hunt program reads as an
+executed command.  Sampling the real corpus for newly matched rows found no
+instance, and resolving it means tracking heredoc delimiters -- a shell
+parser -- so it is disclosed rather than fixed.
 
 ``raw_local_mcp_http`` classifies the curl *request target*, not any
 URL-shaped option argument: common curl options that consume a following
