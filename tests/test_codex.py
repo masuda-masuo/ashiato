@@ -371,13 +371,13 @@ def test_parse_codex_cwd_file_uri_percent_encoding_decodes(tmp_path: Path):
             "type": "CommandExecution",
             "id": "pct-2",
             "command": "pwd",
-            "cwd": "file:///home/masuda/dev/%E3%81%82",
-            "stdout": "/home/masuda/dev/\u3042\n",
+            "cwd": "file:///home/testuser/dev/%E3%81%82",
+            "stdout": "/home/testuser/dev/\u3042\n",
         },
     ])
     parsed = parse_file(jsonl_file)
     assert parsed.tool_calls[0].cwd == "/work/My Project"
-    assert parsed.tool_calls[1].cwd == "/home/masuda/dev/\u3042"
+    assert parsed.tool_calls[1].cwd == "/home/testuser/dev/\u3042"
 
 
 def test_parse_codex_cwd_never_raises_or_guesses(tmp_path: Path):

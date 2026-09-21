@@ -379,7 +379,7 @@ META_UPDATED_MS = 1788692482316
 
 NORMAL_META = (
     '{"schemaVersion":1,"createdAtMs":1788692232863,"hasConversation":true,'
-    '"updatedAtMs":1788692482316,"cwd":"/home/masuda/dev/projects/kairanban"}'
+    '"updatedAtMs":1788692482316,"cwd":"/home/testuser/dev/projects/kairanban"}'
 )
 
 
@@ -406,7 +406,7 @@ def test_parse_chat_meta_returns_aware_utc_datetimes_and_the_rest(tmp_path: Path
     path = _write_meta(tmp_path, "sess-abc", NORMAL_META)
     meta = parse_chat_meta(path)
     assert meta is not None
-    assert meta.cwd == "/home/masuda/dev/projects/kairanban"
+    assert meta.cwd == "/home/testuser/dev/projects/kairanban"
     assert meta.created_at == datetime.fromtimestamp(META_CREATED_MS / 1000, tz=UTC)
     assert meta.updated_at == datetime.fromtimestamp(META_UPDATED_MS / 1000, tz=UTC)
     assert meta.created_at.tzinfo is not None
@@ -420,13 +420,13 @@ def test_parse_chat_meta_reads_the_abandoned_session_shape(tmp_path: Path):
         tmp_path,
         "sess-empty",
         '{"schemaVersion":1,"createdAtMs":1787997347653,"hasConversation":false,'
-        '"updatedAtMs":1787997348407,"cwd":"/home/masuda/dev/projects/cursor"}',
+        '"updatedAtMs":1787997348407,"cwd":"/home/testuser/dev/projects/cursor"}',
     )
     meta = parse_chat_meta(path)
     assert meta is not None
     assert meta.session_id == "sess-empty"
     assert meta.has_conversation is False
-    assert meta.cwd == "/home/masuda/dev/projects/cursor"
+    assert meta.cwd == "/home/testuser/dev/projects/cursor"
 
 
 @pytest.mark.parametrize(

@@ -2571,7 +2571,7 @@ NORMAL_CHAT_META = {
     "createdAtMs": CHAT_CREATED_MS,
     "hasConversation": True,
     "updatedAtMs": CHAT_UPDATED_MS,
-    "cwd": "/home/masuda/dev/projects/kairanban",
+    "cwd": "/home/testuser/dev/projects/kairanban",
 }
 
 
@@ -2635,7 +2635,7 @@ def test_cursor_chats_fill_cwd_and_session_times(tmp_path: Path):
         ).fetchone()
         # Hand-computed UTC conversion of the epoch-ms values.
         assert session == (
-            "/home/masuda/dev/projects/kairanban",
+            "/home/testuser/dev/projects/kairanban",
             datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(tzinfo=None),
             datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(tzinfo=None),
         )
@@ -2749,7 +2749,7 @@ def test_chat_meta_join_touches_only_cursor_rows(tmp_path: Path):
         if db == plain:
             assert cursor_session == (None, None, None)
         else:
-            assert cursor_session[0] == "/home/masuda/dev/projects/kairanban"
+            assert cursor_session[0] == "/home/testuser/dev/projects/kairanban"
             assert cursor_session[1] is not None and cursor_session[2] is not None
 
 
@@ -2830,7 +2830,7 @@ def test_cursor_chats_join_is_idempotent_on_rebuild(tmp_path: Path):
             connection.execute(
                 "SELECT cwd FROM sessions WHERE session_id = 'sess1'"
             ).fetchone()[0]
-            == "/home/masuda/dev/projects/kairanban"
+            == "/home/testuser/dev/projects/kairanban"
         )
     finally:
         connection.close()
@@ -2944,7 +2944,7 @@ def test_an_empty_meta_never_nulls_an_earlier_one(tmp_path: Path):
     empty_meta = {"schemaVersion": 1, "hasConversation": True}  # no cwd, no times
 
     expected = (
-        "/home/masuda/dev/projects/kairanban",
+        "/home/testuser/dev/projects/kairanban",
         datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(tzinfo=None),
         datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(tzinfo=None),
     )
@@ -5021,7 +5021,7 @@ def test_cursor_store_join_keeps_stage_one_meta_values(tmp_path: Path):
             "SELECT cwd, started_at, ended_at FROM sessions WHERE session_id = 'sess1'"
         ).fetchone()
         assert session == (
-            "/home/masuda/dev/projects/kairanban",
+            "/home/testuser/dev/projects/kairanban",
             datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(tzinfo=None),
             datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(tzinfo=None),
         )

@@ -68,7 +68,7 @@ REAL_COMPACTION_RECORD: dict[str, Any] = {
     "timestamp": "2026-07-21T22:58:28.556Z",
     "userType": "external",
     "entrypoint": "cli",
-    "cwd": "/home/masuda/dev/projects/claude",
+    "cwd": "/home/testuser/dev/projects/claude",
     "sessionId": "05d783f6-87a9-43a0-8e96-ef025fe60bf7",
     "version": "2.1.216",
     "gitBranch": "HEAD",
