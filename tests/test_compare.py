@@ -840,11 +840,17 @@ def test_compare_table_has_no_warning_without_asymmetry(
     assert "warning: source" not in out
 
 
-def test_compare_table_excluded_line_per_period(
+def test_compare_table_excluded_no_timestamp_is_disclosed_once(
     compare_db_null_ts: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Each period prints the ``excluded:`` disclosure, labelled with the
-    period name, when that window dropped NULL-timestamp rows."""
+    """The ``excluded:`` disclosure names the NULL-timestamp rows once, as rows
+    both windows dropped.
+
+    Any bounded window drops every NULL-``ts`` row, so the two periods drop the
+    same rows.  Printing the same count once per period would invite a reader
+    to add the two identical numbers together, so the line appears exactly once
+    and says that both windows dropped it.
+    """
     rc = main([
         "compare-periods",
         "--period", "2026-08-01T00:00:00Z..2026-08-07T23:59:59Z",
@@ -854,10 +860,7 @@ def test_compare_table_excluded_line_per_period(
     out = capsys.readouterr().out
     assert rc == 0
     assert (
-        "excluded: baseline: 1 tool calls have no timestamp (the source records none): claude_code 1"
-        in out
-    )
-    assert (
-        "excluded: current: 1 tool calls have no timestamp (the source records none): claude_code 1"
-        in out
-    )
+        "excluded: 1 tool calls have no timestamp (the source records none) "
+        "and are dropped by both windows: claude_code 1"
+    ) in out
+    assert len([line for line in out.splitlines() if line.startswith("excluded:")]) == 1

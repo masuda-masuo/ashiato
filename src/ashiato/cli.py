@@ -1381,23 +1381,36 @@ def _print_compare_table(report: dict[str, Any], out: Any) -> None:
         f"{c_cps_str} calls/session",
         file=out,
     )
-    # NULL-timestamp rows that each window dropped, disclosed per period
-    for label, period in (("baseline", b), ("current", c)):
-        excluded = period.get("excluded_no_timestamp", {})
-        if excluded.get("tool_calls"):
-            parts = ", ".join(
-                f"{item['source']} {item['tool_calls']}" for item in excluded["sources"]
-            )
-            noun = (
-                "the source records none"
-                if len(excluded["sources"]) == 1
-                else "the sources record none"
-            )
-            print(
-                f"excluded: {label}: {excluded['tool_calls']} tool calls "
-                f"have no timestamp ({noun}): {parts}",
-                file=out,
-            )
+    # NULL-timestamp rows that the windows dropped.  Any bounded window drops
+    # every NULL-ts row, so both periods report the same rows: print the
+    # disclosure once, unlabelled, rather than twice with period labels that
+    # would invite a reader to add the two identical counts together.
+    b_excluded = b.get("excluded_no_timestamp", {})
+    c_excluded = c.get("excluded_no_timestamp", {})
+    excluded = b_excluded if b_excluded == c_excluded else None
+    if excluded is None:
+        # Not reachable while both windows drop the same rows; a future
+        # per-window computation would land here rather than printing a
+        # number that belongs to the other period.
+        print(
+            "excluded: the two periods dropped different NULL-timestamp rows; "
+            "see the JSON output",
+            file=out,
+        )
+    elif excluded.get("tool_calls"):
+        parts = ", ".join(
+            f"{item['source']} {item['tool_calls']}" for item in excluded["sources"]
+        )
+        noun = (
+            "the source records none"
+            if len(excluded["sources"]) == 1
+            else "the sources record none"
+        )
+        print(
+            f"excluded: {excluded['tool_calls']} tool calls have no timestamp "
+            f"({noun}) and are dropped by both windows: {parts}",
+            file=out,
+        )
     # A source present in only one period: the category delta includes its
     # entire corpus, so a "0 -> N" jump may be an ingest change, not behaviour.
     for item in report.get("source_asymmetry", []):
