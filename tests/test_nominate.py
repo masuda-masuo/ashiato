@@ -436,7 +436,12 @@ class TestFormatVersion:
         # session whose store pairs with its transcript -- the same Cursor
         # source bytes yield rows where version 15 left all four columns
         # NULL, so a rebuild is required.
-        assert FORMAT_VERSION == 16
+        # Bumped to 17 by issue #87: for a session whose store pairs with its
+        # transcript, Cursor events are now replaced by store-derived rows
+        # carrying the real role, the system prompt and the reasoning -- the
+        # same Cursor source bytes yield rows where version 16 kept the
+        # role-less transcript text chunks, so a rebuild is required.
+        assert FORMAT_VERSION == 17
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

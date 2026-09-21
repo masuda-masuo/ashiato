@@ -169,6 +169,17 @@ class BuildResult:
     #: The store never paired them with a result, so their fate is unknown --
     #: unknown is not success (issue #87 finding 2).
     n_store_calls_without_result: int = 0
+    #: The ``--cursor-chats-source`` store.db conversation join (issue #87
+    #: stage 3): how many messages and how many ``content`` parts were read
+    #: from the stores of sessions that were read at all (paired or not), and
+    #: how many of those parts carried a part type this build does not
+    #: recognise -- ``text`` / ``reasoning`` / ``redacted-reasoning`` become
+    #: ``events`` rows and ``tool-call`` / ``tool-result`` are stage 2's, so
+    #: anything else is counted here, never dropped silently.  All zero when
+    #: no chats source was given.
+    n_store_messages_read: int = 0
+    n_store_parts_read: int = 0
+    n_store_parts_unclassified: int = 0
     missing_sources: list[str] = field(default_factory=list)
     unreadable_files: list[str] = field(default_factory=list)
     failed_files: list[str] = field(default_factory=list)
@@ -934,8 +945,109 @@ def _insert_opencode_parsed(
     )
 
 
+#: Part types of a Cursor store message that become ``events`` rows, and
+#: the event ``type`` spelling each maps to -- the same vocabulary the Codex
+#: path uses, not a second one (issue #87 stage 3).
+CURSOR_STORE_EVENT_PART_TYPES: dict[str, str] = {
+    "text": "text",
+    "reasoning": "reasoning",
+    "redacted-reasoning": "redacted_reasoning",
+}
+
+#: The part types the build recognises at all.  ``tool-call`` /
+#: ``tool-result`` are stage 2's -- they fill ``tool_calls``, never
+#: ``events`` -- and the three event types map through
+#: :data:`CURSOR_STORE_EVENT_PART_TYPES`.  A part whose type is outside this
+#: set is counted as unclassified (``n_store_parts_unclassified``), never
+#: dropped silently.
+CURSOR_STORE_KNOWN_PART_TYPES: frozenset[str] = frozenset(
+    ("text", "reasoning", "redacted-reasoning", "tool-call", "tool-result")
+)
+
+
+def _cursor_store_part_to_event(
+    message: object,
+    part: object,
+    *,
+    session_id: str,
+    file_path: str,
+    cwd: str | None,
+    block_index: int,
+) -> tuple[object, ...]:
+    """Map one store ``text`` / ``reasoning`` / ``redacted-reasoning`` part to an ``Event`` row.
+
+    ``event_id`` is ``cursor:store:{file_path}:{seq}:{block_index}`` --
+    deterministic (a rebuild over the same store rewrites the same rows) and
+    distinct within a session because it is derived from the session and the
+    *position*, never from the store message's ``id``: measured on the real
+    corpus, 4,649 of 24,913 message ids duplicate another id in the same
+    session, so the message id cannot identify a row (issue #87 premise 4).
+    ``seq`` is the message's 0-based index among the store's JSON messages in
+    table order and ``block_index`` the part's 0-based index within the
+    message, so ordering is reconstructible without a timestamp; ``ts`` is
+    NULL -- the store carries no per-message timestamp (measured twice).
+
+    ``role`` is the message's role verbatim (``system`` / ``user`` /
+    ``assistant``).  ``text`` is the part's text; a ``redacted-reasoning``
+    part has none and reads NULL, never a placeholder.  ``is_meta`` is True
+    exactly for the ``system`` role -- the same rule the Codex path applies
+    to its ``developer`` role -- so the system prompt never joins the
+    exchange stream ``topics`` / ``grep`` / ``orphans`` read.  ``cwd`` is
+    the value stage 1 already set on the session.  ``raw`` holds the same
+    extracted part text, like every other Cursor event row.
+    """
+    from ashiato.cursor import CursorStoreMessage as _CSM
+    from ashiato.cursor import CursorStorePart as _CSP
+
+    assert isinstance(message, _CSM)
+    assert isinstance(part, _CSP)
+    event_type = (
+        CURSOR_STORE_EVENT_PART_TYPES.get(part.type) if isinstance(part.type, str) else None
+    )
+    assert event_type is not None
+    role = message.role
+    text = part.text if part.type != "redacted-reasoning" else None
+    return (
+        f"cursor:store:{file_path}:{message.message_index}:{block_index}",  # event_id
+        session_id,
+        file_path,
+        SOURCE_CURSOR,
+        message.message_index,  # seq -- 0-based message index in table order
+        None,                   # ts -- the store carries no per-message timestamp
+        event_type,
+        role,
+        None,                   # parent_uuid
+        None,                   # depth
+        None,                   # is_sidechain
+        role == "system",       # is_meta -- the Codex rule, applied to system
+        None,                   # permission_mode
+        None,                   # effort
+        None,                   # request_id
+        None,                   # message_id
+        None,                   # model
+        cwd,
+        None,                   # git_branch
+        text,
+        text,                   # raw -- the extracted part text, like the other sources
+    )
+
+
 def _cursor_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     """Map a ``CursorTextChunk`` to an ``Event``-shaped row for insertion.
+
+    This is the *transcript-derived* fallback row: it exists so a Cursor
+    session is visible in ``events`` even when no chats store is read.  Its
+    ``role`` is NULL because the transcript export records no role -- but the
+    text itself is not exclusively assistant text: the transcript's text
+    blocks mix user and assistant messages (measured on a 60-session sample,
+    373 of 558 store user texts and 1,255 of 1,335 store assistant texts
+    appear verbatim in the transcript), so these rows are text chunks with
+    ``role`` NULL, nothing more specific.  When ``--cursor-chats-source``
+    pairs the session with its ``store.db``, :func:`_apply_cursor_chat_stores`
+    deletes these rows and inserts store-derived ones that carry the real
+    ``role``, the system prompt and the reasoning (issue #87 stage 3) -- the
+    transcript rows and the store rows would otherwise duplicate nearly all
+    of the text.
 
     ``event_id`` is synthesised and file-path-scoped, the same way the
     opencode and Codex paths' are -- ``seq`` alone does not distinguish two
@@ -943,7 +1055,7 @@ def _cursor_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     id (the parser can emit several text chunks from one transcript line).
     ``ts`` is NULL: a Cursor transcript records no timestamp at all, and
     ``seq`` / ``block_index`` already order the blocks within a file.  Every
-    column Cursor has no value for -- ``role``, ``parent_uuid``, ``depth``,
+    column Cursor has no value for -- ``parent_uuid``, ``depth``,
     ``is_sidechain``, ``is_meta``, the permission/effort fields, ``model``,
     ``cwd``, ``git_branch`` -- is NULL, never a placeholder.
     """
@@ -1080,13 +1192,17 @@ def _insert_cursor_parsed(
 
     Unlike opencode, one file *is* one session: ``ParsedCursorFile`` carries a
     file-level ``session_id`` (the transcript file name's uuid stem), so one
-    ``sessions`` row per file, one ``events`` row per assistant text chunk,
+    ``sessions`` row per file, one ``events`` row per transcript text chunk
+    (``role`` NULL -- the export records no role; the transcript's text
+    blocks are a mix of user and assistant messages, issue #87 premise 1),
     and one ``tool_calls`` row per tool_use block, all with ``source =
-    'cursor'``.  ``ts`` stays NULL everywhere -- Cursor records no timestamp
-    at all -- and ``source_files.n_events`` / ``n_tool_calls`` reflect the
-    rows actually inserted, not a hardcoded zero.  The kaiba-ledger join
-    feeds ``recall_calls`` only: the main tables are built purely from what
-    the transcript records.
+    'cursor'``.  These ``events`` rows are the pre-store fallback: when
+    ``--cursor-chats-source`` pairs the session with its ``store.db``,
+    :func:`_apply_cursor_chat_stores` replaces them with store-derived rows
+    that carry the real ``role``, the system prompt and the reasoning.  The
+    kaiba-ledger join feeds ``recall_calls`` only: the main tables are built
+    purely from what the transcript records (until the store join replaces
+    the events).
     """
     session = Session(
         session_id=parsed.session_id,
@@ -1237,12 +1353,86 @@ def _tool_use_order_key(tool_use_id: str) -> tuple[int, int]:
         return 0, 0
 
 
+def _restore_cursor_transcript_events(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    session_id: str,
+    scratch: Path | None,
+) -> None:
+    """Give a session its transcript-derived events back, when it lost them.
+
+    The inverse of the events replacement (issue #87 stage 3, Finding 2): a
+    session that paired on an earlier build holds store-derived ``events``
+    rows (or none at all, when the replacement produced zero rows), and once
+    its store stops pairing the transcript rows must come back -- an unpaired
+    session keeps exactly what it has *today*, across builds, never the stale
+    store origin and never nothing.
+
+    The session's own transcript file is re-parsed here -- only this
+    session, only when its current rows are store-derived or absent, never
+    every transcript on every build -- and its ``events`` are rewritten from
+    the parsed text chunks in one transaction, with ``sessions.n_events`` /
+    ``source_files.n_events`` corrected to the restored count.  The rest of
+    the session (``tool_calls``, ``recall_calls``, the ``source_files``
+    bookkeeping row itself) is left alone: those tables were never part of
+    the events replacement, and the transcript's size / mtime are unchanged,
+    so the incremental skip still knows the file.  A session whose current
+    rows are already transcript-derived (``cursor:text:``) is a no-op, as is
+    a session whose transcript file can no longer be read -- a restore must
+    not invent rows it cannot derive.
+
+    Runs in a transaction: a failure mid-restore leaves the session exactly
+    as it was, the same guarantee the pair-side replacement has.
+    """
+    row = connection.execute(
+        "SELECT file_path FROM sessions WHERE session_id = ? AND source = ?",
+        [session_id, SOURCE_CURSOR],
+    ).fetchone()
+    if row is None:
+        return
+    file_path = row[0]
+    current = connection.execute(
+        "SELECT event_id FROM events WHERE session_id = ? AND source = ?",
+        [session_id, SOURCE_CURSOR],
+    ).fetchall()
+    if current and all(
+        isinstance(event_id, str) and event_id.startswith("cursor:text:")
+        for (event_id,) in current
+    ):
+        return  # already transcript-derived -- nothing to restore
+    try:
+        parsed = parse_cursor_file(file_path)
+    except OSError:
+        return  # transcript unreadable -- leave the session untouched
+    rows = [_cursor_text_chunk_to_event(chunk) for chunk in parsed.text_chunks]
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        connection.execute(
+            "DELETE FROM events WHERE session_id = ? AND source = ?",
+            [session_id, SOURCE_CURSOR],
+        )
+        _insert_rows(connection, "events", rows, scratch=scratch)
+        connection.execute(
+            "UPDATE sessions SET n_events = ? WHERE session_id = ? AND source = ?",
+            [len(rows), session_id, SOURCE_CURSOR],
+        )
+        connection.execute(
+            "UPDATE source_files SET n_events = ? WHERE file_path = ?",
+            [len(rows), file_path],
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def _apply_cursor_chat_stores(
     connection: duckdb.DuckDBPyConnection,
     meta_files: Sequence[Path],
     result: BuildResult,
     *,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
+    scratch: Path | None = None,
 ) -> None:
     """Join ``--cursor-chats-source`` ``store.db`` files onto the ingested Cursor calls.
 
@@ -1251,7 +1441,7 @@ def _apply_cursor_chat_stores(
     incremental bookkeeping in ``source_files`` tracks *transcripts*, and a
     ``store.db`` has no record there, so there is no cheap way to skip a
     session whose store is unchanged -- reading them all is the honest cost
-    (a handful of small SQLite files per session).  The UPDATE is idempotent,
+    (a handful of small SQLite files per session).  The apply is idempotent,
     so a changed store is picked up even when the transcript it belongs to
     was skipped as unchanged, and a re-applied store writes the same values.
 
@@ -1261,21 +1451,35 @@ def _apply_cursor_chat_stores(
     the plain recorded strings.  Measured on the real corpus, that is the
     right rule: the store records the same ``CallMcpTool`` block name the
     transcript does in 2,321 of 2,321 observed MCP positions, and no non-MCP
-    position disagreed.  This guard is what makes a filled result
-    trustworthy, and it is also what protects against the store's ordering
-    being wrong: ``parse_chat_store`` reads ``blobs`` in table order because
-    the ``latestRootBlobId`` root is only a checkpoint window over the newest
-    messages (Cursor's CLI has saved only new transcript entries per
-    checkpoint since 2026-07-13), so if the table order ever disagreed with
-    the transcript's, the count/name check would refuse the session rather
-    than misalign a single result.  If either check fails, nothing is applied
-    for that session -- a partially applied session is worse than an
-    unapplied one, because a misaligned result attached to the wrong call is
-    invisible afterwards -- and the skip is counted on *result*
-    (``n_store_sessions_skipped_count`` / ``n_store_sessions_skipped_name``)
-    so a silent half-match cannot hide.  Two roots can point at the same
-    session (a normal invocation), so the paired count is derived from the
-    *set* of sessions actually paired, never from the number of store files.
+    position disagreed.  A transcript with no tool calls pairs vacuously
+    with a store that also has none -- the evidence that the two describe
+    the same session is then the session id, the same evidence stage 1
+    already relies on for ``cwd``; a store that *does* hold calls against a
+    call-less transcript is a genuine count mismatch and does not pair
+    (issue #87 stage 3, Finding 4).  This guard is what makes a filled
+    result trustworthy, and it is also what protects against the store's
+    ordering being wrong: ``parse_chat_store`` reads ``blobs`` in table
+    order because the ``latestRootBlobId`` root is only a checkpoint window
+    over the newest messages (Cursor's CLI has saved only new transcript
+    entries per checkpoint since 2026-07-13), so if the table order ever
+    disagreed with the transcript's, the count/name check would refuse the
+    session rather than misalign a single result.  If either check fails,
+    nothing is applied for that session -- a partially applied session is
+    worse than an unapplied one, because a misaligned result attached to
+    the wrong call is invisible afterwards -- and the skip is counted on
+    *result* (``n_store_sessions_skipped_count`` /
+    ``n_store_sessions_skipped_name``) so a silent half-match cannot hide.
+
+    Several chat roots can point at the same session (the live tree and an
+    archive mirror is a normal invocation).  The candidate stores are tried
+    in ``meta_files`` order -- ``iter_cursor_chat_sources`` returns the
+    metas sorted by absolute path, so the winner is the *first* store in
+    that order that pairs -- and a session is marked handled only once a
+    store has actually been applied, never when it merely failed the pairing
+    checks: a stale, unreadable or mismatched store cannot claim the session
+    and starve a later valid one (Finding 3).  When no candidate pairs, the
+    session is unpaired.  The paired count is derived from the *set* of
+    sessions actually paired, never from the number of store files.
 
     For a paired session, each call that has a matching ``tool-result`` part
     gets its ``outcome`` / ``is_error`` / ``result_text`` /
@@ -1289,6 +1493,38 @@ def _apply_cursor_chat_stores(
     ``tool_use_id`` is never touched either: it is the transcript-derived
     ``seq:block_index`` identity documented in :func:`parse_file`, and the
     store has no id the transcript carries to replace it with.
+
+    Every store that is read contributes ``n_store_messages_read`` /
+    ``n_store_parts_read`` (paired or not), and a part whose type is not one
+    of the recognised five is counted in ``n_store_parts_unclassified`` --
+    counted, never dropped silently (issue #87 stage 3).
+
+    For a paired session the transcript-derived ``events`` rows are
+    *replaced*, not added to: the store's system / user / assistant messages
+    carry the roles, the system prompt and the reasoning the transcript rows
+    never had, and keeping both would duplicate nearly all of the text
+    (issue #87 premise 1 -- measured, 1,255 of 1,335 store assistant texts
+    appear verbatim in the transcript).  The new rows follow
+    :func:`_cursor_store_part_to_event`: one row per ``text`` / ``reasoning``
+    / ``redacted-reasoning`` part of every non-``tool`` message, in
+    conversation order, with ``seq`` = 0-based message index, ``block_index``
+    = part index, ``ts`` NULL, ``event_id`` derived from session + position,
+    ``cwd`` as stage 1 set it, ``is_meta`` True only for the ``system`` role.
+    ``sessions.n_events`` / ``source_files.n_events`` are updated to the
+    replaced row count so the recorded numbers stay truthful.  The whole
+    per-session apply -- the result updates, the delete, the insert and the
+    count updates -- runs in one transaction, the way :func:`_store_file`
+    works: a failure at any point rolls the session back to exactly what it
+    was, never a session with its events deleted and nothing inserted
+    (Finding 1).
+
+    An unpaired session keeps exactly the transcript-derived rows it has
+    today -- and that now holds *across builds*: when the database already
+    holds store-derived rows for it (or none at all, because an earlier
+    replacement produced zero rows) and no candidate store pairs any more,
+    :func:`_restore_cursor_transcript_events` re-derives the transcript rows
+    in the same build (Finding 2).  The session is never left half-way
+    between the two origins.
     """
     ingested: dict[str, list[tuple[str, str | None]]] = {}
     rows = connection.execute(
@@ -1302,51 +1538,137 @@ def _apply_cursor_chat_stores(
             (tool_use_id, tool_name if isinstance(tool_name, str) else None)
         )
 
-    seen: set[str] = set()
+    # Sessions that actually have an ingested transcript -- the gate a
+    # store must pass through before it can pair or be restored.  Built from
+    # the sessions table, not from tool_calls: a transcript that made no
+    # tool calls at all is still a session, and can still be enriched
+    # (Finding 4).  A meta whose session has no transcript row creates
+    # nothing, exactly as before.
+    cursor_session_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT DISTINCT session_id FROM sessions WHERE source = ?", [SOURCE_CURSOR]
+        ).fetchall()
+    }
+
+    # First pass: try the candidate stores in order until one pairs.  A
+    # session is marked handled only once a store was actually applied, so a
+    # stale, unreadable or mismatched store never claims it (Finding 3).
+    handled: set[str] = set()
     paired_ids: set[str] = set()
     for path in meta_files:
         session_id = path.parent.name
-        if session_id in seen:
+        if session_id in handled:
             continue
-        session_calls = ingested.get(session_id)
-        if not session_calls:
-            continue  # no ingested transcript calls to fill -- nothing to pair
+        if session_id not in cursor_session_ids:
+            continue  # no ingested transcript session -- nothing to pair
         store_path = path.with_name("store.db")
         if not store_path.is_file():
-            continue  # no store to read -- the same half-match the metas count as unmatched
-        seen.add(session_id)
-        store_calls = parse_chat_store(store_path)
-        if len(store_calls) != len(session_calls):
+            continue  # no store candidate here; the restore pass decides below
+        conversation = parse_chat_store(store_path)
+        result.n_store_messages_read += len(conversation.messages)
+        result.n_store_parts_read += sum(
+            len(message.parts) for message in conversation.messages
+        )
+        result.n_store_parts_unclassified += sum(
+            1
+            for message in conversation.messages
+            for part in message.parts
+            if part.type not in CURSOR_STORE_KNOWN_PART_TYPES
+        )
+        session_calls = ingested.get(session_id, [])
+        if len(conversation) != len(session_calls):
             result.n_store_sessions_skipped_count += 1
             continue
         if any(
             store_call.tool_name != expected
-            for store_call, (_, expected) in zip(store_calls, session_calls, strict=True)
+            for store_call, (_, expected) in zip(conversation, session_calls, strict=True)
         ):
             result.n_store_sessions_skipped_name += 1
             continue
-        for store_call, (tool_use_id, _) in zip(store_calls, session_calls, strict=True):
-            if not store_call.has_result:
-                # The store never paired this call with a tool-result part.
-                # Its fate is unknown: keep NULL outcome / is_error /
-                # result_text rather than read the absence as success.
-                result.n_store_calls_without_result += 1
-                continue
-            is_error, outcome = classify_store_result(store_call.result)
-            text = store_result_text(store_call.result)
-            truncated = False
-            if len(text) > result_text_limit:
-                text = text[:result_text_limit]
-                truncated = True
-            connection.execute(
-                "UPDATE tool_calls SET outcome = ?, is_error = ?, result_text = ?, "
-                "result_truncated = ? "
-                "WHERE tool_use_id = ? AND session_id = ? AND source = ?",
-                [outcome, is_error, text, truncated, tool_use_id, session_id, SOURCE_CURSOR],
-            )
+        # Paired: apply the results and replace the events in one
+        # transaction, so a failure leaves the session exactly as it was
+        # instead of half-replaced (Finding 1).
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            for store_call, (tool_use_id, _) in zip(conversation, session_calls, strict=True):
+                if not store_call.has_result:
+                    # The store never paired this call with a tool-result part.
+                    # Its fate is unknown: keep NULL outcome / is_error /
+                    # result_text rather than read the absence as success.
+                    result.n_store_calls_without_result += 1
+                    continue
+                is_error, outcome = classify_store_result(store_call.result)
+                text = store_result_text(store_call.result)
+                truncated = False
+                if len(text) > result_text_limit:
+                    text = text[:result_text_limit]
+                    truncated = True
+                connection.execute(
+                    "UPDATE tool_calls SET outcome = ?, is_error = ?, result_text = ?, "
+                    "result_truncated = ? "
+                    "WHERE tool_use_id = ? AND session_id = ? AND source = ?",
+                    [outcome, is_error, text, truncated, tool_use_id, session_id, SOURCE_CURSOR],
+                )
+            # issue #87 stage 3: the paired session's events are replaced by
+            # the store's conversation (roles, system prompt, reasoning) --
+            # adding on top would duplicate nearly all of the text (premise 1).
+            session_row = connection.execute(
+                "SELECT file_path, cwd FROM sessions "
+                "WHERE session_id = ? AND source = ?",
+                [session_id, SOURCE_CURSOR],
+            ).fetchone()
+            if session_row is not None:
+                file_path, cwd = session_row
+                event_rows = [
+                    _cursor_store_part_to_event(
+                        message,
+                        part,
+                        session_id=session_id,
+                        file_path=file_path,
+                        cwd=cwd,
+                        block_index=block_index,
+                    )
+                    for message in conversation.messages
+                    if message.role != "tool"  # tool messages are stage 2's, never events
+                    for block_index, part in enumerate(message.parts)
+                    if part.type in CURSOR_STORE_EVENT_PART_TYPES
+                ]
+                connection.execute(
+                    "DELETE FROM events WHERE session_id = ? AND source = ?",
+                    [session_id, SOURCE_CURSOR],
+                )
+                _insert_rows(connection, "events", event_rows, scratch=scratch)
+                connection.execute(
+                    "UPDATE sessions SET n_events = ? WHERE session_id = ? AND source = ?",
+                    [len(event_rows), session_id, SOURCE_CURSOR],
+                )
+                connection.execute(
+                    "UPDATE source_files SET n_events = ? WHERE file_path = ?",
+                    [len(event_rows), file_path],
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        handled.add(session_id)
         paired_ids.add(session_id)
         result.n_tool_calls_filled += sum(
-            1 for call in store_calls if call.has_result
+            1 for call in conversation if call.has_result
+        )
+
+    # Second pass: sessions no store was applied to.  If the database still
+    # holds store-derived rows for one (or none at all), its transcript rows
+    # are restored in this same build -- an unpaired session keeps what it
+    # has today, never the stale store origin and never nothing (Finding 2).
+    for path in meta_files:
+        session_id = path.parent.name
+        if session_id in handled:
+            continue
+        if session_id not in cursor_session_ids:
+            continue
+        _restore_cursor_transcript_events(
+            connection, session_id=session_id, scratch=scratch
         )
     result.n_store_sessions_paired = len(paired_ids)
 
@@ -1680,7 +2002,9 @@ def build(
     ``meta.json`` files under those roots fill ``cwd`` and the session times
     of the Cursor sessions that match, and the ``store.db`` files sitting
     next to them fill ``outcome`` / ``is_error`` / ``result_text`` /
-    ``result_truncated`` of those sessions' tool calls (see
+    ``result_truncated`` of those sessions' tool calls and *replace* the
+    ``events`` of a paired session with store-derived rows carrying the
+    roles, the system prompt and the reasoning (see
     :func:`_apply_cursor_chat_metas` and :func:`_apply_cursor_chat_stores`).
     Nothing is scanned for chat metas by default.
     """
@@ -1943,6 +2267,7 @@ def build(
                     cursor_chat_files,
                     result,
                     result_text_limit=result_text_limit,
+                    scratch=scratch,
                 )
     finally:
         connection.close()

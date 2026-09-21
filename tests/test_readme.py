@@ -80,3 +80,22 @@ def test_cursor_gaps_are_attributed_to_the_export_not_to_cursor() -> None:
     assert "the export records no tool result whatsoever" in text
     assert "~/.cursor/chats/<workspace-hash>/<session-uuid>/" in text
     assert "meta.json" in text
+
+
+def test_cursor_events_replacement_is_documented_in_readme() -> None:
+    """Issue #87 stage 3: the README's Cursor row and chats bullet say plainly
+    that a paired session's events now carry role / system prompt / reasoning
+    (replacing the transcript rows) and that an unpaired session keeps them.
+    """
+    text = README.read_text(encoding="utf-8")
+    # The premise-1 falsehood is gone from the Cursor row (the opencode row
+    # legitimately keeps the phrase -- opencode events really are assistant text).
+    cursor_row = text.split("| Cursor |", 1)[1].split("\n", 1)[0]
+    assert "the extracted assistant message text (not the source line) for text events" not in cursor_row
+    # The new behaviour is stated, in both the coverage row and the bullet.
+    assert "the real `role`, the system prompt the transcript never had" in text
+    assert "keeps the transcript-derived rows exactly as they are" in text
+    # The transcript-derived rows are no longer claimed to carry a role.
+    assert "`role` NULL and their text is a mix of user and assistant messages" in text
+    # The read/unclassified counters are documented too.
+    assert "could not classify" in text

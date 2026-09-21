@@ -19,15 +19,16 @@ Next to the transcripts, Cursor keeps ``~/.cursor/chats/<workspace-hash>/<sessio
 -- an undocumented local store holding a small ``meta.json`` per session plus
 a ``store.db`` with the full conversation.  :func:`parse_chat_meta` reads the
 ``meta.json`` half: the session's working directory and its start/end times.
-:func:`parse_chat_store` reads the ``store.db`` half: each ``tool-call`` part
-of the conversation, in conversation order (the ``blobs`` table's own order,
-which is insertion order -- the ``latestRootBlobId`` root is only a checkpoint
-window over the newest messages since Cursor's CLI stopped rewriting the full
-conversation at each checkpoint in 2026-07-13), paired with the raw ``result``
-of its matching ``tool-result`` part -- the tool results the transcript export
-never records.  The user / system / assistant-text / reasoning messages of the
-store are deliberately not modelled (issue #87 stage 3); this module reads
-only the tool-call and tool-result parts.
+:func:`parse_chat_store` reads the ``store.db`` half: the whole conversation,
+in conversation order (the ``blobs`` table's own order, which is insertion
+order -- the ``latestRootBlobId`` root is only a checkpoint window over the
+newest messages since Cursor's CLI stopped rewriting the full conversation at
+each checkpoint in 2026-07-13).  Each message comes back with its ``role`` and
+its ordered ``content`` parts -- the ``text`` / ``reasoning`` /
+``redacted-reasoning`` parts that become ``events`` rows (issue #87 stage 3),
+and the ``tool-call`` parts, paired with the raw ``result`` of the matching
+``tool-result`` part -- the tool results the transcript export never records
+(issue #87 stage 2).
 
 Only what the recall-followup view needs is modelled: every assistant
 ``text`` block, and every ``tool_use`` block (whichever tool -- the recall
@@ -309,6 +310,67 @@ class CursorStoreToolCall:
     has_result: bool = False
 
 
+@dataclass(slots=True)
+class CursorStorePart:
+    """One ``content`` part of a Cursor chat store message.
+
+    ``type`` is the part's recorded ``type`` verbatim -- ``text``,
+    ``reasoning``, ``redacted-reasoning``, ``tool-call``, ``tool-result``,
+    or anything a future Cursor version writes.  The build maps the first
+    three to ``events`` rows, leaves ``tool-call`` / ``tool-result`` to the
+    ``tool_calls`` rows, and *counts* an unrecognised type (issue #87 stage 3
+    criterion: an unknown part type is counted, never dropped silently).
+    ``text`` is the part's ``text`` when it is a string, else ``None`` -- a
+    ``redacted-reasoning`` part carries no text at all, and a part that
+    records no text must not read as an empty string.
+    """
+
+    type: str | None
+    text: str | None
+
+
+@dataclass(slots=True)
+class CursorStoreMessage:
+    """One chat message of a Cursor ``store.db``, in conversation order.
+
+    ``message_index`` is the message's position among the JSON messages of
+    the ``blobs`` table (0-based, in table order) -- the identity a
+    deterministic ``event_id`` is derived from.  The store's own ``id``
+    field cannot serve: measured on the real corpus, 4,649 of 24,913 ids are
+    duplicates of another id in the same session (issue #87 premise 4).
+    ``role`` is the recorded role verbatim (``system`` / ``user`` /
+    ``assistant`` / ``tool``); a message without a role reads ``None``.
+    ``parts`` are the message's ``content`` parts in order.  A message whose
+    ``content`` is a bare string -- the real system prompt and the initial
+    user_info message are written exactly that way -- is a single ``text``
+    part; a ``content`` that is neither a list nor a string contributes no
+    parts at all.
+    """
+
+    message_index: int
+    role: str | None
+    parts: list[CursorStorePart]
+
+
+class CursorStoreConversation(list[CursorStoreToolCall]):
+    """A parsed ``store.db``: the tool calls (list behaviour) plus the messages.
+
+    Behaves exactly like the ``list[CursorStoreToolCall]`` that
+    :func:`parse_chat_store` used to return -- stage 2's pairing and
+    result-filling code and its tests iterate, index, take ``len`` and
+    compare against ``[]`` unchanged -- and carries the full conversation
+    on ``messages`` for the events replacement (issue #87 stage 3).
+    """
+
+    def __init__(
+        self,
+        tool_calls: list[CursorStoreToolCall],
+        messages: list[CursorStoreMessage],
+    ) -> None:
+        super().__init__(tool_calls)
+        self.messages = messages
+
+
 def _store_call_args(part: dict) -> dict | None:
     """The call's arguments as a dict, from ``args`` or ``input``; else ``None``."""
     args = part.get("args")
@@ -330,8 +392,8 @@ def _store_call_name(part: dict) -> str | None:
     return None
 
 
-def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
-    """Read the tool calls of one Cursor chat ``store.db``, in conversation order.
+def parse_chat_store(path: str | Path) -> CursorStoreConversation:
+    """Read one Cursor chat ``store.db``: the tool calls *and* the conversation.
 
     The store is an undocumented SQLite database.  Conversation order is
     *table order*: ``SELECT data FROM blobs`` returns rows in rowid order,
@@ -347,14 +409,23 @@ def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
     (count equality plus elementwise name agreement) is what protects against
     the ordering being wrong anyway.
 
-    Each returned call carries the raw ``result`` of its matching
-    ``tool-result`` part (matched by ``toolCallId``), with ``has_result``
-    saying whether such a part was found at all -- a call whose id never
-    matches a result part is a call whose fate the store does not record.
+    The return is a :class:`CursorStoreConversation` -- a list of the
+    conversation's ``tool-call`` parts (in conversation order, each carrying
+    the raw ``result`` of its matching ``tool-result`` part, matched by
+    ``toolCallId``, with ``has_result`` saying whether such a part was found
+    at all) -- with the full conversation on ``messages``: every JSON chat
+    message in table order, each with its ``role`` and its ordered
+    ``content`` parts (``CursorStorePart`` carries the recorded ``type``
+    verbatim and the part's text).  A message whose ``content`` is a bare
+    string -- the real system prompt and the initial user_info message are
+    written exactly that way -- reads as one ``text`` part.  Every part is
+    kept, whatever its type: the build decides which become ``events`` rows
+    and which are unclassifiable, and an unknown type must be counted, never
+    dropped silently (issue #87 stage 3).
 
     A missing file, an unreadable or non-SQLite file, a missing or unreadable
     ``blobs`` table, and a blob that is not a JSON message (the store keeps
-    binary protobuf blobs too) yield ``[]`` or are skipped -- never an
+    binary protobuf blobs too) yield an empty conversation -- never an
     exception.  This is an undocumented format; a store a future Cursor
     version writes differently must not take a build down.
     """
@@ -363,15 +434,17 @@ def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
         # mode=ro: a missing file fails here instead of being created empty.
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     except (OSError, sqlite3.Error):
-        return []
+        return CursorStoreConversation([], [])
     try:
         try:
             rows = connection.execute("SELECT data FROM blobs").fetchall()
         except sqlite3.Error:
-            return []
+            return CursorStoreConversation([], [])
 
         calls: list[CursorStoreToolCall] = []
         results: dict[str, object] = {}
+        messages: list[CursorStoreMessage] = []
+        message_index = 0
         for (data,) in rows:
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 continue
@@ -381,32 +454,52 @@ def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
                 continue
             if not isinstance(message, dict):
                 continue
+            role = message.get("role")
             content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                if part_type == "tool-call":
-                    call_id = part.get("toolCallId")
-                    calls.append(
-                        CursorStoreToolCall(
-                            tool_call_id=call_id if isinstance(call_id, str) else None,
-                            tool_name=_store_call_name(part),
-                            args=_store_call_args(part),
-                            result=None,  # attached below, once all results are seen
+            if isinstance(content, str):
+                parts = [CursorStorePart(type="text", text=content)]
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    text = part.get("text")
+                    parts.append(
+                        CursorStorePart(
+                            type=part_type if isinstance(part_type, str) else None,
+                            text=text if isinstance(text, str) else None,
                         )
                     )
-                elif part_type == "tool-result":
-                    call_id = part.get("toolCallId")
-                    if isinstance(call_id, str):
-                        results[call_id] = part.get("result")
+                    if part_type == "tool-call":
+                        call_id = part.get("toolCallId")
+                        calls.append(
+                            CursorStoreToolCall(
+                                tool_call_id=call_id if isinstance(call_id, str) else None,
+                                tool_name=_store_call_name(part),
+                                args=_store_call_args(part),
+                                result=None,  # attached below, once all results are seen
+                            )
+                        )
+                    elif part_type == "tool-result":
+                        call_id = part.get("toolCallId")
+                        if isinstance(call_id, str):
+                            results[call_id] = part.get("result")
+            else:
+                parts = []
+            messages.append(
+                CursorStoreMessage(
+                    message_index=message_index,
+                    role=role if isinstance(role, str) else None,
+                    parts=parts,
+                )
+            )
+            message_index += 1
         for call in calls:
             if call.tool_call_id is not None and call.tool_call_id in results:
                 call.has_result = True
                 call.result = results[call.tool_call_id]
-        return calls
+        return CursorStoreConversation(calls, messages)
     finally:
         connection.close()
 

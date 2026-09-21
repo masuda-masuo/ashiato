@@ -769,3 +769,147 @@ def test_store_result_text_renders_a_dict_as_compact_json_and_a_string_as_is():
     assert store_result_text("plain output") == "plain output"
     assert store_result_text({"status": "error", "message": "boom"}) == '{"message":"boom","status":"error"}'
     assert store_result_text(None) == "null"
+
+
+# ---------------------------------------------------------------- parse_chat_store (conversation, issue #87 stage 3)
+
+
+def _store_chat_message(role: str, content: object, message_id: str = "msg") -> bytes:
+    """One JSON message blob with an explicit role; content is a part list or a bare string.
+
+    The real store writes the system prompt and the initial user_info
+    message as bare ``content`` strings (issue #87 premise), and message
+    ``id`` is *not* unique within a session -- both shapes need fixtures.
+    """
+    return json.dumps({"role": role, "content": content, "id": message_id}).encode("utf-8")
+
+
+def test_parse_chat_store_returns_each_message_with_role_and_parts(tmp_path: Path):
+    """Criterion 1 (stage 3): messages in table order, role verbatim, parts ordered."""
+    from ashiato.cursor import CursorStoreMessage, CursorStorePart
+
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_chat_message("system", "You are a coding assistant.", "s"),
+            _store_chat_message("user", [{"type": "text", "text": "What now?"}], "u"),
+            _store_chat_message(
+                "assistant",
+                [
+                    {"type": "reasoning", "text": "think step one"},
+                    {"type": "text", "text": "Let me check."},
+                    {"type": "tool-call", "toolCallId": "c1", "toolName": "Bash", "input": {}},
+                ],
+                "a",
+            ),
+            _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "c1", "result": "ok"}], "t"),
+        ],
+    )
+    conversation = parse_chat_store(store)
+    assert [c.tool_call_id for c in conversation] == ["c1"]  # stage 2's list still works
+    assert [m.message_index for m in conversation.messages] == [0, 1, 2, 3]
+    assert [m.role for m in conversation.messages] == ["system", "user", "assistant", "tool"]
+    first, second, third, fourth = conversation.messages
+    assert isinstance(first, CursorStoreMessage)
+    assert first.parts == [CursorStorePart(type="text", text="You are a coding assistant.")]
+    assert second.parts == [CursorStorePart(type="text", text="What now?")]
+    assert [(p.type, p.text) for p in third.parts] == [
+        ("reasoning", "think step one"),
+        ("text", "Let me check."),
+        ("tool-call", None),
+    ]
+    assert [(p.type, p.text) for p in fourth.parts] == [("tool-result", None)]
+
+
+def test_parse_chat_store_treats_string_content_as_one_text_part(tmp_path: Path):
+    """The real system prompt is a bare ``content`` string: it reads as one text part."""
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_chat_message("system", "You are a coding assistant.", "s"),
+            _store_chat_message(
+                "user",
+                "<user_info>\nOS Version: linux\n</user_info>",
+                "u",
+            ),
+        ],
+    )
+    conversation = parse_chat_store(store)
+    assert [m.role for m in conversation.messages] == ["system", "user"]
+    assert conversation.messages[0].parts == [
+        type(conversation.messages[0].parts[0])("text", "You are a coding assistant.")
+    ]
+    assert conversation.messages[1].parts[0].text.startswith("<user_info>")
+
+
+def test_parse_chat_store_keeps_unknown_part_types_verbatim(tmp_path: Path):
+    """An unrecognised part type is kept, not dropped: the build counts it (criterion 7)."""
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_chat_message(
+                "assistant",
+                [
+                    {"type": "mystery", "text": "zz"},
+                    {"type": "tool-call", "toolCallId": "c1", "toolName": "Bash", "input": {}},
+                ],
+                "a",
+            ),
+            _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "c1", "result": "ok"}], "t"),
+        ],
+    )
+    conversation = parse_chat_store(store)
+    assistant = conversation.messages[0]
+    assert assistant.parts[0] == type(assistant.parts[0])(type="mystery", text="zz")
+    assert [c.tool_call_id for c in conversation] == ["c1"]  # unknown parts never disturb the calls
+
+
+def test_parse_chat_store_keeps_redacted_reasoning_parts_without_text(tmp_path: Path):
+    """A ``redacted-reasoning`` part has no text; it must read None, never a placeholder."""
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_chat_message(
+                "assistant",
+                [{"type": "redacted-reasoning"}],
+                "a",
+            ),
+        ],
+    )
+    conversation = parse_chat_store(store)
+    assert conversation.messages[0].parts == [
+        type(conversation.messages[0].parts[0])(type="redacted-reasoning", text=None)
+    ]
+
+
+def test_parse_chat_store_message_index_counts_json_messages_not_blobs(tmp_path: Path):
+    """``message_index`` counts JSON chat messages in table order, not every blob.
+
+    The store keeps binary protobuf blobs (the checkpoint root) among the
+    JSON messages; a binary blob must not advance the message index, or the
+    deterministic ``event_id`` would depend on how many binary blobs the
+    store happens to hold.
+    """
+    store = tmp_path / "store.db"
+    root_id = _store_blob_id(0)
+    child_ids = [_store_blob_id(1), _store_blob_id(2)]
+    root = _store_root_blob(child_ids)
+    connection = sqlite3.connect(store)
+    try:
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id, root])
+        # A non-JSON blob sits between the two JSON messages.
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [child_ids[0], b"not json"])
+        connection.execute(
+            "INSERT INTO blobs VALUES (?, ?)",
+            [child_ids[1], _store_chat_message("user", [{"type": "text", "text": "hi"}], "u")],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    conversation = parse_chat_store(store)
+    assert [(m.message_index, m.role) for m in conversation.messages] == [(0, "user")]
