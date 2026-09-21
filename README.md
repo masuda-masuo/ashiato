@@ -314,9 +314,12 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   It counts five stable signals, per category both the tool-call rows and the
   distinct sessions they came from:
   - `companion_status_poll` -- shell calls whose *executed command* invokes
-    `kusabi-companion status`. Other companion subcommands (`chain-show`,
-    `chain-wait`), the bare binary, and text that merely quotes the command (in
-    a tool result, in an `echo` argument, or in a `Read` of a doc) are not polls.
+    `kusabi-companion status`, whether the binary is called directly (basename
+    `kusabi-companion` or `kusabi-companion.mjs`) or through its `node
+    <script>` form (`node .../kusabi-companion.mjs status`). Other companion
+    subcommands (`chain-show`, `chain-wait`, `result`), the bare binary or
+    bare script, and text that merely quotes the command (in a tool result, in
+    an `echo` argument, or in a `Read` of a doc) are not polls.
   - `host_file_hunt` -- shell calls that run `rg`/`grep`/`sed`/`cat` against
     host files. Dedicated file/search tools (`Grep`, `Read`, an MCP search
     tool) are excluded, and hunt words that appear only in a tool result are
@@ -333,7 +336,10 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   and `pending_tool_call`). Classification reads only persisted fields --
   `tool_name` and the command text, never `result_text` -- and the shell
   categories tokenize the executed command, so quoted text in an argument does
-  not count as an invocation. `--since TS` / `--until TS` bound the window
+  not count as an invocation. The shell categories apply to the persisted
+  shell-tool names `Bash`, `PowerShell` and `Shell`, matched case-insensitively
+  (so `bash` counts); the MCP `undo_file_edit` tool-name match stays
+  case-sensitive. `--since TS` / `--until TS` bound the window
   inclusively (either bound excludes rows with a NULL timestamp; without bounds
   they count); `--format table|json` chooses the output (default `table`, and
   deliberately no CSV: this is a fixed structured report, not a dump). Shell
@@ -343,10 +349,13 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   turning arbitrary prose or objects into commands. The exact shell `-c`
   wrapper is unwrapped: `bash -c SCRIPT`, `bash -lc SCRIPT`, and the
   `/bin/bash` / `sh` / `/bin/sh` equivalents are transparent, and SCRIPT is
-  tokenized and classified like any other command line -- but compound
-  commands inside SCRIPT still follow the same first-command-only boundary,
-  and no arbitrary wrapper, variable expansion, or nested command is descended
-  into. The 200-character
+  tokenized and classified like any other command line. A leading `cd <dir>
+  &&` prefix -- the form almost every persisted command starts with -- is
+  stripped (repeatedly, so `cd /x && cd /y && cmd` classifies `cmd`), and it
+  is stripped after the wrapper is unwrapped too. Compound commands are
+  otherwise not descended into: pipes, `;`, `||`, subshells, command
+  substitution, and `VAR=value` prefixes stay unclassified, and no arbitrary
+  wrapper, variable expansion, or nested command is traversed. The 200-character
   `input_summary` is only the fallback when no usable full command can be
   extracted, so a long command whose loopback MCP URL or
   `kusabi-companion status` invocation sits past the summary truncation
@@ -356,11 +365,37 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   value handled, so a loopback URL used only as a header or data value is not
   a raw MCP call while the actual loopback target still is. The JSON
   shape is stable: a top-level object with `coverage` (`since`/`until`
-  echoing the effective bounds, `null` when absent, plus pre-filter
-  `sessions`/`tool_calls`) and an ordered `categories` list whose objects each
-  carry exactly `name`/`tool_calls`/`sessions`. The table prints the same five
-  rows with the same counts. `hygiene` is the named audit for recurring
-  questions; arbitrary one-off investigation remains `ashiato sql`.
+  echoing the effective bounds, `null` when absent, pre-filter
+  `sessions`/`tool_calls`, the per-source `sources` list, and
+  `excluded_no_timestamp` when a window dropped rows that record no
+  timestamp) and an ordered `categories` list whose objects each carry
+  exactly `name`/`tool_calls`/`sessions`. The table prints the same five
+  rows with the same counts, and -- only when a window excluded them -- an
+  `excluded: N tool calls have no timestamp (the source records none):
+  <source> N` line right after the coverage line. That disclosure matters
+  because a windowed `0` is silent evidence: a source that records no
+  per-call timestamp (Cursor) drops out of every bounded window, and its
+  rows can never be read back as "nothing happened". `hygiene` is the named
+  audit for recurring questions; arbitrary one-off investigation remains
+  `ashiato sql`.
+
+- `compare-periods` runs the same hygiene audit over two non-overlapping
+  windows (`--period START..END` twice, baseline then current) and reports,
+  per category, the baseline/current calls and sessions, calls-per-session,
+  and the absolute and percent deltas (percent is `n/a` when the baseline is
+  zero). Its table output adds the disclosure lines: per period, the same
+  `excluded: ...` line when that window dropped NULL-timestamp rows, and one
+  `warning: source '<name>' has N calls in current and 0 in baseline; category
+  deltas include its entire corpus` line per source that has rows in exactly
+  one of the two periods. A source whose ingest was only added part-way
+  between the windows shows up as a `0 -> N` delta that is the entire new
+  corpus, not a behaviour change; the warning says so instead of letting the
+  delta be read as growth. The JSON output carries the structure as data --
+  `source_asymmetry` at the top level and per-period `sources` /
+  `excluded_no_timestamp` in `periods` -- with no prose inside the JSON. A
+  category `0` never means "it did not happen": it means no invocation of
+  that form was persisted in the window, and the disclosure lines say what
+  the window and its sources left out.
 
 - `session-trace` renders one session as a single interleaved timeline: its
   text events and tool calls ordered by transcript line (`seq`), text rows

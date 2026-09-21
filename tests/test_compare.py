@@ -707,3 +707,160 @@ def test_null_timestamp_tool_calls_excluded(
         f"NULL-timestamp tool call must not appear in category counts: {hunt}"
     )
     assert hunt["baseline_sessions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 11. Per-source coverage, source asymmetry, and NULL-timestamp disclosure
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def compare_db_asymmetry(tmp_path: Path) -> Path:
+    """Baseline rows from claude_code only; current-window rows from codex
+    only, so both sources have rows in exactly one of the two periods."""
+    directory = tmp_path / "transcripts"
+    directory.mkdir()
+    sessions: dict[str, list[dict]] = {"baseline-a": _baseline_session()}
+    _write_sessions(directory, sessions)
+    db_path = tmp_path / "asym.duckdb"
+    assert main(["build", "--source", str(directory), "--db", str(db_path)]) == 0
+
+    from ashiato.build import connect
+
+    connection = connect(db_path)
+    try:
+        for index in range(2):
+            connection.execute(
+                "INSERT INTO tool_calls "
+                "(tool_use_id, session_id, source, seq, ts, tool_name, input, input_summary, outcome, is_error) "
+                "VALUES (?, ?, 'codex', ?, ?, 'Bash', CAST(? AS JSON), ?, 'ok', FALSE)",
+                [
+                    f"codex{index}_use",
+                    "codex-a",
+                    index,
+                    f"2026-08-17T10:0{index}:00Z",
+                    '{"command": "kusabi-companion status"}',
+                    "kusabi-companion status",
+                ],
+            )
+    finally:
+        connection.close()
+    return db_path
+
+
+def test_source_asymmetry_names_every_period_exclusive_source(
+    compare_db_asymmetry: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A source present in exactly one period is named with the correct two
+    counts; the source set differs between the periods, so claude_code (6
+    baseline calls) and codex (2 current calls) both appear, sorted by source."""
+    rc, payload = _compare(capsys, compare_db_asymmetry)
+    assert rc == 0
+    assert payload["source_asymmetry"] == [
+        {"source": "claude_code", "baseline_tool_calls": 6, "current_tool_calls": 0},
+        {"source": "codex", "baseline_tool_calls": 0, "current_tool_calls": 2},
+    ]
+
+
+def test_source_asymmetry_is_empty_when_periods_share_sources(
+    compare_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When both periods carry the same source set, there is no asymmetry."""
+    rc, payload = _compare(capsys, compare_db)
+    assert rc == 0
+    assert payload["source_asymmetry"] == []
+
+
+def test_periods_carry_sources_and_excluded_no_timestamp_as_data(
+    compare_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Each period dict carries its own per-source ``sources`` and the
+    ``excluded_no_timestamp`` disclosure; the JSON carries the structure and
+    no prose sentences."""
+    rc, payload = _compare(capsys, compare_db)
+    assert rc == 0
+    assert payload["periods"]["baseline"]["sources"] == [
+        {"source": "claude_code", "tool_calls": 6, "sessions": 1}
+    ]
+    assert payload["periods"]["current"]["sources"] == [
+        {"source": "claude_code", "tool_calls": 11, "sessions": 2}
+    ]
+    for name in ("baseline", "current"):
+        assert payload["periods"][name]["excluded_no_timestamp"] == {
+            "tool_calls": 0,
+            "sources": [],
+        }
+    text = json.dumps(payload)
+    assert "warning: source" not in text
+    assert "tool calls have no timestamp" not in text
+
+
+def test_compare_table_warning_line_per_asymmetric_source(
+    compare_db_asymmetry: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The table prints one ``warning: source ...`` line per asymmetric source
+    after the two period lines and before the category table."""
+    rc = main([
+        "compare-periods",
+        "--period", f"{BASELINE_SINCE}..{BASELINE_UNTIL}",
+        "--period", f"{CURRENT_SINCE}..{CURRENT_UNTIL}",
+        "--db", str(compare_db_asymmetry),
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert (
+        "warning: source 'claude_code' has 6 calls in baseline and 0 in current; "
+        "category deltas include its entire corpus" in out
+    )
+    assert (
+        "warning: source 'codex' has 2 calls in current and 0 in baseline; "
+        "category deltas include its entire corpus" in out
+    )
+    lines = out.splitlines()
+    category_table_start = next(
+        index for index, line in enumerate(lines) if line.startswith("category")
+    )
+    warning_index = next(
+        index for index, line in enumerate(lines) if line.startswith("warning: source")
+    )
+    assert warning_index < category_table_start
+
+
+def test_compare_table_has_no_warning_without_asymmetry(
+    compare_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main([
+        "compare-periods",
+        "--period", f"{BASELINE_SINCE}..{BASELINE_UNTIL}",
+        "--period", f"{CURRENT_SINCE}..{CURRENT_UNTIL}",
+        "--db", str(compare_db),
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "warning: source" not in out
+
+
+def test_compare_table_excluded_no_timestamp_is_disclosed_once(
+    compare_db_null_ts: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``excluded:`` disclosure names the NULL-timestamp rows once, as rows
+    both windows dropped.
+
+    Any bounded window drops every NULL-``ts`` row, so the two periods drop the
+    same rows.  Printing the same count once per period would invite a reader
+    to add the two identical numbers together, so the line appears exactly once
+    and says that both windows dropped it.
+    """
+    rc = main([
+        "compare-periods",
+        "--period", "2026-08-01T00:00:00Z..2026-08-07T23:59:59Z",
+        "--period", "2026-08-15T00:00:00Z..2026-08-21T23:59:59Z",
+        "--db", str(compare_db_null_ts),
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert (
+        "excluded: 1 tool calls have no timestamp (the source records none) "
+        "and are dropped by both windows: claude_code 1"
+    ) in out
+    assert len([line for line in out.splitlines() if line.startswith("excluded:")]) == 1

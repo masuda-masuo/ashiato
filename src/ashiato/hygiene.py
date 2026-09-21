@@ -4,10 +4,12 @@ The five categories replace ad-hoc SQL that used to be rewritten by hand for
 every session-hygiene question:
 
 * ``companion_status_poll`` -- shell calls whose *executed command* invokes
-  ``kusabi-companion status``.  Other companion subcommands (``chain-show``,
-  ``chain-wait``), the bare binary, and text that merely *quotes* the command
-  -- in a tool result, in an ``echo`` argument, or in a ``Read`` of a doc --
-  are not polls.
+  ``kusabi-companion status``: the binary itself (basename ``kusabi-companion``
+  or ``kusabi-companion.mjs``) or its ``node <script>`` form
+  (``node .../kusabi-companion.mjs status``).  Other companion subcommands
+  (``chain-show``, ``chain-wait``, ``result``), the bare binary or bare
+  script, and text that merely *quotes* the command -- in a tool result, in an
+  ``echo`` argument, or in a ``Read`` of a doc -- are not polls.
 * ``host_file_hunt`` -- shell calls that run ``rg``/``grep``/``sed``/``cat``
   against host files.  A call whose persisted tool name is a dedicated
   file/search tool (``Grep``, ``Read``, an MCP search tool) is excluded, and
@@ -23,7 +25,10 @@ every session-hygiene question:
 
 Every classification reads the *persisted* ``tool_name`` and the command only
 -- never ``result_text``: what a tool returned is evidence about the tool, not
-about what was asked for.  The command is the full persisted ``input`` command
+about what was asked for.  The shell categories apply to the persisted
+shell-tool names ``Bash`` / ``PowerShell`` / ``Shell``, matched
+case-insensitively so ``bash`` counts too (the MCP ``undo_file_edit`` name
+match stays case-sensitive).  The command is the full persisted ``input`` command
 field when it can be used, with the 200-character ``input_summary`` kept only
 as a conservative fallback, so a long command whose signal sits past the
 summary truncation boundary still classifies.  A persisted command may be a
@@ -32,13 +37,20 @@ Codex ``input.command`` form -- which decodes to its actual argv without
 turning arbitrary prose or objects into commands.  :func:`_shell_tokens` is a
 deliberately small tokenizer that resolves quotes but not compound forms
 (``&&``, pipes), so classification is conservative: only the first command of
-a line counts as the executed command.  The one exception is the exact shell
-wrapper form ``bash -c SCRIPT`` / ``bash -lc SCRIPT`` (and the ``/bin/bash``
-/ ``sh`` / ``/bin/sh`` equivalents), which is unwrapped -- SCRIPT is
-re-tokenized with the same conservative tokenizer and then classified -- but
-no arbitrary wrapper, variable expansion, or nested command is descended
-into, so an argv element that merely mentions a signal never classifies
-unless it is the script argument of one of those exact forms.
+a line counts as the executed command.  Two exceptions are deliberately
+narrow.  The exact shell wrapper form ``bash -c SCRIPT`` / ``bash -lc
+SCRIPT`` (and the ``/bin/bash`` / ``sh`` / ``/bin/sh`` equivalents) is
+unwrapped -- SCRIPT is re-tokenized with the same conservative tokenizer and
+then classified.  And the ``cd <dir> &&`` prefix that almost every command
+persisted by this machine's sessions carries is stripped: while the token
+list starts with exactly ``<program whose basename is 'cd'>, <one token that
+does not start with '-'>, '&&'``, those three tokens are dropped and the
+check repeats, so ``cd /x && cat /etc/hosts`` classifies the ``cat`` and
+``cd /x && cd /y && cmd`` strips twice.  No other compound form is descended
+into -- pipes, ``;``, ``||``, subshells, command substitution, and
+``VAR=value`` prefixes are not traversed -- and an argv element that merely
+mentions a signal never classifies unless it is the script argument of one
+of those exact wrapper forms or follows the ``cd <dir> &&`` prefix.
 
 ``raw_local_mcp_http`` classifies the curl *request target*, not any
 URL-shaped option argument: common curl options that consume a following
@@ -51,7 +63,12 @@ parser.
 The report is computed by :func:`audit` over one bounded, read-only query and
 returned as plain data (the CLI renders it).  Categories may overlap, and the
 ``coverage`` block counts every selected row and distinct session *before*
-category filtering.  This module never mutates the database.
+category filtering and carries per-source ``sources``, so a windowed report
+discloses which source contributed which rows.  With either bound given, the
+``coverage`` block also discloses ``excluded_no_timestamp`` -- the rows whose
+``ts`` is NULL that the window dropped (the source records no per-call
+timestamp); without bounds nothing is excluded, because NULL-timestamp rows
+count.  This module never mutates the database.
 """
 
 from __future__ import annotations
@@ -76,7 +93,12 @@ CATEGORY_ORDER: tuple[str, ...] = (
 )
 
 #: Persisted tool names whose ``input`` carries an executed shell command.
-_SHELL_TOOLS: frozenset[str] = frozenset({"Bash", "PowerShell"})
+#: Membership is compared case-insensitively (``bash`` counts); the MCP
+#: ``undo_file_edit`` tool-name match below stays case-sensitive.
+_SHELL_TOOLS: frozenset[str] = frozenset({"Bash", "PowerShell", "Shell"})
+
+#: Lower-cased shell tool names for the case-insensitive membership test.
+_SHELL_TOOLS_LOWER: frozenset[str] = frozenset(name.lower() for name in _SHELL_TOOLS)
 
 _COMPANION_BIN = "kusabi-companion"
 _COMPANION_SUBCOMMAND = "status"
@@ -231,11 +253,57 @@ def _program(tokens: list[str]) -> str:
     return Path(tokens[0]).name
 
 
+def _strip_cd_prefix(tokens: list[str]) -> list[str]:
+    """Drop a leading ``cd <dir> &&`` prefix, repeatedly.
+
+    Almost every command persisted by this machine's sessions starts with
+    ``cd <dir> &&``, so while the token list begins with exactly ``<program
+    whose basename is 'cd'>``, one token that does not start with ``-``, and
+    ``&&``, those three tokens are dropped and the check repeats -- ``cd /x &&
+    cd /y && cat f`` strips twice and classifies ``cat f``.  Anything else is
+    left unchanged: a flag as the second token (``cd -P /x && ...``), a
+    different separator (``;``, ``|``), a ``VAR=value`` prefix, a subshell,
+    and quoted prose (which is a single token) all stay untouched, so no
+    signal is invented by descending into a compound form.
+    """
+    while len(tokens) >= 3 and Path(tokens[0]).name == "cd":
+        if tokens[1].startswith("-") or tokens[2] != "&&":
+            break
+        tokens = tokens[3:]
+    return tokens
+
+
 def _is_companion_status_poll(tokens: list[str]) -> bool:
-    """The executed command is ``kusabi-companion status`` (flags allowed after)."""
-    if _program(tokens) != _COMPANION_BIN:
+    """The executed command is ``kusabi-companion status`` (flags allowed after).
+
+    Two invocation forms count.  The binary directly: the executed program's
+    basename is ``kusabi-companion`` or ``kusabi-companion.mjs``.  And the
+    ``node <script>`` form actually persisted by Claude Code sessions: the
+    executed program's basename is ``node`` or ``nodejs`` and its first
+    argument that does not start with ``-`` is a path whose basename is
+    ``kusabi-companion.mjs``.  In both forms the subcommand is the first
+    argument after the program (or after that script path) that does not
+    start with ``-``, and only exactly ``status`` counts -- ``chain-show``,
+    ``chain-wait``, ``result``, and a bare invocation with no subcommand stay
+    unclassified.
+    """
+    program = _program(tokens)
+    if program in (_COMPANION_BIN, _COMPANION_BIN + ".mjs"):
+        arguments = tokens[1:]
+    elif program in ("node", "nodejs"):
+        arguments = tokens[1:]
+        script_index: int | None = None
+        for index, token in enumerate(arguments):
+            if token.startswith("-"):
+                continue
+            script_index = index
+            break
+        if script_index is None or Path(arguments[script_index]).name != _COMPANION_BIN + ".mjs":
+            return False
+        arguments = arguments[script_index + 1 :]
+    else:
         return False
-    for token in tokens[1:]:
+    for token in arguments:
         if token.startswith("-"):
             continue
         return token == _COMPANION_SUBCOMMAND
@@ -357,15 +425,17 @@ def categories_for(
     ``input`` command text (tokenized here), its decoded argv list (the Codex
     JSON-array form), or the ``input_summary`` fallback (see
     :func:`_command_tokens`).  An exact ``bash``/``sh`` ``-c``/``-lc``
-    wrapper is unwrapped before the rules run (see
-    :func:`_unwrap_shell_wrapper`).  The single classification point: the CLI
+    wrapper is unwrapped and a leading ``cd <dir> &&`` prefix is stripped
+    before the rules run (see :func:`_unwrap_shell_wrapper` and
+    :func:`_strip_cd_prefix`).  The single classification point: the CLI
     never re-implements a category rule, and a future thin MCP adapter can
     reuse this function directly.
     """
     matched: list[str] = []
-    if tool_name in _SHELL_TOOLS:
+    if tool_name is not None and tool_name.lower() in _SHELL_TOOLS_LOWER:
         tokens = _shell_tokens(command) if isinstance(command, str) else list(command or ())
         tokens = _unwrap_shell_wrapper(tokens)
+        tokens = _strip_cd_prefix(tokens)
         if _is_companion_status_poll(tokens):
             matched.append("companion_status_poll")
         if _is_host_file_hunt(tokens):
@@ -392,10 +462,18 @@ def audit(
     either bound, NULL timestamps are excluded.  The ``coverage`` block counts
     the selected rows and distinct sessions *before* category filtering;
     categories may overlap, so their ``tool_calls`` do not sum to coverage.
+    ``coverage["sources"]`` breaks the selected rows down per source (sorted
+    by ``tool_calls`` descending, then ``source`` ascending; a NULL source is
+    reported as ``None``).  ``coverage["excluded_no_timestamp"]`` counts the
+    rows whose ``ts`` is NULL that a bounded window dropped, per source --
+    the disclosure for sources that record no per-call timestamp -- and is
+    ``{"tool_calls": 0, "sources": []}`` when neither bound is given, because
+    an unbounded audit counts NULL-timestamp rows.
     """
     query = """
         SELECT
             session_id,
+            source,
             tool_name,
             input_summary,
             outcome,
@@ -418,14 +496,51 @@ def audit(
     coverage_sessions: set[str] = set()
     calls: dict[str, int] = {name: 0 for name in CATEGORY_ORDER}
     sessions: dict[str, set[str]] = {name: set() for name in CATEGORY_ORDER}
-    for session_id, tool_name, input_summary, outcome, input_command, input_command_type in rows:
+    source_calls: dict[str | None, int] = {}
+    source_sessions: dict[str | None, set[str]] = {}
+    for (
+        session_id,
+        source,
+        tool_name,
+        input_summary,
+        outcome,
+        input_command,
+        input_command_type,
+    ) in rows:
         if session_id is not None:
             coverage_sessions.add(session_id)
+        source_calls[source] = source_calls.get(source, 0) + 1
+        if session_id is not None:
+            source_sessions.setdefault(source, set()).add(session_id)
         tokens = _command_tokens(input_command, input_command_type, input_summary)
         for name in categories_for(tool_name, tokens, outcome):
             calls[name] += 1
             if session_id is not None:
                 sessions[name].add(session_id)
+
+    sources = [
+        {
+            "source": source,
+            "tool_calls": source_calls[source],
+            "sessions": len(source_sessions.get(source, set())),
+        }
+        for source in source_calls
+    ]
+    sources.sort(key=lambda item: (-item["tool_calls"], item["source"] or ""))
+
+    excluded_no_timestamp: dict[str, Any] = {"tool_calls": 0, "sources": []}
+    if since is not None or until is not None:
+        excluded_rows = connection.execute(
+            "SELECT source, COUNT(*) FROM tool_calls WHERE ts IS NULL GROUP BY source"
+        ).fetchall()
+        excluded_sources = [
+            {"source": source, "tool_calls": int(count)} for source, count in excluded_rows
+        ]
+        excluded_sources.sort(key=lambda item: (-item["tool_calls"], item["source"] or ""))
+        excluded_no_timestamp = {
+            "tool_calls": sum(item["tool_calls"] for item in excluded_sources),
+            "sources": excluded_sources,
+        }
 
     return {
         "coverage": {
@@ -433,6 +548,8 @@ def audit(
             "until": until,
             "sessions": len(coverage_sessions),
             "tool_calls": len(rows),
+            "sources": sources,
+            "excluded_no_timestamp": excluded_no_timestamp,
         },
         "categories": [
             {"name": name, "tool_calls": calls[name], "sessions": len(sessions[name])}

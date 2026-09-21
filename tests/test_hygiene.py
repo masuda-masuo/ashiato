@@ -357,7 +357,24 @@ def test_json_is_an_object_with_a_stable_shape(hygiene_db: Path, capsys: pytest.
     rc, payload = _audit(capsys, hygiene_db)
     assert rc == 0
     assert set(payload) == {"coverage", "categories"}
-    assert set(payload["coverage"]) == {"since", "until", "sessions", "tool_calls"}
+    assert set(payload["coverage"]) == {
+        "since",
+        "until",
+        "sessions",
+        "tool_calls",
+        "sources",
+        "excluded_no_timestamp",
+    }
+    for entry in payload["coverage"]["sources"]:
+        assert set(entry) == {"source", "tool_calls", "sessions"}
+        assert isinstance(entry["tool_calls"], int)
+        assert isinstance(entry["sessions"], int)
+    excluded = payload["coverage"]["excluded_no_timestamp"]
+    assert set(excluded) == {"tool_calls", "sources"}
+    assert isinstance(excluded["tool_calls"], int)
+    for entry in excluded["sources"]:
+        assert set(entry) == {"source", "tool_calls"}
+        assert isinstance(entry["tool_calls"], int)
     assert [cat["name"] for cat in payload["categories"]] == list(CATEGORY_ORDER)
     for cat in payload["categories"]:
         assert set(cat) == {"name", "tool_calls", "sessions"}
@@ -531,6 +548,78 @@ def test_null_timestamp_rows_included_without_bounds_and_excluded_with(
     assert (host["tool_calls"], host["sessions"]) == (2, 2)
 
 
+# ------------------------------------------------------- per-source coverage
+
+
+@pytest.fixture
+def multi_source_db(tmp_path: Path) -> Path:
+    """The main session plus the NULL-ts session (both claude_code) and one
+    current-window row from a second source (codex), so the coverage
+    ``sources`` breakdown has two sources with different counts."""
+    directory = tmp_path / "transcripts"
+    directory.mkdir()
+    sessions = {"ses-a": _main_session_a()}
+    sessions.update({"ses-null": _main_other_sessions()["ses-null"]})
+    _write_sessions(directory, sessions)
+    db_path = tmp_path / "multi.duckdb"
+    assert main(["build", "--source", str(directory), "--db", str(db_path)]) == 0
+    connection = connect(db_path)
+    try:
+        connection.execute(
+            "INSERT INTO tool_calls "
+            "(tool_use_id, session_id, source, seq, ts, tool_name, input, input_summary, outcome, is_error) "
+            "VALUES (?, ?, 'codex', ?, ?, 'Bash', CAST(? AS JSON), ?, 'ok', FALSE)",
+            [
+                "codex1_use",
+                "ses-codex",
+                0,
+                "2026-08-21T12:00:00Z",
+                '{"command": "kusabi-companion status"}',
+                "kusabi-companion status",
+            ],
+        )
+    finally:
+        connection.close()
+    return db_path
+
+
+def test_coverage_sources_break_selected_rows_down_per_source(
+    multi_source_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``coverage["sources"]`` lists every source among the selected rows with
+    its tool-call and session counts, sorted by tool_calls descending then
+    source ascending."""
+    rc, payload = _audit(capsys, multi_source_db)
+    assert rc == 0
+    sources = payload["coverage"]["sources"]
+    assert [item["source"] for item in sources] == ["claude_code", "codex"]
+    assert sources[0] == {"source": "claude_code", "tool_calls": 23, "sessions": 2}
+    assert sources[1] == {"source": "codex", "tool_calls": 1, "sessions": 1}
+
+
+def test_excluded_no_timestamp_counts_null_ts_rows_when_windowed(
+    hygiene_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With a bound given, coverage discloses the NULL-timestamp rows the
+    window dropped, broken down per source."""
+    rc, payload = _audit(capsys, hygiene_db, "--since", MAIN_SINCE)
+    assert rc == 0
+    assert payload["coverage"]["excluded_no_timestamp"] == {
+        "tool_calls": 1,
+        "sources": [{"source": "claude_code", "tool_calls": 1}],
+    }
+
+
+def test_excluded_no_timestamp_is_empty_without_bounds(
+    hygiene_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without bounds nothing is excluded: an unbounded audit counts
+    NULL-timestamp rows, so the disclosure is the empty shape."""
+    rc, payload = _audit(capsys, hygiene_db)
+    assert rc == 0
+    assert payload["coverage"]["excluded_no_timestamp"] == {"tool_calls": 0, "sources": []}
+
+
 # ---------------------------------------------------------------- table output
 
 
@@ -559,6 +648,23 @@ def test_table_output_lists_the_five_categories_with_both_counts(
     for name, (calls, sessions) in expected.items():
         assert calls in rows[name]
         assert sessions in rows[name]
+
+
+def test_table_excluded_line_appears_only_when_rows_were_dropped(
+    hygiene_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The hygiene table prints the ``excluded:`` disclosure directly after
+    the coverage line when a window dropped NULL-timestamp rows, and omits it
+    entirely when none were dropped (no bounds)."""
+    rc = main(["hygiene", "--db", str(hygiene_db)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "excluded:" not in out
+
+    rc = main(["hygiene", "--db", str(hygiene_db), "--since", MAIN_SINCE])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "excluded: 1 tool calls have no timestamp (the source records none): claude_code 1" in out
 
 
 # ---------------------------------------------------------------- error handling
