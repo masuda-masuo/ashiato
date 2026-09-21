@@ -5399,7 +5399,13 @@ def test_cursor_store_duplicate_message_ids_still_yield_distinct_event_ids(tmp_p
 
 
 def test_cursor_store_events_ts_null_and_no_tool_role_rows(tmp_path: Path):
-    """Criterion 6: ts stays NULL on every replaced row, and tool messages produce none."""
+    """Criterion 6: ts stays NULL on every replaced row, and tool messages produce none.
+
+    The positive assertions are what make this test detect a revert of the
+    replacement: a transcript-only session would hold one ``role`` NULL row
+    with no reasoning anywhere, so the ``system`` row and the ``reasoning``
+    row below only exist because the store conversation replaced it.
+    """
     transcript_dir, chats = _write_stage3_session(tmp_path)
     db_path = tmp_path / "tsnull.duckdb"
     build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
@@ -5423,6 +5429,23 @@ def test_cursor_store_events_ts_null_and_no_tool_role_rows(tmp_path: Path):
                 "SELECT count(*) FROM events WHERE session_id = 'sess1' AND type = 'tool-result'"
             ).fetchone()[0]
             == 0
+        )
+        # The replacement really happened: the store's system prompt is a
+        # ``system`` row and the reasoning part is a ``reasoning`` row --
+        # neither exists in the transcript-derived fallback.
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE session_id = 'sess1' "
+                "AND role = 'system' AND text = 'You are a coding assistant.'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE session_id = 'sess1' "
+                "AND type = 'reasoning' AND role = 'assistant' AND text = 'thinking step one'"
+            ).fetchone()[0]
+            == 1
         )
     finally:
         connection.close()
@@ -5613,4 +5636,374 @@ def test_cursor_store_events_without_chats_source_are_unchanged(tmp_path: Path):
         "text",
         None,
         "Let me check.",
+    )]
+
+
+# ---------------------------------------------------------------- cursor chat stores (issue #87 stage 3): repair round
+
+
+def _session_event_rows(db_path: Path, session_id: str) -> list[tuple]:
+    """Every events row of a session, ordered by event_id."""
+    connection = connect(db_path, read_only=True)
+    try:
+        return connection.execute(
+            "SELECT event_id, seq, type, role, text, ts FROM events "
+            "WHERE session_id = ? ORDER BY event_id",
+            [session_id],
+        ).fetchall()
+    finally:
+        connection.close()
+
+
+def _stage3_store_messages(call1_result: str) -> list[bytes]:
+    """``STAGE3_STORE_MESSAGES`` with the first tool call's result replaced."""
+    out = []
+    for message in STAGE3_STORE_MESSAGES:
+        record = json.loads(message)
+        content = record.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if part.get("type") == "tool-result" and part.get("toolCallId") == "call-1":
+                    part["result"] = call1_result
+        out.append(json.dumps(record).encode("utf-8"))
+    return out
+
+
+#: ``STAGE3_STORE_MESSAGES`` with the second call renamed ``Write`` -- the
+#: transcript says ``Read``, so the name check refuses the session.
+NAME_MISMATCH_STORE_MESSAGES = [
+    _store_chat_message("system", "You are a coding assistant."),
+    _store_chat_message("user", [{"type": "text", "text": "What now?"}]),
+    _store_chat_message(
+        "assistant",
+        [
+            {"type": "reasoning", "text": "thinking step one"},
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}},
+        ],
+    ),
+    _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u"}]),
+    _store_chat_message(
+        "assistant",
+        [{"type": "tool-call", "toolCallId": "call-2", "toolName": "Write", "input": {"file_path": "notes.md"}}],
+    ),
+    _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-2", "result": "written"}]),
+    _store_chat_message(
+        "assistant",
+        [{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {}}],
+    ),
+    _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-3", "result": "facts"}]),
+]
+
+
+def test_cursor_store_replace_is_atomic_on_insert_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Criterion 1: a failure between the delete and the insert changes nothing.
+
+    The per-session apply runs in one transaction, the way ``_store_file``
+    does.  Build once so the session holds its store rows, then build again
+    with ``_insert_rows`` patched to fail exactly on the replacement insert
+    (the ``cursor:store:`` rows): the build raises and the session keeps the
+    exact rows it had -- identical contents, not merely the same count.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "atomic.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    before = _session_event_rows(db_path, "sess1")
+    assert len(before) == 5
+
+    real_insert_rows = build_module._insert_rows
+
+    def failing_insert(connection, table, rows, *, scratch):
+        if table == "events" and rows and rows[0][0].startswith("cursor:store:"):
+            raise duckdb.Error("simulated insert failure")
+        return real_insert_rows(connection, table, rows, scratch=scratch)
+
+    monkeypatch.setattr(build_module, "_insert_rows", failing_insert)
+    with pytest.raises(duckdb.Error, match="simulated insert failure"):
+        build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+
+    after = _session_event_rows(db_path, "sess1")
+    assert after == before
+
+
+def test_cursor_store_stops_pairing_restores_transcript_rows(tmp_path: Path):
+    """Criterion 2: a session that stops pairing gets its transcript rows back.
+
+    Build once with the pairing store, then rename one store tool so the
+    store no longer pairs, and build again without touching the transcript:
+    the session ends with its transcript-derived rows -- not the stale
+    store-derived ones, and not empty.  The transcript file itself was
+    skipped as unchanged (``n_skipped``), so only the restore could have
+    produced these rows.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "transition.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert len(_session_event_rows(db_path, "sess1")) == 5  # store-derived
+
+    _write_cursor_chat_store(chats, "hash1", "sess1", NAME_MISMATCH_STORE_MESSAGES)
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_skipped == 1  # the transcript itself was not re-ingested
+    assert again.n_store_sessions_paired == 0
+    assert again.n_store_sessions_skipped_name == 1
+    rows = _session_event_rows(db_path, "sess1")
+    assert rows == [(
+        f"cursor:text:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:0",
+        2,
+        "text",
+        None,
+        "Let me check.",
+        None,
+    )]
+
+
+def test_cursor_store_stops_pairing_after_zero_event_replace_is_not_left_empty(tmp_path: Path):
+    """Criterion 3: the restore also covers a replacement that produced zero rows.
+
+    ``STORE_RESULT_MESSAGES`` pairs with the transcript but holds no event
+    parts, so the first build replaces the session's events with nothing.
+    After the store stops pairing, the session must not stay empty -- the
+    transcript rows come back.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", STORE_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats, "hash1", "sess1", STORE_RESULT_MESSAGES)
+    db_path = tmp_path / "zero_then_empty.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+    assert result_events_count(db_path, "sess1") == 0  # replaced with zero rows
+
+    _write_cursor_chat_store(chats, "hash1", "sess1", NAME_MISMATCH_STORE_MESSAGES)
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_store_sessions_paired == 0
+    rows = _session_event_rows(db_path, "sess1")
+    assert rows == [(
+        f"cursor:text:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:0",
+        2,
+        "text",
+        None,
+        "Let me check.",
+        None,
+    )]
+
+
+def test_cursor_store_vanished_between_builds_restores_transcript_rows(tmp_path: Path):
+    """Finding 2, store-gone variant: a deleted store also restores the transcript rows.
+
+    The store.db file no longer exists on the second build, so no candidate
+    can be read at all; the restore pass still notices the store-derived
+    rows and gives the session its transcript events back.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "vanished.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert len(_session_event_rows(db_path, "sess1")) == 5  # store-derived
+
+    (chats / "hash1" / "sess1" / "store.db").unlink()
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_store_sessions_paired == 0
+    assert again.n_store_sessions_skipped_count == 0  # no store was read at all
+    rows = _session_event_rows(db_path, "sess1")
+    assert rows == [(
+        f"cursor:text:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:0",
+        2,
+        "text",
+        None,
+        "Let me check.",
+        None,
+    )]
+
+
+def test_cursor_store_candidates_tried_until_one_pairs(tmp_path: Path):
+    """Criterion 4: a stale or unreadable store cannot starve a later valid one.
+
+    Two chat roots hold the same session; the first in sorted-path order is
+    unreadable or name-mismatched, the second is the valid store.  The valid
+    one must be applied.  Asserted for both root-argument orders -- the
+    candidate order comes from sorted absolute paths, so the outcome must
+    not depend on how the roots are passed.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", STORE_TRANSCRIPT_LINES)
+    good_chats = tmp_path / "chats_good"
+    _write_cursor_chat_meta(good_chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(good_chats, "hash1", "sess1", STAGE3_STORE_MESSAGES)
+
+    bad_chats = tmp_path / "chats_bad"  # sorts before good_chats
+    _write_cursor_chat_meta(bad_chats, "hash1", "sess1", NORMAL_CHAT_META)
+    unreadable_store = bad_chats / "hash1" / "sess1" / "store.db"
+    unreadable_store.write_bytes(b"this is not a sqlite database")
+
+    for roots in ([bad_chats, good_chats], [good_chats, bad_chats]):
+        db_path = tmp_path / f"candidates_{roots[0].name}_{roots[1].name}.duckdb"
+        result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=roots)
+        assert result.n_store_sessions_paired == 1, roots
+        # The valid store was applied: events replaced and results filled.
+        assert result.n_tool_calls_filled == 3, roots
+        rows = _session_event_rows(db_path, "sess1")
+        assert len(rows) == 5, roots
+        assert any(role == "system" for _, _, _, role, _, _ in rows), roots
+        call = _tool_call_result(db_path, "2:1")
+        assert call == ("ok", False, "/home/u", False), roots
+
+    # Same session, this time with a name-mismatched first candidate.
+    bad_chats_mm = tmp_path / "chats_bad_mm"
+    _write_cursor_chat_meta(bad_chats_mm, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(bad_chats_mm, "hash1", "sess1", NAME_MISMATCH_STORE_MESSAGES)
+    for roots in ([bad_chats_mm, good_chats], [good_chats, bad_chats_mm]):
+        db_path = tmp_path / f"candidates_mm_{roots[0].name}_{roots[1].name}.duckdb"
+        result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=roots)
+        assert result.n_store_sessions_paired == 1, roots
+        assert result.n_store_sessions_skipped_name == 1, roots
+        rows = _session_event_rows(db_path, "sess1")
+        assert len(rows) == 5, roots
+
+
+def _tool_call_result(db_path: Path, tool_use_id: str) -> tuple:
+    connection = connect(db_path, read_only=True)
+    try:
+        return connection.execute(
+            "SELECT outcome, is_error, result_text, result_truncated "
+            "FROM tool_calls WHERE tool_use_id = ?",
+            [tool_use_id],
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def test_cursor_store_duplicate_roots_first_valid_wins(tmp_path: Path):
+    """Criterion 5: with two valid stores for one session, the first in sorted path order wins.
+
+    Candidate stores are tried in ``meta_files`` order -- the metas sorted
+    by absolute path -- and the first one that pairs is applied; the other
+    is never read.  The two roots here are both valid but give the first
+    call different results, so the lexicographically-earlier root's value
+    landing in the database proves which one won, and a second build over
+    unchanged bytes gives the same outcome (deterministic).
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", STORE_TRANSCRIPT_LINES)
+    chats_a = tmp_path / "chats_a"  # sorts before chats_b
+    _write_cursor_chat_meta(chats_a, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats_a, "hash1", "sess1", _stage3_store_messages("/home/u"))
+    chats_b = tmp_path / "chats_b"
+    _write_cursor_chat_meta(chats_b, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats_b, "hash1", "sess1", _stage3_store_messages("beta"))
+
+    db_path = tmp_path / "two_valid.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats_a, chats_b])
+    assert result.n_store_sessions_paired == 1
+    # Only the winning store was read -- the loser never got a chance.
+    assert result.n_store_messages_read == 8
+    assert _tool_call_result(db_path, "2:1") == ("ok", False, "/home/u", False)
+    assert len(_session_event_rows(db_path, "sess1")) == 5
+
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats_a, chats_b])
+    assert again.n_store_sessions_paired == 1
+    assert _tool_call_result(db_path, "2:1") == ("ok", False, "/home/u", False)
+
+
+#: A transcript that made no tool calls at all: user query, one assistant reply.
+ZERO_CALL_TRANSCRIPT_LINES = [
+    {
+        "role": "user",
+        "message": {
+            "content": [{"type": "text", "text": "<user_query>\nDo the thing.\n</user_query>"}]
+        },
+    },
+    {
+        "role": "assistant",
+        "message": {
+            "content": [{"type": "text", "text": "Done."}]
+        },
+    },
+]
+
+#: A chats store with no tool calls either: system prompt, user text, and an
+#: assistant turn with reasoning + text.  Both counts are zero, so the
+#: pairing conditions hold vacuously and the session is enriched.
+ZERO_CALL_STORE_MESSAGES = [
+    _store_chat_message("system", "You are a coding assistant."),
+    _store_chat_message("user", [{"type": "text", "text": "Do the thing."}]),
+    _store_chat_message(
+        "assistant",
+        [
+            {"type": "reasoning", "text": "thinking"},
+            {"type": "text", "text": "Done."},
+        ],
+    ),
+]
+
+
+def test_cursor_store_zero_call_session_pairs_vacuously(tmp_path: Path):
+    """Criterion 6: a call-less transcript and a call-less store pair.
+
+    Zero transcript calls and zero store calls satisfy the pairing guard
+    vacuously -- the session id is the evidence, the same evidence stage 1
+    relies on for ``cwd`` -- so the session gains its ``role``, its system
+    prompt and its reasoning rows.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess0.jsonl", ZERO_CALL_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess0", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats, "hash1", "sess0", ZERO_CALL_STORE_MESSAGES)
+    db_path = tmp_path / "zerocall.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, type, role, text FROM events WHERE session_id = 'sess0'"
+        ).fetchall()
+    finally:
+        connection.close()
+    rows.sort(key=lambda row: _store_event_position(row[0]))
+    assert [(r[1], r[2], r[3]) for r in rows] == [
+        ("text", "system", "You are a coding assistant."),
+        ("text", "user", "Do the thing."),
+        ("reasoning", "assistant", "thinking"),
+        ("text", "assistant", "Done."),
+    ]
+
+
+def test_cursor_store_zero_call_transcript_with_calling_store_does_not_pair(tmp_path: Path):
+    """Criterion 6: a store that holds calls against a call-less transcript is a mismatch.
+
+    The transcript made no tool calls; the store did.  The counts disagree,
+    so the session does not pair and keeps its transcript-derived rows.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess0.jsonl", ZERO_CALL_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess0", NORMAL_CHAT_META)
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess0",
+        [
+            _store_chat_message("assistant", [{"type": "tool-call", "toolCallId": "c1", "toolName": "Bash", "input": {}}]),
+            _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "c1", "result": "ok"}]),
+        ],
+    )
+    db_path = tmp_path / "zerocall_mismatch.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 0
+    assert result.n_store_sessions_skipped_count == 1
+    rows = _session_event_rows(db_path, "sess0")
+    assert rows == [(
+        f"cursor:text:{(transcript_dir / 'sess0.jsonl').resolve()!s}:2:0",
+        2,
+        "text",
+        None,
+        "Done.",
+        None,
     )]
