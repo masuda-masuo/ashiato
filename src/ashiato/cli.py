@@ -1227,6 +1227,20 @@ def _print_hygiene_table(report: dict[str, Any], out: Any) -> None:
         f"{coverage['sessions']} sessions, {coverage['tool_calls']} tool calls",
         file=out,
     )
+    excluded = coverage.get("excluded_no_timestamp", {})
+    if excluded.get("tool_calls"):
+        parts = ", ".join(
+            f"{item['source']} {item['tool_calls']}" for item in excluded["sources"]
+        )
+        noun = (
+            "the source records none"
+            if len(excluded["sources"]) == 1
+            else "the sources record none"
+        )
+        print(
+            f"excluded: {excluded['tool_calls']} tool calls have no timestamp ({noun}): {parts}",
+            file=out,
+        )
     rows = [[cat["name"], cat["tool_calls"], cat["sessions"]] for cat in report["categories"]]
     _print_table(("category", "tool_calls", "sessions"), rows, out)
 
@@ -1367,6 +1381,41 @@ def _print_compare_table(report: dict[str, Any], out: Any) -> None:
         f"{c_cps_str} calls/session",
         file=out,
     )
+    # NULL-timestamp rows that each window dropped, disclosed per period
+    for label, period in (("baseline", b), ("current", c)):
+        excluded = period.get("excluded_no_timestamp", {})
+        if excluded.get("tool_calls"):
+            parts = ", ".join(
+                f"{item['source']} {item['tool_calls']}" for item in excluded["sources"]
+            )
+            noun = (
+                "the source records none"
+                if len(excluded["sources"]) == 1
+                else "the sources record none"
+            )
+            print(
+                f"excluded: {label}: {excluded['tool_calls']} tool calls "
+                f"have no timestamp ({noun}): {parts}",
+                file=out,
+            )
+    # A source present in only one period: the category delta includes its
+    # entire corpus, so a "0 -> N" jump may be an ingest change, not behaviour.
+    for item in report.get("source_asymmetry", []):
+        source = item["source"]
+        b_tc_a = item["baseline_tool_calls"]
+        c_tc_a = item["current_tool_calls"]
+        if c_tc_a and not b_tc_a:
+            print(
+                f"warning: source '{source}' has {c_tc_a} calls in current and 0 in baseline; "
+                "category deltas include its entire corpus",
+                file=out,
+            )
+        else:
+            print(
+                f"warning: source '{source}' has {b_tc_a} calls in baseline and 0 in current; "
+                "category deltas include its entire corpus",
+                file=out,
+            )
     columns = (
         "category",
         "b_calls", "b_calls/session",

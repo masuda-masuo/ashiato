@@ -43,10 +43,14 @@ def compare_periods(
 ) -> dict[str, Any]:
     """Run hygiene audit over two windows and return a flat comparison report.
 
-    The returned dict has ``periods`` (the baseline and current windows,
-    each with coverage totals) and ``categories`` (one object per hygiene
-    category in :data:`CATEGORY_ORDER`, each carrying flat keys for
-    baseline counts, current counts, change deltas, and computed ratios).
+    The returned dict has ``periods`` (the baseline and current windows, each
+    with coverage totals, its per-source ``sources`` list, and the
+    ``excluded_no_timestamp`` disclosure for the window), ``categories`` (one
+    object per hygiene category in :data:`CATEGORY_ORDER`, each carrying flat
+    keys for baseline counts, current counts, change deltas, and computed
+    ratios), and ``source_asymmetry`` (one object per source that has rows in
+    exactly one of the two periods, so a delta that is really a newly
+    ingested source cannot be read as a behaviour change).
     """
     baseline = hygiene_audit(connection, since=baseline_since, until=baseline_until)
     current = hygiene_audit(connection, since=current_since, until=current_until)
@@ -56,6 +60,22 @@ def compare_periods(
 
     b_cov = baseline["coverage"]
     c_cov = current["coverage"]
+
+    b_sources = {item["source"]: item["tool_calls"] for item in b_cov["sources"]}
+    c_sources = {item["source"]: item["tool_calls"] for item in c_cov["sources"]}
+    source_asymmetry: list[dict[str, Any]] = []
+    for source in sorted(
+        set(b_sources) | set(c_sources),
+        key=lambda item: (item is None, item or ""),
+    ):
+        b_tc = b_sources.get(source, 0)
+        c_tc = c_sources.get(source, 0)
+        if (b_tc > 0) != (c_tc > 0):
+            source_asymmetry.append({
+                "source": source,
+                "baseline_tool_calls": b_tc,
+                "current_tool_calls": c_tc,
+            })
 
     categories: list[dict[str, Any]] = []
     for name in CATEGORY_ORDER:
@@ -86,13 +106,18 @@ def compare_periods(
                 "until": baseline_until.isoformat() + "Z",
                 "tool_calls": b_cov["tool_calls"],
                 "sessions": b_cov["sessions"],
+                "sources": b_cov["sources"],
+                "excluded_no_timestamp": b_cov["excluded_no_timestamp"],
             },
             "current": {
                 "since": current_since.isoformat() + "Z",
                 "until": current_until.isoformat() + "Z",
                 "tool_calls": c_cov["tool_calls"],
                 "sessions": c_cov["sessions"],
+                "sources": c_cov["sources"],
+                "excluded_no_timestamp": c_cov["excluded_no_timestamp"],
             },
         },
         "categories": categories,
+        "source_asymmetry": source_asymmetry,
     }

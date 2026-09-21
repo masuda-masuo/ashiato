@@ -262,6 +262,126 @@ def test_long_companion_status_beyond_summary_truncation_counts() -> None:
     assert _command_tokens(command, "VARCHAR", truncated) == _shell_tokens(command)
 
 
+# ------------------------------------------------------- cd <dir> && prefix
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # the persisted form this machine's sessions almost always use
+        ("cd /x && cat /etc/hosts", {"host_file_hunt"}),
+        ("cd /k && kusabi-companion status", {"companion_status_poll"}),
+        ("cd /repo && curl -s http://127.0.0.1:8750/mcp", {"raw_local_mcp_http"}),
+        # the prefix is stripped repeatedly
+        ("cd /a && cd /b && grep -rn x /home", {"host_file_hunt"}),
+        ("cd /x && cd /y && rg TODO /home", {"host_file_hunt"}),
+        # the prefix is stripped from the script of an unwrapped -c wrapper
+        ("cd /x && node plugins/kusabi/scripts/kusabi-companion.mjs status", {"companion_status_poll"}),
+    ],
+)
+def test_cd_prefix_is_stripped_before_the_rules(command: str, expected: set[str]) -> None:
+    assert set(categories_for("Bash", command, "ok")) == expected
+
+
+def test_cd_prefix_is_stripped_after_wrapper_unwrap() -> None:
+    """The strip applies to the *script* of an unwrapped bash -c wrapper, not
+    only to a bare command line."""
+    assert categories_for("Bash", ["/bin/bash", "-lc", "cd /x && kusabi-companion status"], "ok") == (
+        "companion_status_poll",
+    )
+    assert categories_for("Bash", ["/bin/bash", "-lc", "cd /x && cat /etc/hosts"], "ok") == (
+        "host_file_hunt",
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # not a `cd <dir> &&` prefix: different separator, flag, assignment,
+        # subshell, or a bare cd -- none of them descend into a compound form
+        "cd /x ; cat /etc/hosts",
+        "cd /x | cat /etc/hosts",
+        "cd -P /x && cat /etc/hosts",
+        "FOO=1 cat /etc/hosts",
+        "(cd /x && cat /etc/hosts)",
+        "cd /x",
+        # quoting immunity: prose that merely quotes the command is never a call
+        'echo "cd /x && cat /etc/hosts"',
+        "echo 'kusabi-companion status'",
+        'echo "cat /etc/hosts"',
+    ],
+)
+def test_cd_prefix_near_misses_do_not_classify(command: str) -> None:
+    assert categories_for("Bash", command, "ok") == ()
+
+
+# ------------------------------------------------------- node <script> companion
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # the form actually persisted by Claude Code sessions, relative and
+        # absolute script path, node and nodejs, flags around the subcommand
+        ("node plugins/kusabi/scripts/kusabi-companion.mjs status", {"companion_status_poll"}),
+        ("node /abs/path/kusabi-companion.mjs status --json", {"companion_status_poll"}),
+        ("nodejs kusabi-companion.mjs status", {"companion_status_poll"}),
+        ("cd /k && node plugins/kusabi/scripts/kusabi-companion.mjs status", {"companion_status_poll"}),
+        # the .mjs script invoked directly also counts
+        ("kusabi-companion.mjs status", {"companion_status_poll"}),
+    ],
+)
+def test_node_companion_form_recognises_status(command: str, expected: set[str]) -> None:
+    assert set(categories_for("Bash", command, "ok")) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "node /abs/path/kusabi-companion.mjs chain-wait 123",
+        "node kusabi-companion.mjs chain-show 123",
+        "node kusabi-companion.mjs result",
+        "node kusabi-companion.mjs",
+        "node /abs/path/kusabi-companion.mjs",
+        # a different script (or -e code) is not a companion invocation
+        "node /abs/path/other-script.mjs status",
+        "node -e 'kusabi-companion status'",
+        # the bare binary rules still apply unchanged
+        "kusabi-companion chain-wait 123",
+        "kusabi-companion",
+        "kusabi-companion.mjs result",
+    ],
+)
+def test_node_companion_form_near_misses_do_not_classify(command: str) -> None:
+    assert categories_for("Bash", command, "ok") == ()
+
+
+# ------------------------------------------------------- shell tool names
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["Bash", "PowerShell", "Shell", "bash", "BASH", "POWERSHELL", "shell"],
+)
+def test_shell_tool_names_match_case_insensitively(tool_name: str) -> None:
+    """Cursor's `Shell` tool and opencode's lowercase `bash` both count as
+    shell tools; the membership test is case-insensitive."""
+    assert categories_for(tool_name, "cat /etc/hosts", "ok") == ("host_file_hunt",)
+
+
+def test_shell_tool_names_quoted_prose_is_still_not_a_call() -> None:
+    assert categories_for("Shell", 'echo "cat /etc/hosts"', "ok") == ()
+    assert categories_for("bash", 'echo "kusabi-companion status"', "ok") == ()
+    assert categories_for("Shell", "ls -la /home/dev/proj", "ok") == ()
+
+
+def test_shell_tool_names_undo_file_edit_stays_case_sensitive() -> None:
+    """Only the shell-tool membership test became case-insensitive; the MCP
+    undo_file_edit tool-name match keeps its case-sensitive behaviour."""
+    assert categories_for("mcp__sunaba__undo_file_edit", "", "ok") == ("undo_file_edit",)
+    assert categories_for("MCP__SUNABA__UNDO_FILE_EDIT", "", "ok") == ()
+
+
 # ---------------------------------------------------------------- end to end
 
 
