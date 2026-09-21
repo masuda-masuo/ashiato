@@ -343,7 +343,7 @@ def test_format_version_is_unchanged():
     # `CallDynamicTool` blocks are now stored as MCP calls with `mcp_server`
     # read from `namespace` -- the same Cursor source bytes yield rows where
     # version 17 stored them as ok / builtin, so a rebuild is required.
-    assert FORMAT_VERSION == 18
+    assert FORMAT_VERSION == 19
 
 
 # ---------------------------------------------------------------- read-only discipline

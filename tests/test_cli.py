@@ -211,6 +211,8 @@ def test_denials_json_format(db: Path, capsys: pytest.CaptureFixture[str]):
     assert main(["denials", "--db", str(db), "--format", "json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [row["tool_name"] for row in payload] == ["mcp__sunaba__publish", "Write"]
+    assert payload[0]["denied_by"] == "classifier"
+    assert payload[0]["denial_reason"] is None
     assert payload[1] == {
         "session_id": "11111111-1111-4111-8111-111111111111",
         "seq": 6,
@@ -218,6 +220,8 @@ def test_denials_json_format(db: Path, capsys: pytest.CaptureFixture[str]):
         "tool_name": "Write",
         "input_summary": "/etc/hosts",
         "permission_mode": "default",
+        "denied_by": "user",
+        "denial_reason": None,
         "cwd": "/home/dev/proj",
         "next_tool_name": "mcp__sunaba__publish",
         "next_input_summary": '{"create_pr":true,"files":["src/ashiato/parser.py"]}',

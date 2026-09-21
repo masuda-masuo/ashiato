@@ -6093,3 +6093,507 @@ def test_cursor_store_zero_call_transcript_with_calling_store_does_not_pair(tmp_
         "Done.",
         None,
     )]
+
+
+# ---------------------------------------------------------------- permission_mode_carry (#102)
+
+
+def _write_permission_mode_session(path: Path, session_id: str, records: list[dict]) -> None:
+    """Write a transcript from a list of record dicts."""
+    lines = [json.dumps(r) for r in records]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _pm_record(typ, seq, *, session_id="pm-session", uuid=None, parent_uuid=None,
+               permission_mode=None, message=None, content=None):
+    """Shorthand for a record dict of the given type."""
+    r = {
+        "type": typ,
+        "sessionId": session_id,
+        "uuid": uuid or f"{typ}_{seq}",
+        "parentUuid": parent_uuid,
+        "seq": seq,
+    }
+    if permission_mode is not None:
+        r["permissionMode"] = permission_mode
+    if typ == "permission-mode":
+        pass  # no message
+    elif typ == "assistant":
+        r["message"] = message or {"role": "assistant", "content": content or []}
+    elif typ == "user":
+        r["message"] = message or {"role": "user", "content": content or []}
+    return r
+
+
+def test_permission_mode_carry_default_then_auto(tmp_path: Path, db: Path):
+    """Acceptance criterion 1: permission-mode(default) -> tool_use -> user(auto) -> tool_use."""
+    source = tmp_path / "pm"
+    source.mkdir()
+    records = [
+        _pm_record("permission-mode", 0, permission_mode="default"),
+        _pm_record("assistant", 1, content=[
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+        ]),
+        _pm_record("user", 2, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": False},
+        ]),
+        _pm_record("user", 3, permission_mode="auto", content=[
+            {"type": "text", "text": "go ahead"},
+        ]),
+        _pm_record("assistant", 4, content=[
+            {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "pwd"}},
+        ]),
+        _pm_record("user", 5, content=[
+            {"type": "tool_result", "tool_use_id": "t2", "content": "/home", "is_error": False},
+        ]),
+    ]
+    _write_permission_mode_session(source / "pm_session.jsonl", "pm-session", records)
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, permission_mode FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert rows == [("t1", "default"), ("t2", "auto")]
+    finally:
+        connection.close()
+
+
+def test_permission_mode_carry_null_before_first_observed(tmp_path: Path, db: Path):
+    """Acceptance criterion 2: a tool call before any permission-mode record keeps NULL."""
+    source = tmp_path / "pm"
+    source.mkdir()
+    records = [
+        _pm_record("assistant", 0, content=[
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "echo hi"}},
+        ]),
+        _pm_record("user", 1, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "hi", "is_error": False},
+        ]),
+        _pm_record("permission-mode", 2, permission_mode="acceptEdits"),
+        _pm_record("assistant", 3, content=[
+            {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/x"}},
+        ]),
+        _pm_record("user", 4, content=[
+            {"type": "tool_result", "tool_use_id": "t2", "content": "data", "is_error": False},
+        ]),
+    ]
+    _write_permission_mode_session(source / "pm_session.jsonl", "pm-session", records)
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, permission_mode FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        assert rows == [("t1", None), ("t2", "acceptEdits")]
+    finally:
+        connection.close()
+
+
+def test_permission_mode_carry_type_mode_record_ignored(tmp_path: Path, db: Path):
+    """Acceptance criterion 3: type:'mode' records do not set permission_mode."""
+    source = tmp_path / "pm"
+    source.mkdir()
+    records = [
+        _pm_record("permission-mode", 0, permission_mode="default"),
+        _pm_record("assistant", 1, content=[
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+        ]),
+        _pm_record("user", 2, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": False},
+        ]),
+        # A "mode" record -- different from "permission-mode"
+        {
+            "type": "mode",
+            "sessionId": "pm-session",
+            "uuid": "mode_3",
+            "parentUuid": None,
+            "seq": 3,
+            "mode": "normal",
+        },
+        _pm_record("assistant", 4, content=[
+            {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/x"}},
+        ]),
+        _pm_record("user", 5, content=[
+            {"type": "tool_result", "tool_use_id": "t2", "content": "data", "is_error": False},
+        ]),
+    ]
+    _write_permission_mode_session(source / "pm_session.jsonl", "pm-session", records)
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, permission_mode FROM tool_calls ORDER BY seq"
+        ).fetchall()
+        # The mode record did not change the carry-forward; t2 still has "default".
+        assert rows == [("t1", "default"), ("t2", "default")]
+    finally:
+        connection.close()
+
+
+def test_permission_mode_carry_no_timestamp_record_takes_effect(tmp_path: Path, db: Path):
+    """Acceptance criterion 4: a permission-mode record (no ts) still takes effect."""
+    source = tmp_path / "pm"
+    source.mkdir()
+    records = [
+        _pm_record("permission-mode", 0, permission_mode="auto"),
+        _pm_record("assistant", 1, content=[
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "date"}},
+        ]),
+        _pm_record("user", 2, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "now", "is_error": False},
+        ]),
+    ]
+    _write_permission_mode_session(source / "pm_session.jsonl", "pm-session", records)
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT permission_mode FROM tool_calls WHERE tool_use_id = 't1'"
+        ).fetchone()
+        assert row[0] == "auto"
+    finally:
+        connection.close()
+
+
+def test_permission_mode_carry_events_keep_own_value(tmp_path: Path, db: Path):
+    """Acceptance criterion 5: events.permission_mode keeps its own-record value."""
+    source = tmp_path / "pm"
+    source.mkdir()
+    records = [
+        _pm_record("permission-mode", 0, permission_mode="default"),
+        _pm_record("user", 1, permission_mode="auto", content=[
+            {"type": "text", "text": "hello"},
+        ]),
+        _pm_record("assistant", 2, content=[
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+        ]),
+        _pm_record("user", 3, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": False},
+        ]),
+    ]
+    _write_permission_mode_session(source / "pm_session.jsonl", "pm-session", records)
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        # events.seq is the 1-based line number (parser: enumerate(handle, start=1)),
+        # so the records above are seq 1..4.  Every event keeps the value on its
+        # own record and nothing else: the permission-mode record has "default",
+        # the user record that carries the field has "auto", and the assistant
+        # record that carries the tool_use has NULL -- which is exactly why the
+        # tool call needs the carried state.
+        own = dict(
+            connection.execute(
+                "SELECT seq, permission_mode FROM events WHERE seq <= 4 ORDER BY seq"
+            ).fetchall()
+        )
+        assert own[1] == "default"
+        assert own[2] == "auto"
+        assert own[3] is None
+        # The tool call takes the most recent carried value, which is the user
+        # record's "auto" -- not the assistant record's absent value, and not the
+        # older "default".
+        tool_pm = connection.execute(
+            "SELECT permission_mode FROM tool_calls WHERE tool_use_id = 't1'"
+        ).fetchone()[0]
+        assert tool_pm == "auto"
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------- denied_by / denial_reason (#103)
+
+
+_CLASSIFIER_DENIED_TEXT = (
+    "Permission for this action was denied by the Claude Code auto mode classifier. "
+    "Reason: [Merge Without Review]."
+)
+_USER_DENIED_TEXT = "The user doesn't want to proceed with this tool use. The tool call was rejected."
+_CLASSIFIER_NO_REASON_TEXT = (
+    "Permission for this action was denied by the Claude Code auto mode classifier. "
+    "Reason: No reason provided."
+)
+
+
+def write_denial_session(path: Path, session_id: str, calls) -> None:
+    """A transcript of tool calls where each has a specified outcome type.
+
+    *calls* is a list of (tool_name, tool_input, result_type) tuples where
+    result_type is one of: 'ok', 'error', 'user_denied', 'classifier_denied',
+    'classifier_no_reason'.
+    """
+    lines = []
+    clock = 0
+    result_contents = {
+        "ok": ("ok result", False),
+        "error": ("error result", True),
+        "user_denied": (_USER_DENIED_TEXT, True),
+        "classifier_denied": (_CLASSIFIER_DENIED_TEXT, True),
+        "classifier_no_reason": (_CLASSIFIER_NO_REASON_TEXT, True),
+    }
+    for index, (tool_name, tool_input, result_type) in enumerate(calls):
+        use_id = f"toolu_{index}"
+        lines.append(json.dumps({
+            "type": "assistant",
+            "uuid": f"a{index}",
+            "parentUuid": None if index == 0 else f"r{index - 1}",
+            "sessionId": session_id,
+            "timestamp": f"2026-09-20T12:00:{clock:02d}.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": use_id,
+                    "name": tool_name,
+                    "input": tool_input,
+                }],
+            },
+        }))
+        clock += 1
+        content, is_error = result_contents[result_type]
+        lines.append(json.dumps({
+            "type": "user",
+            "uuid": f"r{index}",
+            "parentUuid": f"a{index}",
+            "sessionId": session_id,
+            "timestamp": f"2026-09-20T12:00:{clock:02d}.000Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": use_id,
+                    "content": content,
+                    "is_error": is_error,
+                }],
+            },
+        }))
+        clock += 1
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_denied_by_user_decline(tmp_path: Path, db: Path):
+    """Acceptance criterion 6: user-decline string yields denied_by='user', denial_reason=None."""
+    source = tmp_path / "denial"
+    source.mkdir()
+    write_denial_session(
+        source / "s1.jsonl", "s1",
+        [("Bash", {"command": "rm -rf /"}, "user_denied")],
+    )
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT denied_by, denial_reason, outcome FROM tool_calls WHERE session_id = 's1'"
+        ).fetchone()
+        assert row == ("user", None, "denied")
+    finally:
+        connection.close()
+
+
+def test_denied_by_classifier_with_reason(tmp_path: Path, db: Path):
+    """Acceptance criterion 6: classifier string with Reason: [X] yields denied_by='classifier', denial_reason='[X]'."""
+    source = tmp_path / "denial"
+    source.mkdir()
+    write_denial_session(
+        source / "s2.jsonl", "s2",
+        [("mcp__sunaba__publish", {"files": ["x.py"]}, "classifier_denied")],
+    )
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT denied_by, denial_reason, outcome FROM tool_calls WHERE session_id = 's2'"
+        ).fetchone()
+        assert row == ("classifier", "[Merge Without Review]", "denied")
+    finally:
+        connection.close()
+
+
+def test_denied_by_classifier_no_reason_provided(tmp_path: Path, db: Path):
+    """Acceptance criterion 7: classifier denial with 'No reason provided' yields denial_reason=None."""
+    source = tmp_path / "denial"
+    source.mkdir()
+    write_denial_session(
+        source / "s3.jsonl", "s3",
+        [("Write", {"file_path": "/x", "content": "y"}, "classifier_no_reason")],
+    )
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT denied_by, denial_reason, outcome FROM tool_calls WHERE session_id = 's3'"
+        ).fetchone()
+        assert row == ("classifier", None, "denied")
+    finally:
+        connection.close()
+
+
+def test_non_denied_rows_have_null_denied_by_and_denial_reason(tmp_path: Path, db: Path):
+    """Acceptance criterion 8: ok, error, pending rows have both new columns NULL."""
+    source = tmp_path / "denial"
+    source.mkdir()
+    write_denial_session(
+        source / "s4.jsonl", "s4",
+        [
+            ("Bash", {"command": "ls"}, "ok"),
+            ("Read", {"file_path": "/x"}, "error"),
+        ],
+    )
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT denied_by, denial_reason, outcome FROM tool_calls WHERE session_id = 's4' ORDER BY seq"
+        ).fetchall()
+        assert rows == [(None, None, "ok"), (None, None, "error")]
+    finally:
+        connection.close()
+
+
+def test_denied_by_outcome_denied_still_holds_the_same_rows(tmp_path: Path, db: Path):
+    """Acceptance criterion 9: outcome='denied' still holds exactly the same rows."""
+    source = tmp_path / "denial"
+    source.mkdir()
+    write_denial_session(
+        source / "s5.jsonl", "s5",
+        [
+            ("Bash", {"command": "rm -rf /"}, "user_denied"),
+            ("Write", {"file_path": "/x", "content": "y"}, "classifier_denied"),
+            ("Bash", {"command": "ls"}, "ok"),
+        ],
+    )
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, outcome FROM tool_calls WHERE session_id = 's5' ORDER BY seq"
+        ).fetchall()
+        assert rows[0][1] == "denied"
+        assert rows[1][1] == "denied"
+        assert rows[2][1] == "ok"
+    finally:
+        connection.close()
+
+
+def test_denials_view_shows_denied_by_and_denial_reason(tmp_path: Path, db: Path):
+    """Acceptance criterion 10: denials view exposes denied_by and denial_reason."""
+    source = tmp_path / "denial"
+    source.mkdir()
+    write_denial_session(
+        source / "s6.jsonl", "s6",
+        [
+            ("Bash", {"command": "rm -rf /"}, "user_denied"),
+            ("Bash", {"command": "echo hi"}, "ok"),
+        ],
+    )
+    build([source], db)
+    connection = connect(db, read_only=True)
+    try:
+        cols = [desc[0] for desc in connection.execute(
+            "SELECT * FROM denial_followups LIMIT 0"
+        ).description]
+        assert "denied_by" in cols
+        assert "denial_reason" in cols
+        row = connection.execute(
+            "SELECT denied_by, denial_reason FROM denial_followups WHERE session_id = 's6'"
+        ).fetchone()
+        assert row == ("user", None)
+    finally:
+        connection.close()
+
+
+def test_denial_reason_classify_denial_unit():
+    """Unit test for classify_denial with various inputs."""
+    from ashiato.parser import classify_denial
+
+    # Non-denied outcomes return (None, None).
+    assert classify_denial(result_text="ok", outcome="ok") == (None, None)
+    assert classify_denial(result_text="error", outcome="error") == (None, None)
+    assert classify_denial(result_text="", outcome="pending") == (None, None)
+
+    # User decline.
+    assert classify_denial(result_text=_USER_DENIED_TEXT, outcome="denied") == ("user", None)
+
+    # Classifier with reason.
+    by, reason = classify_denial(result_text=_CLASSIFIER_DENIED_TEXT, outcome="denied")
+    assert by == "classifier"
+    assert reason == "[Merge Without Review]"
+
+    # Classifier with "No reason provided".
+    by, reason = classify_denial(result_text=_CLASSIFIER_NO_REASON_TEXT, outcome="denied")
+    assert by == "classifier"
+    assert reason is None
+
+    # Denied outcome but text matches neither pattern: (None, None).
+    by, reason = classify_denial(result_text="unknown denial", outcome="denied")
+    assert by is None
+    assert reason is None
+
+
+def test_denial_reason_bracket_reasons_roundtrip():
+    """All measured reasons in the corpus must round-trip."""
+    from ashiato.parser import classify_denial
+
+    reasons = [
+        "[Merge Without Review]",
+        "[Unauthorized Persistence]",
+        "[Credential Materialization]",
+        "[Auto-Mode Bypass]",
+    ]
+    for reason in reasons:
+        text = (
+            "Permission for this action was denied by the Claude Code auto mode classifier. "
+            f"Reason: {reason}."
+        )
+        by, got = classify_denial(result_text=text, outcome="denied")
+        assert by == "classifier"
+        assert got == reason
+
+    # Bare prose reason.
+    text = (
+        "Permission for this action was denied by the Claude Code auto mode classifier. "
+        "Reason: Blocked by classifier rule X."
+    )
+    by, got = classify_denial(result_text=text, outcome="denied")
+    assert by == "classifier"
+    assert got == "Blocked by classifier rule X"
+
+
+def test_denial_reason_stops_at_the_advice_the_harness_appends() -> None:
+    """The reason ends where the harness's fixed advice sentence begins.
+
+    Every classifier denial in the real corpus carries that sentence after the
+    reason, so taking the rest of the message swallowed it into the reason -- and
+    made `No reason provided` fail to normalise to NULL, because the text kept
+    going.  Cutting at the first period instead would truncate the real reasons,
+    which are prose containing their own sentences.  These are the four measured
+    shapes, verbatim apart from the shortened advice tail.
+    """
+    from ashiato.parser import classify_denial
+
+    advice = (
+        "If you have other tasks that don't depend on this action, continue working on "
+        "those. IMPORTANT: You *may* attempt to accomplish this action using other tools."
+    )
+    prefix = (
+        "Permission for this action was denied by the Claude Code auto mode classifier. "
+        "Reason: "
+    )
+    cases = {
+        "Blocked by classifier. ": "Blocked by classifier",
+        "No reason provided. ": None,
+        "[Auto-Mode Bypass]. ": "[Auto-Mode Bypass]",
+        (
+            "[Merge Without Review] Merging PR #572, which the agent itself authored, "
+            "with no human approval; ask the user to confirm. "
+        ): (
+            "[Merge Without Review] Merging PR #572, which the agent itself authored, "
+            "with no human approval; ask the user to confirm"
+        ),
+    }
+    for body, expected in cases.items():
+        denied_by, reason = classify_denial(
+            result_text=prefix + body + advice, outcome="denied"
+        )
+        assert denied_by == "classifier"
+        assert reason == expected, body

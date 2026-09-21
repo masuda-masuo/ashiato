@@ -669,14 +669,46 @@ reach chains ~2,400 deep, so the walk is both memoized and iterative.
 
 `tool_use_id`, `session_id`, `file_path`, `source`, `seq`, `ts`, `call_event_id`, `result_event_id`,
 `tool_name`, `tool_kind`, `mcp_server`, `input`, `input_summary`, `outcome`, `is_error`,
-`result_text`, `result_truncated`, `duration_ms`, `permission_mode`, `cwd`, `is_sidechain`,
-`parent_tool_use_id`.
+`result_text`, `result_truncated`, `duration_ms`, `permission_mode`, `denied_by`,
+`denial_reason`, `cwd`, `is_sidechain`, `parent_tool_use_id`.
 
 `source` records which transcript format produced the call (`claude_code` or `codex`).
 Built by joining each `tool_use` block to its `tool_result` on `tool_use_id`; the call is on
-an assistant line and the result on a later user line. `seq`, `ts`, `permission_mode`, `cwd`
-and `is_sidechain` come from the calling event. `input` is a DuckDB `JSON` column, so
-`input->>'$.command'` works.
+an assistant line and the result on a later user line. `seq`, `ts`, `cwd`
+and `is_sidechain` come from the calling event.
+
+`permission_mode` is **carried forward**, not read off the call. The record that holds a
+`tool_use` block never carries `permissionMode`: the field appears on `permission-mode`
+records (`{"type": "permission-mode", "permissionMode": "default", "sessionId": ...}`, which
+have no timestamp at all) and on `user` records. Parsing a file in order, the most recently
+seen value is attached to the tool calls that follow it, ordered by `seq` — never by `ts`,
+which the mode records do not have. Three things follow, and an analysis that groups by mode
+has to say so rather than quietly dropping rows:
+
+- A call before the first observed value is `NULL`. That means "not recorded" and is never
+  back-filled from a later value or from a default.
+- Only 454 of 727 archived transcript files carry the field at all, so sessions older than
+  that stay `NULL` no matter how the database is rebuilt.
+- Sources other than `claude_code` record no equivalent and are `NULL` by design.
+
+`events.permission_mode` keeps a different meaning on purpose: the value on *that record*,
+so you can still find where the mode changed. A `{"type": "mode", "mode": "normal"}` record
+is a separate concept and never sets either column.
+
+`denied_by` and `denial_reason` split a denial into who denied it and why. `denied_by` is
+`user` when the result carries the user-decline string, `classifier` when it carries the auto
+mode classifier's string, and `NULL` for anything not denied (or for a denial matching
+neither pattern — a guess is not recorded). `denial_reason` holds the classifier's reason,
+cut at the fixed advice sentence the harness appends after it, and is `NULL` for a user
+decline and for `No reason provided`. `outcome = 'denied'` is unchanged and still covers
+both, so existing queries keep working.
+
+The split exists because the two are different events: a user decline is a one-off judgement
+and may go through next time, while a classifier block is reproducible for the same command
+shape and can therefore be designed around. Reading only a denial count conflates "propose
+this better" with "this is not permitted at all".
+
+`input` is a DuckDB `JSON` column, so `input->>'$.command'` works.
 
 `input_summary` is one short line saying what the call asked for, so you can read a list of
 calls without knowing each tool's argument shape: the `command` of a `Bash`, the `file_path`
@@ -760,8 +792,12 @@ reads the evidence and decides.
 
 One row per `outcome = 'denied'` call in `tool_calls`, joined to the next tool call in the
 same session: `session_id`, `seq`, `ts`, `tool_name`, `input_summary`, `permission_mode`,
-`cwd`, `next_tool_name`, `next_input_summary`, `next_outcome`, `next_ts`, `gap_seconds`,
-`followup_kind`.
+`denied_by`, `denial_reason`, `cwd`, `next_tool_name`, `next_input_summary`, `next_outcome`,
+`next_ts`, `gap_seconds`, `followup_kind`.
+
+`denied_by` / `denial_reason` are what make the follow-up readable: the same count of
+denials means "propose this better" when the user declined and "this is not permitted at
+all" when the classifier blocked, and only the second can be designed around.
 
 A view, not a table: it is derived entirely from `tool_calls`, so it cannot fall out of step
 with the rows it summarises and the incremental build has nothing extra to maintain.

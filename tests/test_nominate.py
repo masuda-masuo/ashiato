@@ -447,7 +447,7 @@ class TestFormatVersion:
         # `mcp_server` read from `namespace` -- the same Cursor source bytes
         # yield rows where version 17 stored them as ok / builtin, so a
         # rebuild is required.
-        assert FORMAT_VERSION == 18
+        assert FORMAT_VERSION == 19
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

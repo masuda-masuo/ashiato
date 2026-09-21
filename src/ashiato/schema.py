@@ -97,6 +97,8 @@ TOOL_CALL_TABLE: tuple[Column, ...] = (
     ("result_truncated", "BOOLEAN"),
     ("duration_ms", "BIGINT"),
     ("permission_mode", "VARCHAR"),
+    ("denied_by", "VARCHAR"),
+    ("denial_reason", "VARCHAR"),
     ("cwd", "VARCHAR"),
     ("is_sidechain", "BOOLEAN"),
     ("parent_tool_use_id", "VARCHAR"),
@@ -234,7 +236,14 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: read from ``namespace`` (6,974 of 9,295 Cursor MCP calls were stored
 #: ``builtin`` with ``mcp_server`` NULL).  The same Cursor source bytes yield
 #: different rows than version 17, so existing databases must be rebuilt.
-FORMAT_VERSION = 18
+#: Version 19 = tool_calls now carry ``permission_mode`` carried forward from
+#: the most recent ``permission-mode`` or ``user`` record in file order
+#: (issue #102), and two new columns ``denied_by`` / ``denial_reason`` that
+#: distinguish user declines from classifier blocks (issue #103).  The same
+#: source bytes yield different rows than version 18 (``permission_mode`` was
+#: NULL for every Claude Code row, ``denied_by`` / ``denial_reason`` are new),
+#: so existing databases must be rebuilt.
+FORMAT_VERSION = 19
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
@@ -323,7 +332,8 @@ CREATE OR REPLACE VIEW "{DENIAL_FOLLOWUPS_VIEW}" AS
 WITH line_heads AS (
     -- One row per transcript line that issued tool calls: the call that a
     -- denial on an earlier line is paired with, chosen by tool_use_id.
-    SELECT session_id, seq, ts, tool_name, input, input_summary, outcome
+    SELECT session_id, seq, ts, tool_name, input, input_summary, outcome,
+           permission_mode, denied_by, denial_reason, cwd
     FROM "tool_calls"
     QUALIFY row_number() OVER (PARTITION BY session_id, seq ORDER BY tool_use_id) = 1
 ),
@@ -349,6 +359,8 @@ SELECT
     denied.tool_name,
     denied.input_summary,
     denied.permission_mode,
+    denied.denied_by,
+    denied.denial_reason,
     denied.cwd,
     following.next_tool_name,
     following.next_input_summary,
