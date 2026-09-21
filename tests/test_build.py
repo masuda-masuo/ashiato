@@ -2212,6 +2212,92 @@ def test_cursor_transcript_populates_sessions_events_and_tool_calls(tmp_path: Pa
         connection.close()
 
 
+def test_cursor_call_dynamic_tool_block_is_stored_as_mcp(tmp_path: Path):
+    """A CallDynamicTool block with namespace/toolName is mcp, server = namespace.
+
+    Measured on the real corpus: 6,974 of 9,295 Cursor MCP calls (75%) arrive
+    as ``CallDynamicTool`` blocks spelling the server as ``input.namespace``,
+    and the pre-fix builder stored them as ``builtin`` with ``mcp_server``
+    NULL.  Both block names and both key spellings are the same identity --
+    ``server`` / ``namespace`` both name the MCP server.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(
+        transcript_dir / "sess1.jsonl",
+        [
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "CallDynamicTool",
+                            "input": {
+                                "arguments": {"phase": "edit"},
+                                "namespace": "sunaba",
+                                "toolName": "get_workflow_guide",
+                            },
+                        },
+                    ]
+                },
+            },
+            {"type": "turn_ended", "status": "success"},
+        ],
+    )
+    db_path = tmp_path / "dynamic.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir])
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT tool_name, tool_kind, mcp_server FROM tool_calls"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == ("CallDynamicTool", "mcp", "sunaba")
+
+
+def test_cursor_call_dynamic_tool_without_namespace_or_server_keeps_null_mcp_server(tmp_path: Path):
+    """A CallDynamicTool block whose input carries no server key stores mcp_server NULL.
+
+    Cursor's own agent can omit ``namespace`` / ``toolName`` entirely (the
+    tool answers ``server: Required, toolName: Required``) -- measured 178
+    such calls on the real corpus, 177 of them errors.  NULL is the honest
+    value: no server was recorded, so inventing one would fabricate a record
+    Cursor never made.
+    """
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(
+        transcript_dir / "sess1.jsonl",
+        [
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "CallDynamicTool",
+                            "input": {"arguments": {"query": "x"}},
+                        },
+                    ]
+                },
+            },
+            {"type": "turn_ended", "status": "success"},
+        ],
+    )
+    db_path = tmp_path / "dynamic-null.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir])
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT tool_name, tool_kind, mcp_server FROM tool_calls"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == ("CallDynamicTool", "builtin", None)
+
+
 def test_cursor_tool_call_outcome_and_is_error_are_null(tmp_path: Path):
     """Acceptance criterion 2: outcome IS NULL and is_error IS NULL -- not 'pending', not False.
 

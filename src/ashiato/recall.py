@@ -38,10 +38,15 @@ CLAUDE_RECALL_TOOL = "mcp__kaiba__recall"
 OPENCODE_RECALL_TOOL = "kaiba_recall"
 CODEX_RECALL_TOOL = "mcp__kaiba__recall"
 
-#: Cursor calls every MCP tool through one block name, ``CallMcpTool``; which
-#: MCP tool it is comes from ``input.server`` / ``input.toolName`` instead of
-#: from the block name itself, unlike the other two sources.
+#: Cursor records MCP tool calls under two block names, ``CallMcpTool`` and
+#: ``CallDynamicTool``; which MCP tool it is comes from the block's input --
+#: the server identity is ``input.server`` when present, otherwise
+#: ``input.namespace``, with ``toolName`` naming the tool -- instead of from
+#: the block name itself, unlike the other two sources.  ``GetDynamicTools`` /
+#: ``GetMcpTools`` are not calls at all: they fetch the tool catalogue and
+#: must never be read as one.
 CURSOR_MCP_TOOL_NAME = "CallMcpTool"
+CURSOR_DYNAMIC_TOOL_NAME = "CallDynamicTool"
 CURSOR_RECALL_SERVER = "kaiba"
 CURSOR_RECALL_TOOL = "recall"
 
@@ -322,10 +327,30 @@ def extract_from_opencode(
 
 
 def _is_cursor_recall(call: CursorToolCall) -> bool:
-    if call.name != CURSOR_MCP_TOOL_NAME or not isinstance(call.input, dict):
+    """True when *call* is a kaiba recall, whichever block name Cursor used.
+
+    Both MCP block names carry the same identity under the same key precedence:
+    the server identity is ``input.server`` when present, otherwise
+    ``input.namespace`` -- the same reading
+    :func:`ashiato.build._cursor_tool_call_to_row` uses, so a call build.py
+    attributes to a server is attributed identically here.  ``GetDynamicTools``
+    / ``GetMcpTools`` (the tool catalogue fetches) match neither block name,
+    so their inputs never count as a recall even when they mention ``recall``.
+    """
+    if not isinstance(call.input, dict):
         return False
+    if call.name not in (CURSOR_MCP_TOOL_NAME, CURSOR_DYNAMIC_TOOL_NAME):
+        return False
+    server = call.input.get("server")
+    namespace = call.input.get("namespace")
+    if isinstance(server, str):
+        server_identity = server
+    elif isinstance(namespace, str):
+        server_identity = namespace
+    else:
+        server_identity = None
     return (
-        call.input.get("server") == CURSOR_RECALL_SERVER
+        server_identity == CURSOR_RECALL_SERVER
         and call.input.get("toolName") == CURSOR_RECALL_TOOL
     )
 

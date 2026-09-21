@@ -338,7 +338,12 @@ def test_format_version_is_unchanged():
     # carrying the real role, the system prompt and the reasoning -- the same
     # Cursor source bytes yield rows where version 16 kept the role-less
     # transcript text chunks, so a rebuild is required.
-    assert FORMAT_VERSION == 17
+    # Bumped to 18 by issues #92/#93: a Cursor store shell result whose first
+    # line is a nonzero `Exit code` now classifies as an error, and
+    # `CallDynamicTool` blocks are now stored as MCP calls with `mcp_server`
+    # read from `namespace` -- the same Cursor source bytes yield rows where
+    # version 17 stored them as ok / builtin, so a rebuild is required.
+    assert FORMAT_VERSION == 18
 
 
 # ---------------------------------------------------------------- read-only discipline

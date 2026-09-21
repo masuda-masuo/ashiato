@@ -289,6 +289,17 @@ CURSOR_RESULT_ERROR_PREFIXES: tuple[str, ...] = (
 #: not-failed, exactly the way a brand-new denial pattern must not be guessed.
 CURSOR_RESULT_FAILURE_STATUSES: tuple[str, ...] = ("error", "failed", "failure")
 
+#: The first-line marker of a Cursor shell tool result (classifier rule 4).
+#: Cursor records a shell result as a string whose first line is
+#: ``Exit code: N`` followed by the command output, and a nonzero N means the
+#: command failed.  Measured on the real corpus: 1,566 of 1,864 Shell /
+#: AwaitShell results carry an ``Exit code: 0`` first line, 53 a nonzero one,
+#: and 245 carry no ``Exit code`` line at all -- those record no exit status
+#: and must not be guessed at.  Like rule 3 the match is anchored at the
+#: start of the string: an ``Exit code: N`` that merely appears inside
+#: captured command output is not evidence of failure.
+CURSOR_RESULT_EXIT_CODE_PREFIX = "Exit code: "
+
 
 @dataclass(slots=True)
 class CursorStoreToolCall:
@@ -514,12 +525,16 @@ def classify_store_result(result: object) -> tuple[bool, str]:
        is an error;
     3. a string starting with one of :data:`CURSOR_RESULT_ERROR_PREFIXES` is
        an error;
-    4. anything else is ``ok``.
+    4. a string whose first line is ``Exit code: N`` with nonzero N is an
+       error -- Cursor records a shell result as a string whose first line is
+       the exit code, so a nonzero exit means the command failed;
+    5. anything else is ``ok``.
 
     ``pending`` and ``denied`` are never produced: a result that exists at
-    all means the call completed, and Cursor records no denial signal.  Rule 3
-    is prefix matching on model-facing prose -- a weaker signal than the
-    other sources' status fields, which is why it is the last resort.
+    all means the call completed, and Cursor records no denial signal.  Rules
+    3 and 4 are anchored text rules on model-facing prose -- weaker signals
+    than the other sources' status fields, which is why they come after the
+    structured dict signals.
     """
     if isinstance(result, dict):
         error = result.get("error")
@@ -532,6 +547,11 @@ def classify_store_result(result: object) -> tuple[bool, str]:
     if isinstance(result, str):
         if result.startswith(CURSOR_RESULT_ERROR_PREFIXES):
             return True, "error"
+        first_line = result.split("\n", 1)[0].strip()
+        if first_line.startswith(CURSOR_RESULT_EXIT_CODE_PREFIX):
+            code_text = first_line[len(CURSOR_RESULT_EXIT_CODE_PREFIX):].strip()
+            if code_text.isdigit() and int(code_text) != 0:
+                return True, "error"
         return False, "ok"
     return False, "ok"
 

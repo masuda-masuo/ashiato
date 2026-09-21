@@ -112,6 +112,16 @@ DEFAULT_CODEX_SOURCE = Path("~/.codex/sessions")
 #: (``~/.cursor/chats/<workspace-hash>/<session-uuid>/meta.json``).
 CURSOR_CHATS_META_PATTERN = "*/*/meta.json"
 
+#: The second Cursor block name that calls an MCP tool, alongside
+#: :data:`CURSOR_MCP_TOOL_NAME` (``CallMcpTool``).  Cursor records both block
+#: names with the same meaning but different key spellings: ``CallMcpTool``
+#: carries ``server`` / ``toolName`` in its input, ``CallDynamicTool`` spells
+#: the same identity as ``namespace`` / ``toolName``.  Measured on the real
+#: corpus, 6,974 of 9,295 Cursor MCP calls (75%) arrive as
+#: ``CallDynamicTool``; the pre-fix builder stored them as ``builtin`` with
+#: ``mcp_server`` NULL even though the server name sits in the input.
+CURSOR_DYNAMIC_TOOL_NAME = "CallDynamicTool"
+
 #: Below this many rows the temp file costs more than the row-by-row insert.
 BULK_INSERT_MIN_ROWS = 8
 
@@ -1120,12 +1130,14 @@ def _cursor_tool_call_to_row(call: object) -> list[object]:
     does not change that: ``store.db`` carries no per-message timestamp, so
     ``ts`` stays NULL after the join too.
 
-    ``tool_name`` is the recorded block name.  Cursor calls every MCP tool
-    through one block name, ``CallMcpTool``, and records which MCP tool it is
-    in the input (``server`` / ``toolName``) instead of in the name, so the
-    mcp/``split_tool_name`` spelling the other sources use does not apply;
-    ``mcp_server`` is read straight out of the recorded input.  ``input`` and
-    ``input_summary`` come from the recorded input as with every other source.
+    ``tool_name`` is the recorded block name.  Cursor calls MCP tools through
+    two block names, ``CallMcpTool`` and ``CallDynamicTool``, and records
+    which MCP tool it is in the input instead of in the name -- ``CallMcpTool``
+    carries ``server`` / ``toolName``, ``CallDynamicTool`` spells the same
+    identity as ``namespace`` / ``toolName`` -- so the mcp/``split_tool_name``
+    spelling the other sources use does not apply; ``mcp_server`` is read
+    straight out of the recorded input.  ``input`` and ``input_summary`` come
+    from the recorded input as with every other source.
 
     ``call_event_id`` / ``result_event_id`` are NULL: Cursor does not link a
     tool_use block to any ``events`` row (it records no result event at all),
@@ -1141,16 +1153,23 @@ def _cursor_tool_call_to_row(call: object) -> list[object]:
         else json.dumps(tool_input, ensure_ascii=False, default=str)
     )
 
-    # CallMcpTool blocks name the real tool in the input, not the block name.
+    # MCP blocks (CallMcpTool / CallDynamicTool) name the real tool in the
+    # input, not the block name.
     tool_kind = "builtin"
     mcp_server: str | None = None
-    if call.name == CURSOR_MCP_TOOL_NAME and isinstance(tool_input, dict):
+    if (
+        call.name in (CURSOR_MCP_TOOL_NAME, CURSOR_DYNAMIC_TOOL_NAME)
+        and isinstance(tool_input, dict)
+    ):
         server = tool_input.get("server")
+        namespace = tool_input.get("namespace")
         tool_name = tool_input.get("toolName")
-        if isinstance(server, str) or isinstance(tool_name, str):
+        if isinstance(server, str) or isinstance(namespace, str) or isinstance(tool_name, str):
             tool_kind = "mcp"
         if isinstance(server, str):
             mcp_server = server
+        elif isinstance(namespace, str):
+            mcp_server = namespace
 
     return [
         call.call_id,          # tool_use_id
