@@ -39,7 +39,7 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
 pip install -e ".[dev]"
 ```
 
-Python 3.11+. The only runtime dependency is `duckdb`.
+Python 3.12+. The only runtime dependency is `duckdb`.
 
 ## Use
 
@@ -845,7 +845,7 @@ ruff check .
 pytest -q
 ```
 
-CI runs `ruff check .` and the full `pytest` suite on Python 3.11 and 3.12 for every
-push and pull request.
+CI runs `ruff check .` and the full `pytest` suite on Python 3.12 for every push and
+pull request — one interpreter, the one this tool runs on.
 
 Fixtures under `tests/fixtures/` are synthetic — no real transcript is ever committed.

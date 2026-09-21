@@ -18,9 +18,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          # The one interpreter this tool actually runs on (the WSL host).
-          # requires-python still allows >=3.11 and ruff still targets py311,
-          # but only this version is exercised here.
+          # The one interpreter this tool runs on (the WSL host); it is also
+          # the floor in requires-python and ruff's target-version, so what CI
+          # exercises is exactly what the package claims to support.
           python-version: "3.12"
           cache: pip
       - name: Install
