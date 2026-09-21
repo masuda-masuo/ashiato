@@ -20,7 +20,13 @@ import pytest
 
 from ashiato.build import connect
 from ashiato.cli import main
-from ashiato.hygiene import _command_tokens, _shell_tokens, audit, categories_for
+from ashiato.hygiene import (
+    _SEGMENT_SEP,
+    _command_tokens,
+    _shell_tokens,
+    audit,
+    categories_for,
+)
 
 
 def test_shell_tokenizer_resolves_quotes_without_splitting() -> None:
@@ -222,16 +228,18 @@ def test_shell_c_wrapper_near_misses_do_not_classify(argv: list[str], expected: 
     assert set(categories_for("Bash", argv, "ok")) == expected
 
 
-def test_shell_c_wrapper_script_still_first_command_only() -> None:
-    """Compound commands inside SCRIPT are not descended into: the first
-    command of the script is the executed command, exactly as for an
-    unwrapped command line."""
+def test_shell_c_wrapper_script_splits_on_separators_and_not_on_ampersand() -> None:
+    """Inside an unwrapped bash -c script, ``;`` splits into segments that are
+    classified independently, while ``&&`` is not a separator (only the
+    ``cd <dir> &&`` prefix rule applies)."""
     assert categories_for(
         "Bash",
         ["bash", "-c", "cat /etc/hosts && curl http://127.0.0.1:8750/mcp"],
         "ok",
     ) == ("host_file_hunt",)
-    assert categories_for("Bash", ["bash", "-c", "echo hi; kusabi-companion status"], "ok") == ()
+    assert categories_for("Bash", ["bash", "-c", "echo hi; kusabi-companion status"], "ok") == (
+        "companion_status_poll",
+    )
     assert categories_for("Bash", ["bash", "-c", "curl http://127.0.0.1:8750/mcp && cat /etc/hosts"], "ok") == (
         "raw_local_mcp_http",
     )
@@ -299,7 +307,6 @@ def test_cd_prefix_is_stripped_after_wrapper_unwrap() -> None:
     [
         # not a `cd <dir> &&` prefix: different separator, flag, assignment,
         # subshell, or a bare cd -- none of them descend into a compound form
-        "cd /x ; cat /etc/hosts",
         "cd /x | cat /etc/hosts",
         "cd -P /x && cat /etc/hosts",
         "FOO=1 cat /etc/hosts",
@@ -503,3 +510,166 @@ def test_codex_shell_wrapper_argv_classify_end_to_end(tmp_path: Path) -> None:
     assert counts["host_file_hunt"]["tool_calls"] == 1
     assert counts["raw_local_mcp_http"]["tool_calls"] == 1
     assert report["coverage"]["tool_calls"] == 3
+
+
+# --------------------------------------------------- segment separators
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # the most frequent measured shape: a sleep, then the poll after a semicolon
+        (
+            "sleep 90; cd /k && node plugins/kusabi/scripts/kusabi-companion.mjs status",
+            {"companion_status_poll"},
+        ),
+        # the poll is the third segment, not the first
+        ("ls -la; command -v kusabi-companion; kusabi-companion status", {"companion_status_poll"}),
+        # inside an unwrapped wrapper script, semicolons split too
+        (["bash", "-c", "echo hi; kusabi-companion status"], {"companion_status_poll"}),
+        # one row, one category, not two -- two hunt segments are still one host_file_hunt
+        ("cat /etc/hosts; cat /etc/passwd", {"host_file_hunt"}),
+        # a trailing or doubled separator is harmless
+        ("cat /etc/hosts;;", {"host_file_hunt"}),
+        ("cat /etc/hosts;", {"host_file_hunt"}),
+        # semicolons also split after the wrapper unwrap
+        (["/bin/bash", "-lc", "cd /x && cat /etc/hosts; curl http://127.0.0.1:8750/mcp"],
+         {"host_file_hunt", "raw_local_mcp_http"}),
+    ],
+)
+def test_semicolon_separator(command: str | list[str], expected: set[str]) -> None:
+    assert set(categories_for("Bash", command, "ok")) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # a raw newline separates segments (Cursor multi-line scripts)
+        ("cd /k\nkusabi-companion status\necho done", {"companion_status_poll"}),
+        # multiple newlines
+        ("cat /etc/hosts\ncat /etc/passwd\n", {"host_file_hunt"}),
+        # newlines inside the unwrapped wrapper script
+        (["bash", "-c", "echo hi\nkusabi-companion status"], {"companion_status_poll"}),
+    ],
+)
+def test_newline_separator(command: str | list[str], expected: set[str]) -> None:
+    assert set(categories_for("Bash", command, "ok")) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # semicolons inside double quotes are not separators
+        'echo "a; cat /etc/hosts"',
+        'echo "sleep 90; kusabi-companion status"',
+        # semicolons inside single quotes are not separators
+        "echo 'a; cat /etc/hosts'",
+        "echo 'sleep 90; kusabi-companion status'",
+        # newlines inside single quotes are not separators
+        "echo 'a\ncat /etc/hosts'",
+        # newlines inside double quotes are not separators
+        'echo "a\ncat /etc/hosts"',
+        # argv elements are never re-split
+        ["echo", "a; cat /etc/hosts"],
+        ["echo", "kusabi-companion status"],
+    ],
+)
+def test_separator_quoting(command: str | list[str]) -> None:
+    """Quoting and argv elements are never split on separators."""
+    assert categories_for("Bash", command, "ok") == ()
+
+
+def test_section_b_shapes_keep_not_classifying() -> None:
+    """Shapes from the real corpus that the segment change must leave alone."""
+    # VAR=value prefix is not stripped
+    assert categories_for("Bash", "FOO=1 cat /etc/hosts", "ok") == ()
+    # variable indirection -- the assignment is a segment, the program is $K
+    assert categories_for("Bash", "K=/path/to/kusabi-companion.mjs", "ok") == ()
+    # loop keywords as first token are not programs
+    assert categories_for("Bash", "while true; do cat /etc/hosts; done", "ok") == ()
+    # pipes are not separators -- only the first command counts
+    assert categories_for("Bash", "cat /etc/hosts | grep x", "ok") == ("host_file_hunt",)
+    # && is not a separator (only cd <dir> && is special)
+    assert categories_for("Bash", "cmd && cmd", "ok") == ()
+    # subshell is not a program
+    assert categories_for("Bash", "(cd /x && cat /etc/hosts)", "ok") == ()
+    # dedicated tools are never shell categories
+    assert categories_for("Grep", "cat /etc/hosts", "ok") == ()
+
+
+def test_nul_in_a_command_string_cannot_forge_a_separator() -> None:
+    """A NUL in persisted command *text* must not act as a separator.
+
+    The separator is a NUL sentinel, so the tokenizer drops NULs from its input:
+    a string that carries one classifies exactly as it would without it.  A list
+    argument is deliberately not filtered -- it is either a real argv (which
+    cannot contain NUL) or the already-tokenized output of
+    :func:`_command_tokens`, whose sentinels are the separators and must
+    survive; filtering them once broke every real ``;`` row while every
+    string-level test stayed green.
+    """
+    assert categories_for("Bash", "echo hi \x00 cat /etc/hosts", "ok") == ()
+    assert categories_for("Bash", "cat /etc/hosts \x00 echo hi", "ok") == ("host_file_hunt",)
+    # a command that is nothing but NULs is an empty command
+    assert categories_for("Bash", "\x00\x00", "ok") == ()
+
+
+def test_command_tokens_separators_survive_into_categories_for() -> None:
+    """The real pipeline passes :func:`_command_tokens` output (a list) into
+    :func:`categories_for`, so the sentinels it produced must still split."""
+    tokens = _command_tokens(
+        "sleep 90; cd /k && node plugins/kusabi/scripts/kusabi-companion.mjs status 2>&1 | head -3",
+        "VARCHAR",
+        None,
+    )
+    assert _SEGMENT_SEP in tokens
+    assert categories_for("Bash", tokens, "ok") == ("companion_status_poll",)
+
+
+def test_separator_rows_classify_end_to_end_through_audit(tmp_path: Path) -> None:
+    """End to end: the real pipeline reaches ``categories_for`` with the token
+    list from :func:`_command_tokens`, not with a string.
+
+    Every string-level separator test can pass while this layer is broken -- it
+    happened: filtering the tokenizer's sentinels out of a list argument left
+    every real ``;`` row unclassified with the whole suite green.  These are the
+    two most frequent measured shapes from the real corpus.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    _bash_call(
+        "ses-sleep",
+        "sleep 90; cd ~/dev/projects/kusabi && "
+        "node plugins/kusabi/scripts/kusabi-companion.mjs status 2>&1 | head -15",
+        source,
+    )
+    _bash_call("ses-seq", "ls -la; echo ===; cat /etc/hosts", source)
+    _bash_call("ses-newline", "cd /k\nkusabi-companion status\necho done", source)
+
+    db_path = tmp_path / "separators.duckdb"
+    assert main(["build", "--source", str(source), "--db", str(db_path)]) == 0
+    connection = connect(db_path, read_only=True)
+    try:
+        report = audit(connection)
+    finally:
+        connection.close()
+
+    counts = {cat["name"]: cat for cat in report["categories"]}
+    assert counts["companion_status_poll"]["tool_calls"] == 2
+    assert counts["host_file_hunt"]["tool_calls"] == 1
+    assert report["coverage"]["tool_calls"] == 3
+
+
+def test_heredoc_body_line_is_a_known_over_count() -> None:
+    """A heredoc body is not quoted, so a body line beginning with a hunt
+    program reads as an executed command.
+
+    Pinned as a known limitation, not an aspiration: detecting it means tracking
+    heredoc delimiters, which is the shell parser these boundaries exist to
+    avoid.  Sampling the rows this change newly matched on the real corpus found
+    no instance of it.
+    """
+    command = "python3 - <<'EOF'\ncat = 1  # a python line, not a command\nEOF"
+    assert categories_for("Bash", command, "ok") == ("host_file_hunt",)
+    # the same body line inside quotes is correctly not a command
+    assert categories_for("Bash", "python3 -c 'cat = 1'", "ok") == ()

@@ -37,25 +37,39 @@ Codex ``input.command`` form -- which decodes to its actual argv without
 turning arbitrary prose or objects into commands.  :func:`_shell_tokens` is a
 deliberately small tokenizer that resolves quotes but not compound forms
 (``&&``, pipes), so classification is conservative: only the first command of
-a line counts as the executed command.  Two exceptions are deliberately
-narrow.  The exact shell wrapper form ``bash -c SCRIPT`` / ``bash -lc
-SCRIPT`` (and the ``/bin/bash`` / ``sh`` / ``/bin/sh`` equivalents) is
-unwrapped -- SCRIPT is re-tokenized with the same conservative tokenizer and
-then classified.  And the ``cd <dir> &&`` prefix that almost every command
-persisted by this machine's sessions carries is stripped: while the token
-list starts with exactly ``<program whose basename is 'cd'>, <one token that
-does not start with '-'>, '&&'``, those three tokens are dropped and the
-check repeats, so ``cd /x && cat /etc/hosts`` classifies the ``cat`` and
-``cd /x && cd /y && cmd`` strips twice.  No other compound form is descended
-into -- pipes, ``;``, ``||``, subshells, command substitution, and
-``VAR=value`` prefixes are not traversed -- and an argv element that merely
-mentions a signal never classifies unless it is the script argument of one
-of those exact wrapper forms or follows the ``cd <dir> &&`` prefix.
+a *segment* counts as the executed command.  Three exceptions are
+deliberately narrow.  The exact shell wrapper form ``bash -c SCRIPT`` /
+``bash -lc SCRIPT`` (and the ``/bin/bash`` / ``sh`` / ``/bin/sh``
+equivalents) is unwrapped -- SCRIPT is re-tokenized with the same
+conservative tokenizer and then classified.  The ``cd <dir> &&`` prefix that
+almost every command persisted by this machine's sessions carries is
+stripped: while the token list starts with exactly ``<program whose basename
+is 'cd'>, <one token that does not start with '-'>, '&&'``, those three
+tokens are dropped and the check repeats, so ``cd /x && cat /etc/hosts``
+classifies the ``cat`` and ``cd /x && cd /y && cmd`` strips twice.  And a
+standalone ``;`` or a raw newline splits the command into segments (below).
+No other compound form is descended into -- pipes, ``||``, ``&``, subshells,
+command substitution, and ``VAR=value`` prefixes are not traversed -- and an
+argv element that merely mentions a signal never classifies unless it is the
+script argument of one of those exact wrapper forms or follows the
+``cd <dir> &&`` prefix.
+
+A persisted shell command is split into **segments** by standalone ``;``
+tokens and raw newlines (outside quotes).  Each segment is classified
+independently with the same rules above -- ``_strip_cd_prefix`` and the
+category checks run per segment -- and the row is reported once per matched
+category (never per segment).  Quoting is respected: a ``;`` or newline
+inside single or double quotes stays inside its token and does not split.
+Argv elements are never re-split.  The one known over-count: a heredoc body
+is not quoted, so a body line that begins with a hunt program reads as an
+executed command.  Sampling the real corpus for newly matched rows found no
+instance, and resolving it means tracking heredoc delimiters -- a shell
+parser -- so it is disclosed rather than fixed.
 
 ``raw_local_mcp_http`` classifies the curl *request target*, not any
 URL-shaped option argument: common curl options that consume a following
-value (``-H``/``--header``, ``-d``/``--data*``, ``-F``/``--form``, ``--url``,
-...) have their value handled, so ``curl -H 'http://localhost:8750/'
+value (``-H``/``--header``, ``-d``/``--data*``, ``-F``/``--form``, ``--url``
+... ) have their value handled, so ``curl -H 'http://localhost:8750/'
 https://api.github.com`` is not a raw MCP call while the actual loopback
 target still is.  This is a conservative option-value skip, not a full curl
 parser.
@@ -166,6 +180,10 @@ _CURL_VALUE_OPTIONS_LONG: frozenset[str] = frozenset(
 #: An MCP undo call on any server, e.g. ``mcp__sunaba__undo_file_edit``.
 _UNDO_FILE_EDIT_RE = re.compile(r"^mcp__.+__undo_file_edit$")
 
+#: Sentinel token emitted by :func:`_shell_tokens` for segment separators
+#: (standalone ``;`` tokens and raw newlines outside quotes).
+_SEGMENT_SEP: str = "\x00"
+
 
 def _shell_tokens(command: str | None) -> list[str]:
     """Split a shell command line into argv-like tokens.
@@ -173,12 +191,25 @@ def _shell_tokens(command: str | None) -> list[str]:
     Single and double quotes (with backslash escapes inside double quotes and
     outside them) are resolved so that a hunt/poll word inside a quoted
     argument -- ``echo "usage: kusabi-companion status"`` -- stays part of one
-    token instead of looking like an executed command.  Compound forms are not
-    resolved: only the first command of a line is considered executed, which
-    keeps the boundary honest where a full shell parser would be overkill.
+    token instead of looking like an executed command.  A standalone ``;``
+    outside quotes and a raw newline outside quotes become segment-separator
+    sentinel tokens (see :func:`_split_segments`).  Compound forms other than
+    ``;`` are not resolved: only the first command of a segment counts as the
+    executed command, which keeps the boundary honest where a full shell parser
+    would be overkill.
+
+    The separator is a NUL sentinel, which a shell can never carry in an
+    argument, so a persisted command cannot forge one -- but a NUL *character*
+    in the persisted text could still arrive as a lone token that compares
+    equal to it, so NULs are dropped from the input before scanning.  Only the
+    tokenizer ever emits a separator.
     """
     if not command:
         return []
+    if _SEGMENT_SEP in command:
+        command = command.replace(_SEGMENT_SEP, "")
+        if not command:
+            return []
     tokens: list[str] = []
     current: list[str] = []
     quote: str | None = None
@@ -199,16 +230,45 @@ def _shell_tokens(command: str | None) -> list[str]:
         elif char == "\\" and index + 1 < length:
             current.append(command[index + 1])
             index += 1
+        elif char == ";":
+            # Standalone semicolon outside quotes: flush and emit separator.
+            if current:
+                tokens.append("".join(current))
+                current = []
+            tokens.append(_SEGMENT_SEP)
         elif char.isspace():
             if current:
                 tokens.append("".join(current))
                 current = []
+            # Raw newlines outside quotes are segment separators.
+            if char in ("\n", "\r"):
+                tokens.append(_SEGMENT_SEP)
         else:
             current.append(char)
         index += 1
     if current:
         tokens.append("".join(current))
     return tokens
+
+
+def _split_segments(tokens: list[str]) -> list[list[str]]:
+    """Split a flat token list into segments on separator sentinels.
+
+    Consecutive separators or leading/trailing separators produce no empty
+    segments -- every returned segment is non-empty.
+    """
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token == _SEGMENT_SEP:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
 
 
 #: Shell programs whose exact ``-c``/``-lc`` wrapper is unwrapped before the
@@ -424,24 +484,35 @@ def categories_for(
     ``command`` is what to classify for shell rows: the full persisted
     ``input`` command text (tokenized here), its decoded argv list (the Codex
     JSON-array form), or the ``input_summary`` fallback (see
-    :func:`_command_tokens`).  An exact ``bash``/``sh`` ``-c``/``-lc``
-    wrapper is unwrapped and a leading ``cd <dir> &&`` prefix is stripped
-    before the rules run (see :func:`_unwrap_shell_wrapper` and
-    :func:`_strip_cd_prefix`).  The single classification point: the CLI
-    never re-implements a category rule, and a future thin MCP adapter can
-    reuse this function directly.
+    :func:`_command_tokens`).  The command is split into segments by
+    standalone ``;`` tokens and raw newlines outside quotes (see
+    :func:`_split_segments`).  An exact ``bash``/``sh`` ``-c``/``-lc``
+    wrapper is unwrapped once at the top level, and a leading ``cd <dir> &&``
+    prefix is stripped per segment (see :func:`_unwrap_shell_wrapper` and
+    :func:`_strip_cd_prefix`).  The row is reported once per matched
+    category -- never per segment -- and argv elements are never re-split.
+    The single classification point: the CLI never re-implements a category
+    rule, and a future thin MCP adapter can reuse this function directly.
     """
     matched: list[str] = []
     if tool_name is not None and tool_name.lower() in _SHELL_TOOLS_LOWER:
+        # A list argument is already tokenized: either a persisted argv list, or
+        # the output of :func:`_command_tokens`, which tokenizes the full
+        # persisted command with :func:`_shell_tokens` and therefore carries
+        # this module's separator sentinels.  Those must survive, so a list is
+        # never filtered -- the sentinel is a NUL, which a real argv cannot
+        # carry, and NULs are dropped from string input by the tokenizer.
         tokens = _shell_tokens(command) if isinstance(command, str) else list(command or ())
         tokens = _unwrap_shell_wrapper(tokens)
-        tokens = _strip_cd_prefix(tokens)
-        if _is_companion_status_poll(tokens):
-            matched.append("companion_status_poll")
-        if _is_host_file_hunt(tokens):
-            matched.append("host_file_hunt")
-        if _is_raw_local_mcp_http(tokens):
-            matched.append("raw_local_mcp_http")
+        segments = _split_segments(tokens)
+        for segment in segments:
+            segment = _strip_cd_prefix(segment)
+            if "companion_status_poll" not in matched and _is_companion_status_poll(segment):
+                matched.append("companion_status_poll")
+            if "host_file_hunt" not in matched and _is_host_file_hunt(segment):
+                matched.append("host_file_hunt")
+            if "raw_local_mcp_http" not in matched and _is_raw_local_mcp_http(segment):
+                matched.append("raw_local_mcp_http")
     if _is_undo_file_edit(tool_name):
         matched.append("undo_file_edit")
     if outcome == "pending":
