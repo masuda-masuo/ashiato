@@ -29,7 +29,7 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
   | Claude Code | `sessions`, `events`, `tool_calls`, `recall_calls` | the verbatim JSON of the transcript line -- nothing a Claude transcript contains is dropped |
   | Codex | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted message text (not the source line) for text events; the verbatim item JSON for `context_compaction` rows -- lifecycle, turn-context and token-usage records are not modelled at all |
   | opencode | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since opencode text parts carry no timestamp; one `sessions` row per distinct session id in the file (tool parts and text parts carry their own); one `tool_calls` row per *terminal* tool part -- `completed` or `error`, with the failure message in `result_text` and `duration_ms` from the part's `time`; job lifecycle events and `pending`/`running` tool parts are not modelled at all |
-  | Cursor | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since the agent-transcript export records no timestamps at all (`seq` / `block_index` order the rows within a file instead); one `sessions` row per file (a Cursor transcript file is one session -- its file-name uuid stem); one `tool_calls` row per `tool_use` block, but with `outcome` and `is_error` NULL -- the export records no tool result whatsoever (no `tool_result` blocks, ever), and a call whose fate is genuinely unknown must not read as interrupted (`pending`) or as succeeded (`ok`). Neither gap is Cursor's: its own undocumented local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`) holds both, with `cwd` and session times read from its `meta.json` as of this change and tool results not yet read (issue #87) |
+  | Cursor | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since the agent-transcript export records no timestamps at all (`seq` / `block_index` order the rows within a file instead); one `sessions` row per file (a Cursor transcript file is one session -- its file-name uuid stem); one `tool_calls` row per `tool_use` block -- the export records no tool result whatsoever (no `tool_result` blocks, ever), so with `--cursor-chats-source` the results are filled from Cursor's own undocumented local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`): the `meta.json` supplies `cwd` and the session times, and the sibling `store.db` supplies `outcome` / `is_error` / `result_text` / `result_truncated` for every call of a session whose store pairs with the transcript (same tool-call count and elementwise-equal tool names, compared as plain recorded strings -- the store records the same `CallMcpTool` block name the transcript does, measured in 2,321 of 2,321 observed MCP positions, so there is no MCP name equivalence to apply). That verdict is a weaker signal than the other sources' status fields -- a named, documented classifier that reads a dict `error` key, a failing dict `status`, or an error-prefixed result string -- and `ts` still stays NULL, since the store carries no per-message timestamp either. Without the chats source, or for a session the store cannot pair, `outcome` / `is_error` stay NULL, and a call whose fate is genuinely unknown must not read as interrupted (`pending`) or as succeeded (`ok`) |
 
   `source_files` (per-file bookkeeping) is populated by all four.
 
@@ -89,8 +89,12 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   session). For every chat meta whose session id matches a Cursor session ingested from
   a transcript, the build fills `sessions.cwd`, `events.cwd` and `tool_calls.cwd` from
   the meta's `cwd`, and `sessions.started_at` / `ended_at` from its `createdAtMs` /
-  `updatedAtMs`. Nothing is scanned for chat metadata by default -- pass
-  `--cursor-chats-source` to opt in.
+  `updatedAtMs`. The `store.db` sitting next to each meta is read the same way: for a
+  session whose tool-call count and tool names match the transcript's, it fills the
+  tool-call results (`outcome`, `is_error`, `result_text`, `result_truncated`) from the
+  store's `tool-result` parts, and the build reports how many sessions paired, how many
+  were skipped (count or name mismatch), and how many tool calls were filled. Nothing is
+  scanned for chat metadata by default -- pass `--cursor-chats-source` to opt in.
 - `--codex-source` is repeatable and is searched recursively for `*.jsonl` Codex
   session files (`~/.codex/sessions` on a machine that has them). A separate list
   for the same reason as the others: Codex keeps its own directory tree, so a
@@ -667,9 +671,10 @@ uses, so a call issued in parallel with the recall is never mistaken for a react
 
 Cursor is a special case: its agent-transcript export carries no tool results at all (no
 `tool_result` blocks, ever) -- the tool results Cursor does keep live in its undocumented
-local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`) and are not read yet
-(issue #87) -- so `output` and `ts` cannot come from the transcript the way they do for
-the other two sources. Instead they are reconstructed from kaiba's own `recalls` ledger
+local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`) and are read into
+`tool_calls` (for paired sessions, via `--cursor-chats-source`) as of issue #87, but a
+`recall_calls` row needs `output` and `ts` the transcript cannot supply -- so they are
+reconstructed from kaiba's own `recalls` ledger
 (`~/.kaiba/kaiba.db`, read via `--kaiba-db`): the n-th occurrence of a query *within one
 Cursor transcript file* pairs with the n-th `agent = 'cursor'` row for that query, ordered
 by `created_at`, and `output` is the joined `content` of that row's `matches`, in

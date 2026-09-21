@@ -430,7 +430,13 @@ class TestFormatVersion:
         # chats meta.json -- the same Cursor source bytes yield different
         # rows than version 14 (which left all three cwd columns and the
         # session times NULL), so a rebuild is required.
-        assert FORMAT_VERSION == 15
+        # Bumped to 16 by issue #87: with `--cursor-chats-source` given,
+        # Cursor tool calls now carry outcome / is_error / result_text /
+        # result_truncated filled from the undocumented chats store.db for a
+        # session whose store pairs with its transcript -- the same Cursor
+        # source bytes yield rows where version 15 left all four columns
+        # NULL, so a rebuild is required.
+        assert FORMAT_VERSION == 16
 
 
 # ---------------------------------------------------------------- negative-fact miner tests

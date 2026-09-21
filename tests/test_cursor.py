@@ -19,7 +19,16 @@ from pathlib import Path
 
 import pytest
 
-from ashiato.cursor import ChatMeta, CursorTextChunk, CursorToolCall, parse_chat_meta, parse_file
+from ashiato.cursor import (
+    ChatMeta,
+    CursorTextChunk,
+    CursorToolCall,
+    classify_store_result,
+    parse_chat_meta,
+    parse_chat_store,
+    parse_file,
+    store_result_text,
+)
 from ashiato.recall import extract_from_cursor
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -484,3 +493,279 @@ def test_parse_chat_meta_never_raises_on_other_malformed_shapes(tmp_path: Path):
 def test_no_usable_session_id_returns_none(tmp_path: Path):
     """A meta.json directly in a filesystem root has no parent name: the whole record is None."""
     assert parse_chat_meta(Path("/meta.json")) is None
+
+
+# ---------------------------------------------------------------- parse_chat_store
+
+
+def _store_blob_id(n: int) -> bytes:
+    """A deterministic 32-byte blob id."""
+    return n.to_bytes(32, "big")
+
+
+def _store_root_blob(child_ids: list[bytes]) -> bytes:
+    """A protobuf whose repeated field 1 is the child ids, in order."""
+    out = bytearray()
+    for child in child_ids:
+        out.append(0x0A)  # field 1, wire type 2
+        out.append(len(child))  # 32, one varint byte
+        out.extend(child)
+    return bytes(out)
+
+
+def _store_message(parts: list[dict]) -> bytes:
+    """One JSON message blob: a chat message whose content holds the parts."""
+    return json.dumps(
+        {"role": "assistant", "content": parts, "id": "msg", "providerOptions": {}}
+    ).encode("utf-8")
+
+
+def _write_store_db(
+    path: Path,
+    messages: list[bytes],
+    *,
+    root_child_ids: list[bytes] | None = None,
+) -> None:
+    """A minimal chats ``store.db``: ``meta`` (hex-encoded JSON) + ``blobs``.
+
+    ``blobs`` holds one row per message in insertion order, plus a root blob
+    whose protobuf field-1 children are the checkpoint window.  By default
+    the root lists every message; ``root_child_ids`` makes it list a subset
+    (the real shape).  The parser reads the table, not the root, so the
+    window only matters as fixture realism.
+    """
+    root_id = _store_blob_id(0)
+    child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
+    root = _store_root_blob(root_child_ids if root_child_ids is not None else child_ids)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.execute(
+            "INSERT INTO meta VALUES ('conversation', ?)",
+            [json.dumps({"latestRootBlobId": root_id.hex()}).encode("utf-8").hex()],
+        )
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id, root])
+        connection.executemany(
+            "INSERT INTO blobs VALUES (?, ?)", zip(child_ids, messages, strict=True)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_parse_chat_store_returns_tool_calls_in_conversation_order(tmp_path: Path):
+    """Criterion 1: ids, names, args and results, in table (conversation) order.
+
+    A tool-result message interleaved between call messages, and two calls in
+    one message, must not reorder anything: the returned calls follow the
+    ``blobs`` table's own row order -- insertion order -- not the root blob's
+    checkpoint window.
+    """
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_message(
+                [{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "ls"}}]
+            ),
+            _store_message(
+                [
+                    {"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "x"}},
+                    {"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "q"}},
+                ]
+            ),
+            _store_message(
+                [
+                    {"type": "tool-result", "toolCallId": "call-3", "result": {"status": "error", "message": "boom"}},
+                    {"type": "tool-result", "toolCallId": "call-1", "result": "total 42"},
+                    {"type": "tool-result", "toolCallId": "call-2", "result": "file contents"},
+                ]
+            ),
+            _store_message([{"type": "text", "text": "unmodelled"}]),
+        ],
+    )
+    calls = parse_chat_store(store)
+    assert [c.tool_call_id for c in calls] == ["call-1", "call-2", "call-3"]
+    assert calls[0].tool_name == "Bash"
+    assert calls[0].args == {"command": "ls"}
+    assert calls[0].result == "total 42"
+    assert calls[1].tool_name == "Read"
+    assert calls[1].result == "file contents"
+    # The tool-result for call-3 arrives in the same message as call-1's:
+    # matching is by toolCallId, so it still lands on call-3, not on call-1.
+    assert calls[2].tool_call_id == "call-3"
+    assert calls[2].args == {"query": "q"}
+    assert calls[2].result == {"status": "error", "message": "boom"}
+
+
+def test_parse_chat_store_marks_a_call_without_a_result_part(tmp_path: Path):
+    """A call with no matching tool-result keeps has_result False, result None.
+
+    The absence of a result part is not a JSON-null result: the call's fate
+    is unknown, and the build must leave outcome / is_error / result_text
+    NULL (asserted there); at the parser level this is ``has_result``.
+    """
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "c", "toolName": "Bash", "input": {}}]),
+            _store_message([{"type": "text", "text": "unmodelled"}]),
+        ],
+    )
+    calls = parse_chat_store(store)
+    assert len(calls) == 1
+    assert calls[0].has_result is False
+    assert calls[0].result is None
+
+
+def _write_store_db_hex_ids(
+    path: Path,
+    messages: list[bytes],
+    *,
+    root_child_ids: list[bytes] | None = None,
+    meta_payload: dict | None = None,
+) -> None:
+    """A store in the *real* spelling: ``blobs.id`` is TEXT holding the hex.
+
+    The root blob's protobuf carries the 32-byte raw child ids -- the two
+    spellings are exactly what the real store has.  The parser reads the
+    ``blobs`` table directly and never looks up ids, so the spelling is only
+    fixture realism.  By default the root lists every message;
+    ``root_child_ids`` makes it list a *subset*, the real checkpoint-window
+    shape (the latest root only names the newest messages).
+    """
+    root_id = _store_blob_id(0)
+    child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
+    root = _store_root_blob(root_child_ids if root_child_ids is not None else child_ids)
+    payload = meta_payload if meta_payload is not None else {"latestRootBlobId": root_id.hex()}
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.execute(
+            "INSERT INTO meta VALUES ('conversation', ?)",
+            [json.dumps(payload).encode("utf-8").hex()],
+        )
+        connection.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id.hex(), root])
+        connection.executemany(
+            "INSERT INTO blobs VALUES (?, ?)",
+            [(child.hex(), message) for child, message in zip(child_ids, messages, strict=True)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_parse_chat_store_reads_messages_beyond_the_latest_root(tmp_path: Path):
+    """The latest root is a checkpoint window, not the conversation (issue #87).
+
+    Since 2026-07-13 Cursor's CLI saves only *new* transcript entries at each
+    checkpoint, so the root blob's field-1 children name a suffix of the
+    conversation.  Here the table holds four messages but the root lists only
+    the last two -- all four calls must come back, in table (insertion)
+    order.  Under the pre-fix code this fixture returns only the root's
+    subset, so this test fails before the change.
+    """
+    store = tmp_path / "store.db"
+    _write_store_db_hex_ids(
+        store,
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "ls"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "total 42"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "x"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "contents"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "q"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": "facts"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-4", "toolName": "Glob", "input": {"pattern": "*.md"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-4", "result": "notes.md"}]),
+        ],
+        # The root's checkpoint window covers only the last two messages.
+        root_child_ids=[_store_blob_id(7), _store_blob_id(8)],
+    )
+    calls = parse_chat_store(store)
+    assert [c.tool_call_id for c in calls] == ["call-1", "call-2", "call-3", "call-4"]
+    assert calls[0].result == "total 42"
+    assert calls[3].tool_name == "Glob"
+    assert calls[3].result == "notes.md"
+
+
+def _bad_store_cases(tmp_path: Path) -> list[tuple[str, Path]]:
+    cases: list[tuple[str, Path]] = []
+    # Robustness, case 1: a missing file.
+    missing = tmp_path / "missing.db"
+    cases.append(("missing", missing))
+    # Robustness, case 2: bytes that are not a SQLite database.
+    not_sqlite = tmp_path / "not.db"
+    not_sqlite.write_bytes(b"this is not a sqlite database")
+    cases.append(("not-sqlite", not_sqlite))
+    # Robustness, case 3: no readable blobs table (only meta).
+    no_blobs = tmp_path / "no-blobs.db"
+    connection = sqlite3.connect(no_blobs)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.commit()
+    finally:
+        connection.close()
+    cases.append(("no-blobs-table", no_blobs))
+    # Robustness, case 4: blobs holds only non-JSON data (the store keeps
+    # binary protobuf blobs alongside the JSON messages -- those are skipped).
+    non_json = tmp_path / "non-json.db"
+    connection = sqlite3.connect(non_json)
+    try:
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.execute(
+            "INSERT INTO blobs VALUES (?, ?)", [_store_blob_id(7), b"not json at all"]
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    cases.append(("non-json-blob", non_json))
+    return cases
+
+
+@pytest.mark.parametrize(
+    "name", ["missing", "not-sqlite", "no-blobs-table", "non-json-blob"]
+)
+def test_parse_chat_store_robustness_cases_return_empty(tmp_path: Path, name: str):
+    """Criterion 2: all robustness cases return [] and never raise."""
+    cases = dict(_bad_store_cases(tmp_path))
+    assert parse_chat_store(cases[name]) == []
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # Criterion 7, case 1: a dict with a non-empty error key.
+        ({"error": "tool blew up"}, (True, "error")),
+        ({"error": ""}, (False, "ok")),  # empty error key is not an error
+        # Criterion 7, case 2: a dict whose status says failure.
+        ({"status": "error", "message": "boom"}, (True, "error")),
+        ({"status": "failed"}, (True, "error")),
+        ({"status": "failure"}, (True, "error")),
+        # Criterion 7, case 3: each measured string prefix.
+        ("Error executing tool 'Bash'", (True, "error")),
+        ("Error: Tool execution error: boom", (True, "error")),
+        # Criterion 7, case 4: a plain string result.
+        ("total 42", (False, "ok")),
+        # Criterion 7, case 5: a dict with neither key.
+        ({"data": [1, 2], "ok": True}, (False, "ok")),
+        ({"status": "success"}, (False, "ok")),
+        (None, (False, "ok")),
+    ],
+)
+def test_classify_store_result(result: object, expected: tuple[bool, str]):
+    """Criterion 7: the five classifier cases, asserting outcome and is_error."""
+    assert classify_store_result(result) == expected
+
+
+def test_classify_store_result_prefix_matching_is_anchored():
+    """Rule 3 is a *prefix* match: a result that merely quotes the error text is ok."""
+    assert classify_store_result("The agent said: Error executing tool 'Bash'") == (False, "ok")
+
+
+def test_store_result_text_renders_a_dict_as_compact_json_and_a_string_as_is():
+    assert store_result_text("plain output") == "plain output"
+    assert store_result_text({"status": "error", "message": "boom"}) == '{"message":"boom","status":"error"}'
+    assert store_result_text(None) == "null"
