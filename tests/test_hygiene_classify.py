@@ -222,16 +222,18 @@ def test_shell_c_wrapper_near_misses_do_not_classify(argv: list[str], expected: 
     assert set(categories_for("Bash", argv, "ok")) == expected
 
 
-def test_shell_c_wrapper_script_still_first_command_only() -> None:
-    """Compound commands inside SCRIPT are not descended into: the first
-    command of the script is the executed command, exactly as for an
-    unwrapped command line."""
+def test_shell_c_wrapper_script_splits_on_separators_and_not_on_ampersand() -> None:
+    """Inside an unwrapped bash -c script, ``;`` splits into segments that are
+    classified independently, while ``&&`` is not a separator (only the
+    ``cd <dir> &&`` prefix rule applies)."""
     assert categories_for(
         "Bash",
         ["bash", "-c", "cat /etc/hosts && curl http://127.0.0.1:8750/mcp"],
         "ok",
     ) == ("host_file_hunt",)
-    assert categories_for("Bash", ["bash", "-c", "echo hi; kusabi-companion status"], "ok") == ()
+    assert categories_for("Bash", ["bash", "-c", "echo hi; kusabi-companion status"], "ok") == (
+        "companion_status_poll",
+    )
     assert categories_for("Bash", ["bash", "-c", "curl http://127.0.0.1:8750/mcp && cat /etc/hosts"], "ok") == (
         "raw_local_mcp_http",
     )
@@ -299,7 +301,6 @@ def test_cd_prefix_is_stripped_after_wrapper_unwrap() -> None:
     [
         # not a `cd <dir> &&` prefix: different separator, flag, assignment,
         # subshell, or a bare cd -- none of them descend into a compound form
-        "cd /x ; cat /etc/hosts",
         "cd /x | cat /etc/hosts",
         "cd -P /x && cat /etc/hosts",
         "FOO=1 cat /etc/hosts",
@@ -503,3 +504,101 @@ def test_codex_shell_wrapper_argv_classify_end_to_end(tmp_path: Path) -> None:
     assert counts["host_file_hunt"]["tool_calls"] == 1
     assert counts["raw_local_mcp_http"]["tool_calls"] == 1
     assert report["coverage"]["tool_calls"] == 3
+
+
+# --------------------------------------------------- segment separators
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # the most frequent measured shape: a sleep, then the poll after a semicolon
+        (
+            "sleep 90; cd /k && node plugins/kusabi/scripts/kusabi-companion.mjs status",
+            {"companion_status_poll"},
+        ),
+        # the poll is the third segment, not the first
+        ("ls -la; command -v kusabi-companion; kusabi-companion status", {"companion_status_poll"}),
+        # inside an unwrapped wrapper script, semicolons split too
+        (["bash", "-c", "echo hi; kusabi-companion status"], {"companion_status_poll"}),
+        # one row, one category, not two -- two hunt segments are still one host_file_hunt
+        ("cat /etc/hosts; cat /etc/passwd", {"host_file_hunt"}),
+        # a trailing or doubled separator is harmless
+        ("cat /etc/hosts;;", {"host_file_hunt"}),
+        ("cat /etc/hosts;", {"host_file_hunt"}),
+        # semicolons also split after the wrapper unwrap
+        (["/bin/bash", "-lc", "cd /x && cat /etc/hosts; curl http://127.0.0.1:8750/mcp"],
+         {"host_file_hunt", "raw_local_mcp_http"}),
+    ],
+)
+def test_semicolon_separator(command: str | list[str], expected: set[str]) -> None:
+    assert set(categories_for("Bash", command, "ok")) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # a raw newline separates segments (Cursor multi-line scripts)
+        ("cd /k\nkusabi-companion status\necho done", {"companion_status_poll"}),
+        # multiple newlines
+        ("cat /etc/hosts\ncat /etc/passwd\n", {"host_file_hunt"}),
+        # newlines inside the unwrapped wrapper script
+        (["bash", "-c", "echo hi\nkusabi-companion status"], {"companion_status_poll"}),
+    ],
+)
+def test_newline_separator(command: str | list[str], expected: set[str]) -> None:
+    assert set(categories_for("Bash", command, "ok")) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # semicolons inside double quotes are not separators
+        'echo "a; cat /etc/hosts"',
+        'echo "sleep 90; kusabi-companion status"',
+        # semicolons inside single quotes are not separators
+        "echo 'a; cat /etc/hosts'",
+        "echo 'sleep 90; kusabi-companion status'",
+        # newlines inside single quotes are not separators
+        "echo 'a\ncat /etc/hosts'",
+        # newlines inside double quotes are not separators
+        'echo "a\ncat /etc/hosts"',
+        # argv elements are never re-split
+        ["echo", "a; cat /etc/hosts"],
+        ["echo", "kusabi-companion status"],
+    ],
+)
+def test_separator_quoting(command: str | list[str]) -> None:
+    """Quoting and argv elements are never split on separators."""
+    assert categories_for("Bash", command, "ok") == ()
+
+
+def test_section_b_shapes_keep_not_classifying() -> None:
+    """Shapes from the real corpus that the segment change must leave alone."""
+    # VAR=value prefix is not stripped
+    assert categories_for("Bash", "FOO=1 cat /etc/hosts", "ok") == ()
+    # variable indirection -- the assignment is a segment, the program is $K
+    assert categories_for("Bash", "K=/path/to/kusabi-companion.mjs", "ok") == ()
+    # loop keywords as first token are not programs
+    assert categories_for("Bash", "while true; do cat /etc/hosts; done", "ok") == ()
+    # pipes are not separators -- only the first command counts
+    assert categories_for("Bash", "cat /etc/hosts | grep x", "ok") == ("host_file_hunt",)
+    # && is not a separator (only cd <dir> && is special)
+    assert categories_for("Bash", "cmd && cmd", "ok") == ()
+    # subshell is not a program
+    assert categories_for("Bash", "(cd /x && cat /etc/hosts)", "ok") == ()
+    # dedicated tools are never shell categories
+    assert categories_for("Grep", "cat /etc/hosts", "ok") == ()
+
+
+def test_nul_in_a_command_cannot_forge_a_separator() -> None:
+    """The segment separator is a NUL sentinel, so a NUL in the persisted text
+    must not act as one: a shell cannot pass NUL in an argument, and a row that
+    somehow carries one must classify exactly as it would without it."""
+    # a lone NUL between commands would split the line if it were a separator
+    assert categories_for("Bash", "echo hi \x00 cat /etc/hosts", "ok") == ()
+    assert categories_for("Bash", "cat /etc/hosts \x00 echo hi", "ok") == ("host_file_hunt",)
+    # the argv form: an element equal to the sentinel is data, not a separator
+    assert categories_for("Bash", ["echo", "hi", "\x00", "cat", "/etc/hosts"], "ok") == ()
+    # a command that is nothing but NULs is an empty command
+    assert categories_for("Bash", "\x00\x00", "ok") == ()

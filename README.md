@@ -352,10 +352,14 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   tokenized and classified like any other command line. A leading `cd <dir>
   &&` prefix -- the form almost every persisted command starts with -- is
   stripped (repeatedly, so `cd /x && cd /y && cmd` classifies `cmd`), and it
-  is stripped after the wrapper is unwrapped too. Compound commands are
-  otherwise not descended into: pipes, `;`, `||`, subshells, command
-  substitution, and `VAR=value` prefixes stay unclassified, and no arbitrary
-  wrapper, variable expansion, or nested command is traversed. The 200-character
+  is stripped after the wrapper is unwrapped too. A persisted shell command is
+  split into segments by standalone `;` tokens and raw newlines (outside
+  quotes); each segment is classified independently with the same rules and
+  the row is reported once per category (never per segment). Pipes, `||`,
+  `&`, subshells, command substitution, and `VAR=value` prefixes are not
+  separators and not descended into, and no arbitrary wrapper, variable
+  expansion, or nested command is traversed. Argv elements are never
+  re-split. The 200-character
   `input_summary` is only the fallback when no usable full command can be
   extracted, so a long command whose loopback MCP URL or
   `kusabi-companion status` invocation sits past the summary truncation
