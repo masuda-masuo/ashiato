@@ -524,25 +524,25 @@ def _write_store_db(
     path: Path,
     messages: list[bytes],
     *,
-    root_blob: bytes | None = None,
-    root_id: bytes | None = None,
-    meta_payload: dict | None = None,
+    root_child_ids: list[bytes] | None = None,
 ) -> None:
     """A minimal chats ``store.db``: ``meta`` (hex-encoded JSON) + ``blobs``.
 
-    The root blob's field-1 children are the messages, in order -- the same
-    blob graph shape the real store uses, tiny enough for fixtures.
+    ``blobs`` holds one row per message in insertion order, plus a root blob
+    whose protobuf field-1 children are the checkpoint window.  By default
+    the root lists every message; ``root_child_ids`` makes it list a subset
+    (the real shape).  The parser reads the table, not the root, so the
+    window only matters as fixture realism.
     """
-    root_id = root_id if root_id is not None else _store_blob_id(0)
+    root_id = _store_blob_id(0)
     child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
-    root = root_blob if root_blob is not None else _store_root_blob(child_ids)
-    payload = meta_payload if meta_payload is not None else {"latestRootBlobId": root_id.hex()}
+    root = _store_root_blob(root_child_ids if root_child_ids is not None else child_ids)
     connection = sqlite3.connect(path)
     try:
         connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
         connection.execute(
             "INSERT INTO meta VALUES ('conversation', ?)",
-            [json.dumps(payload).encode("utf-8").hex()],
+            [json.dumps({"latestRootBlobId": root_id.hex()}).encode("utf-8").hex()],
         )
         connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
         connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id, root])
@@ -555,11 +555,12 @@ def _write_store_db(
 
 
 def test_parse_chat_store_returns_tool_calls_in_conversation_order(tmp_path: Path):
-    """Criterion 1: ids, names, args and results, ordered by the blob graph.
+    """Criterion 1: ids, names, args and results, in table (conversation) order.
 
     A tool-result message interleaved between call messages, and two calls in
     one message, must not reorder anything: the returned calls follow the
-    message order of the root blob's children, not the table layout.
+    ``blobs`` table's own row order -- insertion order -- not the root blob's
+    checkpoint window.
     """
     store = tmp_path / "store.db"
     _write_store_db(
@@ -598,23 +599,23 @@ def test_parse_chat_store_returns_tool_calls_in_conversation_order(tmp_path: Pat
     assert calls[2].result == {"status": "error", "message": "boom"}
 
 
-def test_parse_chat_store_reads_a_meta_row_not_at_position_zero(tmp_path: Path):
-    """Only the row whose value decodes to JSON with latestRootBlobId qualifies."""
+def test_parse_chat_store_marks_a_call_without_a_result_part(tmp_path: Path):
+    """A call with no matching tool-result keeps has_result False, result None.
+
+    The absence of a result part is not a JSON-null result: the call's fate
+    is unknown, and the build must leave outcome / is_error / result_text
+    NULL (asserted there); at the parser level this is ``has_result``.
+    """
     store = tmp_path / "store.db"
-    messages = [_store_message([{"type": "tool-call", "toolCallId": "c", "toolName": "Bash", "input": {}}])]
-    _write_store_db(store, messages)
-    connection = sqlite3.connect(store)
-    try:
-        connection.execute(
-            "INSERT INTO meta VALUES ('other', ?)", [b"not hex".hex()]
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    _write_store_db(
+        store,
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "c", "toolName": "Bash", "input": {}}]),
+            _store_message([{"type": "text", "text": "unmodelled"}]),
+        ],
+    )
     calls = parse_chat_store(store)
     assert len(calls) == 1
-    # No tool-result part exists for this call: has_result must be False --
-    # the parser must not present the absent result as a JSON-null success.
     assert calls[0].has_result is False
     assert calls[0].result is None
 
@@ -623,17 +624,21 @@ def _write_store_db_hex_ids(
     path: Path,
     messages: list[bytes],
     *,
+    root_child_ids: list[bytes] | None = None,
     meta_payload: dict | None = None,
 ) -> None:
     """A store in the *real* spelling: ``blobs.id`` is TEXT holding the hex.
 
-    The root blob's protobuf still carries the 32-byte raw child ids -- the
-    mismatch between the two spellings is exactly the shape the real store
-    has, and the lookup must bridge it (issue #87 stage 2 repair).
+    The root blob's protobuf carries the 32-byte raw child ids -- the two
+    spellings are exactly what the real store has.  The parser reads the
+    ``blobs`` table directly and never looks up ids, so the spelling is only
+    fixture realism.  By default the root lists every message;
+    ``root_child_ids`` makes it list a *subset*, the real checkpoint-window
+    shape (the latest root only names the newest messages).
     """
     root_id = _store_blob_id(0)
     child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
-    root = _store_root_blob(child_ids)
+    root = _store_root_blob(root_child_ids if root_child_ids is not None else child_ids)
     payload = meta_payload if meta_payload is not None else {"latestRootBlobId": root_id.hex()}
     connection = sqlite3.connect(path)
     try:
@@ -653,15 +658,15 @@ def _write_store_db_hex_ids(
         connection.close()
 
 
-def test_parse_chat_store_resolves_raw_byte_children_against_hex_text_ids(tmp_path: Path):
-    """The real spelling (issue #87 stage 2 repair): TEXT hex ids, raw-byte children.
+def test_parse_chat_store_reads_messages_beyond_the_latest_root(tmp_path: Path):
+    """The latest root is a checkpoint window, not the conversation (issue #87).
 
-    ``blobs.id`` is a TEXT column holding the hex of the id while the root
-    protobuf's field-1 children are the raw 32 bytes.  Before the fix the
-    bytes branch of ``_blob_id_candidates`` only tried the raw spelling, so
-    every child lookup missed and the parser returned zero calls; the fix
-    makes the bytes branch symmetric and tries ``.hex()`` as well.  The
-    BLOB-id spelling is exercised by the other fixtures (``_write_store_db``).
+    Since 2026-07-13 Cursor's CLI saves only *new* transcript entries at each
+    checkpoint, so the root blob's field-1 children name a suffix of the
+    conversation.  Here the table holds four messages but the root lists only
+    the last two -- all four calls must come back, in table (insertion)
+    order.  Under the pre-fix code this fixture returns only the root's
+    subset, so this test fails before the change.
     """
     store = tmp_path / "store.db"
     _write_store_db_hex_ids(
@@ -671,59 +676,60 @@ def test_parse_chat_store_resolves_raw_byte_children_against_hex_text_ids(tmp_pa
             _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "total 42"}]),
             _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "x"}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "contents"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "q"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": "facts"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-4", "toolName": "Glob", "input": {"pattern": "*.md"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-4", "result": "notes.md"}]),
         ],
+        # The root's checkpoint window covers only the last two messages.
+        root_child_ids=[_store_blob_id(7), _store_blob_id(8)],
     )
     calls = parse_chat_store(store)
-    assert [c.tool_call_id for c in calls] == ["call-1", "call-2"]
-    assert calls[0].tool_name == "Bash"
+    assert [c.tool_call_id for c in calls] == ["call-1", "call-2", "call-3", "call-4"]
     assert calls[0].result == "total 42"
-    assert calls[1].tool_name == "Read"
-    assert calls[1].result == "contents"
+    assert calls[3].tool_name == "Glob"
+    assert calls[3].result == "notes.md"
 
 
 def _bad_store_cases(tmp_path: Path) -> list[tuple[str, Path]]:
     cases: list[tuple[str, Path]] = []
-    # Criterion 2, case 1: a missing file.
+    # Robustness, case 1: a missing file.
     missing = tmp_path / "missing.db"
     cases.append(("missing", missing))
-    # Criterion 2, case 2: bytes that are not a SQLite database.
+    # Robustness, case 2: bytes that are not a SQLite database.
     not_sqlite = tmp_path / "not.db"
     not_sqlite.write_bytes(b"this is not a sqlite database")
     cases.append(("not-sqlite", not_sqlite))
-    # Criterion 2, case 3: a meta table with no qualifying row.
-    no_meta = tmp_path / "no-meta.db"
-    connection = sqlite3.connect(no_meta)
+    # Robustness, case 3: no readable blobs table (only meta).
+    no_blobs = tmp_path / "no-blobs.db"
+    connection = sqlite3.connect(no_blobs)
     try:
         connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
-        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
         connection.commit()
     finally:
         connection.close()
-    cases.append(("no-meta-row", no_meta))
-    # Criterion 2, case 4: a meta row whose root id is not in blobs.
-    no_root = tmp_path / "no-root.db"
-    _write_store_db(no_root, [], meta_payload={"latestRootBlobId": "ff" * 32})
-    cases.append(("root-not-in-blobs", no_root))
-    # Criterion 2, case 5: a truncated root protobuf (field says 32 bytes, only 10 follow).
-    truncated = tmp_path / "truncated.db"
-    _write_store_db(truncated, [], root_blob=b"\x0a\x20" + _store_blob_id(1)[:10])
-    cases.append(("truncated-protobuf", truncated))
-    # Criterion 2, case 6: a child blob that is not JSON.
+    cases.append(("no-blobs-table", no_blobs))
+    # Robustness, case 4: blobs holds only non-JSON data (the store keeps
+    # binary protobuf blobs alongside the JSON messages -- those are skipped).
     non_json = tmp_path / "non-json.db"
-    _write_store_db(non_json, [], root_blob=_store_root_blob([_store_blob_id(7)]))
     connection = sqlite3.connect(non_json)
     try:
-        connection.execute("INSERT INTO blobs VALUES (?, ?)", [_store_blob_id(7), b"not json at all"])
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.execute(
+            "INSERT INTO blobs VALUES (?, ?)", [_store_blob_id(7), b"not json at all"]
+        )
         connection.commit()
     finally:
         connection.close()
-    cases.append(("non-json-child", non_json))
+    cases.append(("non-json-blob", non_json))
     return cases
 
 
-@pytest.mark.parametrize("name", ["missing", "not-sqlite", "no-meta-row", "root-not-in-blobs", "truncated-protobuf", "non-json-child"])
+@pytest.mark.parametrize(
+    "name", ["missing", "not-sqlite", "no-blobs-table", "non-json-blob"]
+)
 def test_parse_chat_store_robustness_cases_return_empty(tmp_path: Path, name: str):
-    """Criterion 2: all six cases return [] and never raise."""
+    """Criterion 2: all robustness cases return [] and never raise."""
     cases = dict(_bad_store_cases(tmp_path))
     assert parse_chat_store(cases[name]) == []
 

@@ -20,8 +20,11 @@ Next to the transcripts, Cursor keeps ``~/.cursor/chats/<workspace-hash>/<sessio
 a ``store.db`` with the full conversation.  :func:`parse_chat_meta` reads the
 ``meta.json`` half: the session's working directory and its start/end times.
 :func:`parse_chat_store` reads the ``store.db`` half: each ``tool-call`` part
-of the conversation, in conversation order, paired with the raw ``result`` of
-its matching ``tool-result`` part -- the tool results the transcript export
+of the conversation, in conversation order (the ``blobs`` table's own order,
+which is insertion order -- the ``latestRootBlobId`` root is only a checkpoint
+window over the newest messages since Cursor's CLI stopped rewriting the full
+conversation at each checkpoint in 2026-07-13), paired with the raw ``result``
+of its matching ``tool-result`` part -- the tool results the transcript export
 never records.  The user / system / assistant-text / reasoning messages of the
 store are deliberately not modelled (issue #87 stage 3); this module reads
 only the tool-call and tool-result parts.
@@ -37,9 +40,6 @@ value is.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import contextlib
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -309,106 +309,8 @@ class CursorStoreToolCall:
     has_result: bool = False
 
 
-def _varint(data: bytes, i: int) -> tuple[int, int] | None:
-    """(value, next index) of the varint starting at *i*, or ``None`` when truncated."""
-    value = 0
-    shift = 0
-    n = len(data)
-    while i < n:
-        b = data[i]
-        i += 1
-        value |= (b & 0x7F) << shift
-        if not b & 0x80:
-            return value, i
-        shift += 7
-        if shift > 63:
-            return None
-    return None
-
-
-def _decode_proto(data: bytes) -> tuple[list[tuple[int, bytes]], bool]:
-    """(fields, complete) from a minimal varint / length-delimited protobuf reader.
-
-    ``complete`` is False when the payload is truncated or uses a wire type
-    this reader does not know: a truncated blob must read as unreadable, not
-    as a partial list of children -- a session whose root blob is cut off
-    yields nothing, exactly like a missing file.
-    """
-    fields: list[tuple[int, bytes]] = []
-    i = 0
-    n = len(data)
-    while i < n:
-        tag = _varint(data, i)
-        if tag is None:
-            return fields, False
-        tag, i = tag
-        wire = tag & 7
-        if wire == 2:
-            length = _varint(data, i)
-            if length is None:
-                return fields, False
-            ln, i = length
-            if i + ln > n:
-                return fields, False
-            fields.append((tag >> 3, data[i : i + ln]))
-            i += ln
-        elif wire == 0:
-            value = _varint(data, i)
-            if value is None:
-                return fields, False
-            _, i = value
-        else:
-            return fields, False
-    return fields, True
-
-
-def _blob_id_candidates(value: object) -> list[object]:
-    """Query spellings for a ``latestRootBlobId``-style value.
-
-    The meta row stores its JSON hex-encoded, and the blob ids inside it are
-    the same 32-byte values the protobuf carries, but the ``blobs.id`` column
-    of the real store is TEXT holding the id's *hex* spelling while the
-    protobuf children are the *raw* 32 bytes -- so an id may arrive as either
-    spelling and must be tried in both (plus base64, in case a future Cursor
-    version switches) so the join does not depend on the column's declared
-    type.  The string branch tries ``bytes.fromhex``; the bytes branch is
-    symmetric and tries ``.hex()``.
-    """
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        raw = bytes(value)
-        candidates: list[object] = [raw, raw.hex()]
-        with contextlib.suppress(binascii.Error):
-            candidates.append(base64.b64encode(raw).decode("ascii"))
-        return candidates
-    if not isinstance(value, str) or not value:
-        return []
-    candidates: list[object] = [value]
-    with contextlib.suppress(ValueError):
-        candidates.append(bytes.fromhex(value))
-    with contextlib.suppress(ValueError, binascii.Error):
-        candidates.append(base64.b64decode(value, validate=True))
-    return candidates
-
-
-def _lookup_blob(connection: sqlite3.Connection, value: object) -> bytes | None:
-    """The ``blobs.data`` bytes for one id spelling, or ``None`` when not present."""
-    for candidate in _blob_id_candidates(value):
-        try:
-            row = connection.execute(
-                "SELECT data FROM blobs WHERE id = ?", [candidate]
-            ).fetchone()
-        except sqlite3.Error:
-            return None
-        if row is not None:
-            data = row[0]
-            if isinstance(data, (bytes, bytearray, memoryview)):
-                return bytes(data)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-    return None
-
-
 def _store_call_args(part: dict) -> dict | None:
+    """The call's arguments as a dict, from ``args`` or ``input``; else ``None``."""
     args = part.get("args")
     if isinstance(args, dict):
         return args
@@ -431,21 +333,29 @@ def _store_call_name(part: dict) -> str | None:
 def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
     """Read the tool calls of one Cursor chat ``store.db``, in conversation order.
 
-    The store is an undocumented SQLite database.  Conversation order comes
-    from the blob graph, not from table order: ``meta`` carries a
-    hex-encoded JSON ``latestRootBlobId``; that blob is a protobuf whose
-    repeated field 1 holds the child blob ids in order; the children that
-    are JSON are the messages, and each message's ``content`` holds the
-    ``tool-call`` / ``tool-result`` parts in conversation order.  Each
-    returned call carries the raw ``result`` of its matching ``tool-result``
-    part (matched by ``toolCallId``), with ``has_result`` saying whether such
-    a part was found at all -- a call whose id never matches a result part
-    is a call whose fate the store does not record.
+    The store is an undocumented SQLite database.  Conversation order is
+    *table order*: ``SELECT data FROM blobs`` returns rows in rowid order,
+    which is insertion order, and every row whose bytes decode as a JSON chat
+    message contributes its ``content`` parts in that order.  The ``meta``
+    row and the ``latestRootBlobId`` blob are deliberately *not* used: since
+    2026-07-13 Cursor's CLI saves only new transcript entries at each
+    checkpoint instead of rewriting the full conversation, so the latest root
+    is a window over the newest messages, not the conversation -- walking its
+    field-1 children yields a suffix.  Reading the table instead of the root
+    is what makes the returned calls match the transcript for sessions of any
+    length; the pairing guard in :func:`ashiato.build._apply_cursor_chat_stores`
+    (count equality plus elementwise name agreement) is what protects against
+    the ordering being wrong anyway.
 
-    A missing file, an unreadable or non-SQLite file, a ``meta`` row that
-    does not decode, a root id that is not in ``blobs``, a truncated
-    protobuf, and a non-JSON child all yield ``[]`` for the session -- never
-    an exception.  This is an undocumented format; a store a future Cursor
+    Each returned call carries the raw ``result`` of its matching
+    ``tool-result`` part (matched by ``toolCallId``), with ``has_result``
+    saying whether such a part was found at all -- a call whose id never
+    matches a result part is a call whose fate the store does not record.
+
+    A missing file, an unreadable or non-SQLite file, a missing or unreadable
+    ``blobs`` table, and a blob that is not a JSON message (the store keeps
+    binary protobuf blobs too) yield ``[]`` or are skipped -- never an
+    exception.  This is an undocumented format; a store a future Cursor
     version writes differently must not take a build down.
     """
     path = Path(path).resolve()
@@ -456,40 +366,17 @@ def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
         return []
     try:
         try:
-            rows = connection.execute("SELECT value FROM meta").fetchall()
+            rows = connection.execute("SELECT data FROM blobs").fetchall()
         except sqlite3.Error:
             return []
-        root_id: object | None = None
-        for (value,) in rows:
-            if not isinstance(value, str):
-                continue
-            try:
-                payload = json.loads(bytes.fromhex(value).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if isinstance(payload, dict):
-                candidate = payload.get("latestRootBlobId")
-                if isinstance(candidate, str) and candidate:
-                    root_id = candidate
-                    break
-        if root_id is None:
-            return []
-        root_blob = _lookup_blob(connection, root_id)
-        if root_blob is None:
-            return []
-        fields, complete = _decode_proto(root_blob)
-        if not complete:
-            return []
-        child_ids = [value for field, value in fields if field == 1]
 
         calls: list[CursorStoreToolCall] = []
         results: dict[str, object] = {}
-        for child_id in child_ids:
-            child = _lookup_blob(connection, child_id)
-            if child is None:
+        for (data,) in rows:
+            if not isinstance(data, (bytes, bytearray, memoryview)):
                 continue
             try:
-                message = json.loads(child.decode("utf-8"))
+                message = json.loads(bytes(data).decode("utf-8"))
             except (UnicodeDecodeError, ValueError):
                 continue
             if not isinstance(message, dict):

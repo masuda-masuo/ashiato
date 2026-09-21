@@ -1283,7 +1283,14 @@ def _apply_cursor_chat_stores(
     A session is paired only when the store is *proven* to line up with the
     transcript: the two tool-call counts are equal *and* the tool names agree
     elementwise (under the MCP equivalence of
-    :func:`_cursor_effective_tool_name`).  If either check fails, nothing is
+    :func:`_cursor_effective_tool_name`).  This guard is what makes a filled
+    result trustworthy, and it is also what protects against the store's
+    ordering being wrong: ``parse_chat_store`` reads ``blobs`` in table order
+    because the ``latestRootBlobId`` root is only a checkpoint window over
+    the newest messages (Cursor's CLI has saved only new transcript entries
+    per checkpoint since 2026-07-13), so if the table order ever disagreed
+    with the transcript's, the count/name check would refuse the session
+    rather than misalign a single result.  If either check fails, nothing is
     applied for that session -- a partially applied session is worse than an
     unapplied one, because a misaligned result attached to the wrong call is
     invisible afterwards -- and the skip is counted on *result*
