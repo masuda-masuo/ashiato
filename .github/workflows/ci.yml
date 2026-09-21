@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# The repository default is already read-only; stating it here is what the
+# CodeQL actions/missing-workflow-permissions rule asks for, and it survives a
+# change to that default.
+permissions:
+  contents: read
+
 jobs:
   lint-and-test:
     name: lint and test (Python ${{ matrix.python-version }})
