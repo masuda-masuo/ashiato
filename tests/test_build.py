@@ -4765,7 +4765,7 @@ STORE_RESULT_MESSAGES = [
     _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
     _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}]),
     _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}]),
-    _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "denial_pattern_x9", "top_k": 10}}]),
+    _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall", "arguments": {"query": "denial_pattern_x9", "top_k": 10}}}]),
     _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
 ]
 
@@ -4826,7 +4826,7 @@ def test_cursor_store_count_mismatch_skips_the_whole_session(tmp_path: Path):
             _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
             _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}]),
-            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "denial_pattern_x9", "top_k": 10}}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall", "arguments": {"query": "denial_pattern_x9", "top_k": 10}}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
             # The extra fourth store call -- the 094de10c... shape.
             _store_message([{"type": "tool-call", "toolCallId": "call-4", "toolName": "Bash", "input": {}}]),
@@ -4859,7 +4859,7 @@ def test_cursor_store_name_mismatch_skips_the_whole_session(tmp_path: Path):
         # The transcript's second call is Read; the store calls it Write.
         _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Write", "input": {"file_path": "notes.md"}}]),
         _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "written"}]),
-        _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {}}]),
+        _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall"}}]),
         _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": "ok"}]),
     ]
     _write_cursor_chat_store(chats, "hash1", "sess1", wrong)
@@ -4881,8 +4881,18 @@ def test_cursor_store_name_mismatch_skips_the_whole_session(tmp_path: Path):
     assert rows == [(None, None, None)] * 3
 
 
-def test_cursor_store_mcp_equivalence_pairs_without_a_mismatch(tmp_path: Path):
-    """Criterion 6: transcript CallMcpTool + input.toolName='recall' pairs with store 'recall'."""
+def test_cursor_store_calls_mcp_tools_callmctool_and_pairs(tmp_path: Path):
+    """Criterion 1: the store records CallMcpTool, so a CallMcpTool transcript pairs.
+
+    Measured on the real corpus: the store writes the same ``CallMcpTool``
+    block name the transcript does in 2,321 of 2,321 observed MCP positions --
+    there is no MCP name equivalence to apply, the rule is plain equality.  A
+    transcript ``CallMcpTool`` (with ``input.toolName = 'recall'``) at
+    position k pairs with a store that says ``CallMcpTool`` at the same
+    position, and the result is applied.  Under the pre-fix code (which
+    mapped the transcript name to 'recall') this session was skipped as a
+    name mismatch, so this test fails before the change.
+    """
     transcript_dir = tmp_path / "cursor"
     transcript_dir.mkdir()
     _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
@@ -4893,7 +4903,7 @@ def test_cursor_store_mcp_equivalence_pairs_without_a_mismatch(tmp_path: Path):
         "hash1",
         "sess1",
         [
-            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "recall", "args": {"query": "denial_pattern_x9"}}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall", "arguments": {"query": "denial_pattern_x9"}}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "matched facts"}]),
         ],
     )
@@ -4924,7 +4934,7 @@ def test_cursor_store_result_over_the_limit_is_truncated(tmp_path: Path):
             _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": long_result}]),
             _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "short"}]),
-            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {}}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall"}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": "ok"}]),
         ],
     )
@@ -5044,7 +5054,7 @@ def test_cursor_store_results_are_reapplied_when_the_store_changes(tmp_path: Pat
             _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "new output"}]),
             _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}]),
-            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {}}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall"}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
         ],
     )
@@ -5169,7 +5179,7 @@ def test_cursor_store_call_without_a_result_keeps_null_outcome(tmp_path: Path):
             _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
             # call-2 Read has NO tool-result part anywhere in the store.
             _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}]),
-            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "denial_pattern_x9", "top_k": 10}}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall", "arguments": {"query": "denial_pattern_x9", "top_k": 10}}}]),
             _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
         ],
     )

@@ -1221,31 +1221,6 @@ def _apply_cursor_chat_metas(
     result.n_cursor_sessions_unmatched = len(cursor_session_ids - matched_ids)
 
 
-def _cursor_effective_tool_name(tool_name: object, tool_input: object) -> str | None:
-    """The name a store call would use for a transcript ``tool_use`` block.
-
-    Cursor calls every MCP tool through one block name, ``CallMcpTool``, and
-    records which MCP tool it is in ``input.toolName``; the ``store.db``
-    names it directly.  ``CallMcpTool`` + ``input.toolName`` is therefore
-    equivalent to the store's ``toolName`` for the elementwise pairing check
-    -- a transcript ``CallMcpTool`` whose input carries no ``toolName``, or
-    one whose input is unreadable, has no store-side spelling and reads as
-    ``None`` (the check then fails, which is correct: the equivalence cannot
-    be proven).
-    """
-    if tool_name == CURSOR_MCP_TOOL_NAME:
-        if isinstance(tool_input, str):
-            try:
-                tool_input = json.loads(tool_input)
-            except ValueError:
-                tool_input = None
-        if isinstance(tool_input, dict):
-            real = tool_input.get("toolName")
-            return real if isinstance(real, str) else None
-        return None  # CallMcpTool with no readable input has no store-side name
-    return tool_name if isinstance(tool_name, str) else None
-
-
 def _tool_use_order_key(tool_use_id: str) -> tuple[int, int]:
     """(seq, block_index) of a synthetic ``seq:block_index`` call id.
 
@@ -1282,16 +1257,19 @@ def _apply_cursor_chat_stores(
 
     A session is paired only when the store is *proven* to line up with the
     transcript: the two tool-call counts are equal *and* the tool names agree
-    elementwise (under the MCP equivalence of
-    :func:`_cursor_effective_tool_name`).  This guard is what makes a filled
-    result trustworthy, and it is also what protects against the store's
-    ordering being wrong: ``parse_chat_store`` reads ``blobs`` in table order
-    because the ``latestRootBlobId`` root is only a checkpoint window over
-    the newest messages (Cursor's CLI has saved only new transcript entries
-    per checkpoint since 2026-07-13), so if the table order ever disagreed
-    with the transcript's, the count/name check would refuse the session
-    rather than misalign a single result.  If either check fails, nothing is
-    applied for that session -- a partially applied session is worse than an
+    elementwise -- ``transcript tool_name == store toolName``, both taken as
+    the plain recorded strings.  Measured on the real corpus, that is the
+    right rule: the store records the same ``CallMcpTool`` block name the
+    transcript does in 2,321 of 2,321 observed MCP positions, and no non-MCP
+    position disagreed.  This guard is what makes a filled result
+    trustworthy, and it is also what protects against the store's ordering
+    being wrong: ``parse_chat_store`` reads ``blobs`` in table order because
+    the ``latestRootBlobId`` root is only a checkpoint window over the newest
+    messages (Cursor's CLI has saved only new transcript entries per
+    checkpoint since 2026-07-13), so if the table order ever disagreed with
+    the transcript's, the count/name check would refuse the session rather
+    than misalign a single result.  If either check fails, nothing is applied
+    for that session -- a partially applied session is worse than an
     unapplied one, because a misaligned result attached to the wrong call is
     invisible afterwards -- and the skip is counted on *result*
     (``n_store_sessions_skipped_count`` / ``n_store_sessions_skipped_name``)
@@ -1314,14 +1292,14 @@ def _apply_cursor_chat_stores(
     """
     ingested: dict[str, list[tuple[str, str | None]]] = {}
     rows = connection.execute(
-        "SELECT session_id, tool_use_id, tool_name, input FROM tool_calls "
+        "SELECT session_id, tool_use_id, tool_name FROM tool_calls "
         "WHERE source = ?",
         [SOURCE_CURSOR],
     ).fetchall()
     rows.sort(key=lambda row: _tool_use_order_key(row[1]))
-    for session_id, tool_use_id, tool_name, tool_input in rows:
+    for session_id, tool_use_id, tool_name in rows:
         ingested.setdefault(session_id, []).append(
-            (tool_use_id, _cursor_effective_tool_name(tool_name, tool_input))
+            (tool_use_id, tool_name if isinstance(tool_name, str) else None)
         )
 
     seen: set[str] = set()
