@@ -287,6 +287,293 @@ def test_the_same_line_mcp_call_is_neither_prefix_nor_suffix_of_the_recall():
     assert "other" not in followup and "lookup" not in followup
 
 
+# ---------------------------------------------------------------- CallDynamicTool recall blocks
+
+
+def _call_dynamic_recall_line(
+    *, namespace: str = "kaiba", tool_name: str = "recall", query: str = "q"
+) -> dict:
+    """One ``CallDynamicTool`` tool_use block, the shape the real corpus records."""
+    return {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "CallDynamicTool",
+                    "input": {
+                        "arguments": {"query": query},
+                        "namespace": namespace,
+                        "toolName": tool_name,
+                    },
+                }
+            ]
+        },
+    }
+
+
+def test_recall_call_dynamic_namespace_kaiba_recall_produces_a_row(tmp_path: Path):
+    """A CallDynamicTool block with namespace='kaiba' and toolName='recall' is a recall call."""
+    path = tmp_path / "dynamic-recall.jsonl"
+    path.write_text(
+        json.dumps(_call_dynamic_recall_line(query="q")) + "\n", encoding="utf-8"
+    )
+    rows = extract_from_cursor(parse_file(path))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.source == "cursor"
+    assert row.query == "q"
+    assert row.call_id == "1:0"
+    assert row.recall_id == f"{path.resolve()}:1:0"
+
+
+def test_recall_call_dynamic_other_namespace_produces_no_row(tmp_path: Path):
+    """A CallDynamicTool block for a different namespace is not a kaiba recall."""
+    path = tmp_path / "other-namespace.jsonl"
+    path.write_text(
+        json.dumps(_call_dynamic_recall_line(namespace="sunaba")) + "\n",
+        encoding="utf-8",
+    )
+    assert extract_from_cursor(parse_file(path)) == []
+
+
+def test_recall_call_dynamic_other_tool_name_produces_no_row(tmp_path: Path):
+    """A CallDynamicTool block for a different toolName is not a kaiba recall."""
+    path = tmp_path / "other-tool.jsonl"
+    path.write_text(
+        json.dumps(_call_dynamic_recall_line(tool_name="remember")) + "\n",
+        encoding="utf-8",
+    )
+    assert extract_from_cursor(parse_file(path)) == []
+
+
+def test_recall_call_dynamic_get_dynamic_tools_is_not_a_call(tmp_path: Path):
+    """GetDynamicTools / GetMcpTools fetch the catalogue; 'recall' in their input is not a call.
+
+    The catalogue fetches spell the same keys a real call would, so only the
+    block-name gate tells them apart -- 15 real catalogue-fetch inputs mention
+    ``recall`` and must not become recall rows.
+    """
+    path = tmp_path / "catalogue.jsonl"
+    lines = [
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "GetDynamicTools",
+                        "input": {
+                            "namespace": "kaiba",
+                            "toolName": "recall",
+                            "arguments": {"query": "q"},
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "GetMcpTools",
+                        "input": {
+                            "server": "kaiba",
+                            "toolName": "recall",
+                            "arguments": {"query": "q"},
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "CallMcpTool",
+                        "input": {
+                            "server": "kaiba",
+                            "toolName": "recall",
+                            "arguments": {"query": "q"},
+                        },
+                    }
+                ]
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    rows = extract_from_cursor(parse_file(path))
+    # Only the real CallMcpTool call yields a row; the catalogue fetches do not.
+    assert len(rows) == 1
+    assert rows[0].query == "q"
+    assert rows[0].call_id == "3:0"
+
+
+def test_recall_call_dynamic_and_call_mcp_tool_recalls_both_produce_rows(tmp_path: Path):
+    """Both block names name the same kaiba recall; each produces its own row."""
+    path = tmp_path / "both-blocks.jsonl"
+    lines = [
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "CallDynamicTool",
+                        "input": {
+                            "arguments": {"query": "dyn"},
+                            "namespace": "kaiba",
+                            "toolName": "recall",
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "CallMcpTool",
+                        "input": {
+                            "server": "kaiba",
+                            "toolName": "recall",
+                            "arguments": {"query": "mcp"},
+                        },
+                    }
+                ]
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    rows = extract_from_cursor(parse_file(path))
+    assert len(rows) == 2
+    assert {row.query for row in rows} == {"dyn", "mcp"}
+    assert {row.call_id for row in rows} == {"1:0", "2:0"}
+
+
+# ---------------------------------------------------------------- crossed server-key spellings
+
+def _call_mcp_line_with_identity(
+    *,
+    server: str | None = None,
+    namespace: str | None = None,
+    tool_name: str = "recall",
+    query: str = "q",
+) -> dict:
+    """One ``CallMcpTool`` block carrying the server identity under either key spelling."""
+    input_block: dict = {"arguments": {"query": query}, "toolName": tool_name}
+    if server is not None:
+        input_block["server"] = server
+    if namespace is not None:
+        input_block["namespace"] = namespace
+    return {
+        "role": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "CallMcpTool", "input": input_block}]},
+    }
+
+
+def _call_dynamic_line_with_identity(
+    *,
+    server: str | None = None,
+    namespace: str | None = None,
+    tool_name: str = "recall",
+    query: str = "q",
+) -> dict:
+    """One ``CallDynamicTool`` block carrying the server identity under either key spelling."""
+    input_block: dict = {"arguments": {"query": query}, "toolName": tool_name}
+    if server is not None:
+        input_block["server"] = server
+    if namespace is not None:
+        input_block["namespace"] = namespace
+    return {
+        "role": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "CallDynamicTool", "input": input_block}]},
+    }
+
+
+def test_recall_call_mcp_namespace_kaiba_recall_produces_a_row(tmp_path: Path):
+    """CallMcpTool with namespace='kaiba' (no server) and toolName='recall' is a recall.
+
+    The production corpus has such rows (server=NULL, namespace=kaiba,
+    toolName=recall) that recall.py previously lost while build.py attributed
+    them to kaiba; both must read the identity the same way.
+    """
+    path = tmp_path / "mcp-namespace-recall.jsonl"
+    path.write_text(
+        json.dumps(_call_mcp_line_with_identity(namespace="kaiba")) + "\n",
+        encoding="utf-8",
+    )
+    rows = extract_from_cursor(parse_file(path))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.query == "q"
+    assert row.call_id == "1:0"
+    assert row.recall_id == f"{path.resolve()}:1:0"
+
+
+def test_recall_call_mcp_server_null_namespace_kaiba_is_a_recall(tmp_path: Path):
+    """CallMcpTool with server explicitly null and namespace='kaiba' is still a recall."""
+    path = tmp_path / "mcp-null-server-recall.jsonl"
+    line = {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "CallMcpTool",
+                    "input": {
+                        "arguments": {"query": "q"},
+                        "server": None,
+                        "namespace": "kaiba",
+                        "toolName": "recall",
+                    },
+                }
+            ]
+        },
+    }
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    rows = extract_from_cursor(parse_file(path))
+    assert len(rows) == 1
+    assert rows[0].query == "q"
+
+
+def test_recall_call_dynamic_server_kaiba_recall_produces_a_row(tmp_path: Path):
+    """CallDynamicTool with server='kaiba' (no namespace) and toolName='recall' is a recall."""
+    path = tmp_path / "dynamic-server-recall.jsonl"
+    path.write_text(
+        json.dumps(_call_dynamic_line_with_identity(server="kaiba")) + "\n",
+        encoding="utf-8",
+    )
+    rows = extract_from_cursor(parse_file(path))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.query == "q"
+    assert row.call_id == "1:0"
+    assert row.recall_id == f"{path.resolve()}:1:0"
+
+
+def test_recall_crossed_spelling_other_server_is_not_a_recall(tmp_path: Path):
+    """A crossed-spelling block whose server identity is another server is not a recall.
+
+    ``server`` wins over ``namespace`` in both block names, so a block spelling
+    server='sunaba' alongside namespace='kaiba' is attributed to sunaba -- just
+    as build.py would -- and must not become a recall row.
+    """
+    path = tmp_path / "crossed-other-server.jsonl"
+    lines = [
+        _call_mcp_line_with_identity(server="sunaba", namespace="kaiba"),
+        _call_dynamic_line_with_identity(server="sunaba", namespace="kaiba"),
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    assert extract_from_cursor(parse_file(path)) == []
+
+
 # ---------------------------------------------------------------- kaiba sqlite join fixture
 
 
@@ -763,6 +1050,47 @@ def test_classify_store_result(result: object, expected: tuple[bool, str]):
 def test_classify_store_result_prefix_matching_is_anchored():
     """Rule 3 is a *prefix* match: a result that merely quotes the error text is ok."""
     assert classify_store_result("The agent said: Error executing tool 'Bash'") == (False, "ok")
+
+
+def test_classify_store_result_shell_exit_code_nonzero_first_line_is_error():
+    """Rule 4: a shell result whose first line is a nonzero Exit code is an error.
+
+    Cursor records a shell result as a string whose first line is the exit
+    code: ``Exit code: 127`` here means the command failed, so the call is an
+    error.  The pre-fix classifier fell through to "anything else" and stored
+    every shell result ``ok`` -- measured on the real corpus, 53 of 1,864
+    Shell / AwaitShell results carry a nonzero exit code.
+    """
+    assert classify_store_result(
+        "Exit code: 127\n\nCommand output:\n\n```\nGetDynamicTools: command not found\n```\n\nCommand completed in 300 ms."
+    ) == (True, "error")
+
+
+def test_classify_store_result_shell_exit_code_zero_first_line_is_ok():
+    """Rule 4: ``Exit code: 0`` on the first line is a successful shell result."""
+    assert classify_store_result("Exit code: 0\n\nCommand output:\n\npwd\n") == (False, "ok")
+
+
+def test_classify_store_result_shell_result_without_exit_code_line_is_ok():
+    """Rule 4: a shell result with no ``Exit code`` line records no status -- ok.
+
+    Measured on the real corpus, 245 of 1,864 Shell / AwaitShell results have
+    no ``Exit code`` line at all: the exit status is unknown and must not be
+    guessed at.
+    """
+    assert classify_store_result("Command output:\n\nsome output\n") == (False, "ok")
+
+
+def test_classify_store_result_exit_code_in_middle_of_output_is_not_an_error():
+    """Rule 4 anchors at the start, like rule 3: an ``Exit code`` that merely
+    appears inside captured command output is not evidence of failure.
+    """
+    assert classify_store_result("Command output:\n\nExit code: 2\n") == (False, "ok")
+
+
+def test_classify_store_result_malformed_exit_code_first_line_is_not_guessed():
+    """Rule 4 does not guess: a first line that is not ``Exit code: <int>`` reads ok."""
+    assert classify_store_result("Exit code: nope\n\nCommand output:\n") == (False, "ok")
 
 
 def test_store_result_text_renders_a_dict_as_compact_json_and_a_string_as_is():

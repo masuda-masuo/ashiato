@@ -226,7 +226,15 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: {block_index}``.  The same Cursor source bytes yield rows where version
 #: 16 kept the role-less transcript text chunks, so existing databases must
 #: be rebuilt.
-FORMAT_VERSION = 17
+#: Version 18 = two Cursor ingest fixes that change stored column values
+#: (issues #92 / #93): a store shell result whose first line is a nonzero
+#: ``Exit code`` now classifies as an error (53 of 1,864 Shell / AwaitShell
+#: results were stored ``ok``), and ``CallDynamicTool`` blocks are now
+#: recognised as MCP calls alongside ``CallMcpTool``, with ``mcp_server``
+#: read from ``namespace`` (6,974 of 9,295 Cursor MCP calls were stored
+#: ``builtin`` with ``mcp_server`` NULL).  The same Cursor source bytes yield
+#: different rows than version 17, so existing databases must be rebuilt.
+FORMAT_VERSION = 18
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
