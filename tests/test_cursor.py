@@ -19,7 +19,16 @@ from pathlib import Path
 
 import pytest
 
-from ashiato.cursor import ChatMeta, CursorTextChunk, CursorToolCall, parse_chat_meta, parse_file
+from ashiato.cursor import (
+    ChatMeta,
+    CursorTextChunk,
+    CursorToolCall,
+    classify_store_result,
+    parse_chat_meta,
+    parse_chat_store,
+    parse_file,
+    store_result_text,
+)
 from ashiato.recall import extract_from_cursor
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -484,3 +493,273 @@ def test_parse_chat_meta_never_raises_on_other_malformed_shapes(tmp_path: Path):
 def test_no_usable_session_id_returns_none(tmp_path: Path):
     """A meta.json directly in a filesystem root has no parent name: the whole record is None."""
     assert parse_chat_meta(Path("/meta.json")) is None
+
+
+# ---------------------------------------------------------------- parse_chat_store
+
+
+def _store_blob_id(n: int) -> bytes:
+    """A deterministic 32-byte blob id."""
+    return n.to_bytes(32, "big")
+
+
+def _store_root_blob(child_ids: list[bytes]) -> bytes:
+    """A protobuf whose repeated field 1 is the child ids, in order."""
+    out = bytearray()
+    for child in child_ids:
+        out.append(0x0A)  # field 1, wire type 2
+        out.append(len(child))  # 32, one varint byte
+        out.extend(child)
+    return bytes(out)
+
+
+def _store_message(parts: list[dict]) -> bytes:
+    """One JSON message blob: a chat message whose content holds the parts."""
+    return json.dumps(
+        {"role": "assistant", "content": parts, "id": "msg", "providerOptions": {}}
+    ).encode("utf-8")
+
+
+def _write_store_db(
+    path: Path,
+    messages: list[bytes],
+    *,
+    root_blob: bytes | None = None,
+    root_id: bytes | None = None,
+    meta_payload: dict | None = None,
+) -> None:
+    """A minimal chats ``store.db``: ``meta`` (hex-encoded JSON) + ``blobs``.
+
+    The root blob's field-1 children are the messages, in order -- the same
+    blob graph shape the real store uses, tiny enough for fixtures.
+    """
+    root_id = root_id if root_id is not None else _store_blob_id(0)
+    child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
+    root = root_blob if root_blob is not None else _store_root_blob(child_ids)
+    payload = meta_payload if meta_payload is not None else {"latestRootBlobId": root_id.hex()}
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.execute(
+            "INSERT INTO meta VALUES ('conversation', ?)",
+            [json.dumps(payload).encode("utf-8").hex()],
+        )
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id, root])
+        connection.executemany(
+            "INSERT INTO blobs VALUES (?, ?)", zip(child_ids, messages, strict=True)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_parse_chat_store_returns_tool_calls_in_conversation_order(tmp_path: Path):
+    """Criterion 1: ids, names, args and results, ordered by the blob graph.
+
+    A tool-result message interleaved between call messages, and two calls in
+    one message, must not reorder anything: the returned calls follow the
+    message order of the root blob's children, not the table layout.
+    """
+    store = tmp_path / "store.db"
+    _write_store_db(
+        store,
+        [
+            _store_message(
+                [{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "ls"}}]
+            ),
+            _store_message(
+                [
+                    {"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "x"}},
+                    {"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "q"}},
+                ]
+            ),
+            _store_message(
+                [
+                    {"type": "tool-result", "toolCallId": "call-3", "result": {"status": "error", "message": "boom"}},
+                    {"type": "tool-result", "toolCallId": "call-1", "result": "total 42"},
+                    {"type": "tool-result", "toolCallId": "call-2", "result": "file contents"},
+                ]
+            ),
+            _store_message([{"type": "text", "text": "unmodelled"}]),
+        ],
+    )
+    calls = parse_chat_store(store)
+    assert [c.tool_call_id for c in calls] == ["call-1", "call-2", "call-3"]
+    assert calls[0].tool_name == "Bash"
+    assert calls[0].args == {"command": "ls"}
+    assert calls[0].result == "total 42"
+    assert calls[1].tool_name == "Read"
+    assert calls[1].result == "file contents"
+    # The tool-result for call-3 arrives in the same message as call-1's:
+    # matching is by toolCallId, so it still lands on call-3, not on call-1.
+    assert calls[2].tool_call_id == "call-3"
+    assert calls[2].args == {"query": "q"}
+    assert calls[2].result == {"status": "error", "message": "boom"}
+
+
+def test_parse_chat_store_reads_a_meta_row_not_at_position_zero(tmp_path: Path):
+    """Only the row whose value decodes to JSON with latestRootBlobId qualifies."""
+    store = tmp_path / "store.db"
+    messages = [_store_message([{"type": "tool-call", "toolCallId": "c", "toolName": "Bash", "input": {}}])]
+    _write_store_db(store, messages)
+    connection = sqlite3.connect(store)
+    try:
+        connection.execute(
+            "INSERT INTO meta VALUES ('other', ?)", [b"not hex".hex()]
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    calls = parse_chat_store(store)
+    assert len(calls) == 1
+    # No tool-result part exists for this call: has_result must be False --
+    # the parser must not present the absent result as a JSON-null success.
+    assert calls[0].has_result is False
+    assert calls[0].result is None
+
+
+def _write_store_db_hex_ids(
+    path: Path,
+    messages: list[bytes],
+    *,
+    meta_payload: dict | None = None,
+) -> None:
+    """A store in the *real* spelling: ``blobs.id`` is TEXT holding the hex.
+
+    The root blob's protobuf still carries the 32-byte raw child ids -- the
+    mismatch between the two spellings is exactly the shape the real store
+    has, and the lookup must bridge it (issue #87 stage 2 repair).
+    """
+    root_id = _store_blob_id(0)
+    child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
+    root = _store_root_blob(child_ids)
+    payload = meta_payload if meta_payload is not None else {"latestRootBlobId": root_id.hex()}
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.execute(
+            "INSERT INTO meta VALUES ('conversation', ?)",
+            [json.dumps(payload).encode("utf-8").hex()],
+        )
+        connection.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id.hex(), root])
+        connection.executemany(
+            "INSERT INTO blobs VALUES (?, ?)",
+            [(child.hex(), message) for child, message in zip(child_ids, messages, strict=True)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_parse_chat_store_resolves_raw_byte_children_against_hex_text_ids(tmp_path: Path):
+    """The real spelling (issue #87 stage 2 repair): TEXT hex ids, raw-byte children.
+
+    ``blobs.id`` is a TEXT column holding the hex of the id while the root
+    protobuf's field-1 children are the raw 32 bytes.  Before the fix the
+    bytes branch of ``_blob_id_candidates`` only tried the raw spelling, so
+    every child lookup missed and the parser returned zero calls; the fix
+    makes the bytes branch symmetric and tries ``.hex()`` as well.  The
+    BLOB-id spelling is exercised by the other fixtures (``_write_store_db``).
+    """
+    store = tmp_path / "store.db"
+    _write_store_db_hex_ids(
+        store,
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "ls"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "total 42"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "x"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "contents"}]),
+        ],
+    )
+    calls = parse_chat_store(store)
+    assert [c.tool_call_id for c in calls] == ["call-1", "call-2"]
+    assert calls[0].tool_name == "Bash"
+    assert calls[0].result == "total 42"
+    assert calls[1].tool_name == "Read"
+    assert calls[1].result == "contents"
+
+
+def _bad_store_cases(tmp_path: Path) -> list[tuple[str, Path]]:
+    cases: list[tuple[str, Path]] = []
+    # Criterion 2, case 1: a missing file.
+    missing = tmp_path / "missing.db"
+    cases.append(("missing", missing))
+    # Criterion 2, case 2: bytes that are not a SQLite database.
+    not_sqlite = tmp_path / "not.db"
+    not_sqlite.write_bytes(b"this is not a sqlite database")
+    cases.append(("not-sqlite", not_sqlite))
+    # Criterion 2, case 3: a meta table with no qualifying row.
+    no_meta = tmp_path / "no-meta.db"
+    connection = sqlite3.connect(no_meta)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.commit()
+    finally:
+        connection.close()
+    cases.append(("no-meta-row", no_meta))
+    # Criterion 2, case 4: a meta row whose root id is not in blobs.
+    no_root = tmp_path / "no-root.db"
+    _write_store_db(no_root, [], meta_payload={"latestRootBlobId": "ff" * 32})
+    cases.append(("root-not-in-blobs", no_root))
+    # Criterion 2, case 5: a truncated root protobuf (field says 32 bytes, only 10 follow).
+    truncated = tmp_path / "truncated.db"
+    _write_store_db(truncated, [], root_blob=b"\x0a\x20" + _store_blob_id(1)[:10])
+    cases.append(("truncated-protobuf", truncated))
+    # Criterion 2, case 6: a child blob that is not JSON.
+    non_json = tmp_path / "non-json.db"
+    _write_store_db(non_json, [], root_blob=_store_root_blob([_store_blob_id(7)]))
+    connection = sqlite3.connect(non_json)
+    try:
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [_store_blob_id(7), b"not json at all"])
+        connection.commit()
+    finally:
+        connection.close()
+    cases.append(("non-json-child", non_json))
+    return cases
+
+
+@pytest.mark.parametrize("name", ["missing", "not-sqlite", "no-meta-row", "root-not-in-blobs", "truncated-protobuf", "non-json-child"])
+def test_parse_chat_store_robustness_cases_return_empty(tmp_path: Path, name: str):
+    """Criterion 2: all six cases return [] and never raise."""
+    cases = dict(_bad_store_cases(tmp_path))
+    assert parse_chat_store(cases[name]) == []
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # Criterion 7, case 1: a dict with a non-empty error key.
+        ({"error": "tool blew up"}, (True, "error")),
+        ({"error": ""}, (False, "ok")),  # empty error key is not an error
+        # Criterion 7, case 2: a dict whose status says failure.
+        ({"status": "error", "message": "boom"}, (True, "error")),
+        ({"status": "failed"}, (True, "error")),
+        ({"status": "failure"}, (True, "error")),
+        # Criterion 7, case 3: each measured string prefix.
+        ("Error executing tool 'Bash'", (True, "error")),
+        ("Error: Tool execution error: boom", (True, "error")),
+        # Criterion 7, case 4: a plain string result.
+        ("total 42", (False, "ok")),
+        # Criterion 7, case 5: a dict with neither key.
+        ({"data": [1, 2], "ok": True}, (False, "ok")),
+        ({"status": "success"}, (False, "ok")),
+        (None, (False, "ok")),
+    ],
+)
+def test_classify_store_result(result: object, expected: tuple[bool, str]):
+    """Criterion 7: the five classifier cases, asserting outcome and is_error."""
+    assert classify_store_result(result) == expected
+
+
+def test_classify_store_result_prefix_matching_is_anchored():
+    """Rule 3 is a *prefix* match: a result that merely quotes the error text is ok."""
+    assert classify_store_result("The agent said: Error executing tool 'Bash'") == (False, "ok")
+
+
+def test_store_result_text_renders_a_dict_as_compact_json_and_a_string_as_is():
+    assert store_result_text("plain output") == "plain output"
+    assert store_result_text({"status": "error", "message": "boom"}) == '{"message":"boom","status":"error"}'
+    assert store_result_text(None) == "null"

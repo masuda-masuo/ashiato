@@ -19,8 +19,12 @@ Next to the transcripts, Cursor keeps ``~/.cursor/chats/<workspace-hash>/<sessio
 -- an undocumented local store holding a small ``meta.json`` per session plus
 a ``store.db`` with the full conversation.  :func:`parse_chat_meta` reads the
 ``meta.json`` half: the session's working directory and its start/end times.
-The ``store.db`` half (tool results, user and system turns) is deliberately
-not read yet (issue #87).
+:func:`parse_chat_store` reads the ``store.db`` half: each ``tool-call`` part
+of the conversation, in conversation order, paired with the raw ``result`` of
+its matching ``tool-result`` part -- the tool results the transcript export
+never records.  The user / system / assistant-text / reasoning messages of the
+store are deliberately not modelled (issue #87 stage 3); this module reads
+only the tool-call and tool-result parts.
 
 Only what the recall-followup view needs is modelled: every assistant
 ``text`` block, and every ``tool_use`` block (whichever tool -- the recall
@@ -33,7 +37,11 @@ value is.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import contextlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -254,4 +262,304 @@ def parse_chat_meta(path: str | Path) -> ChatMeta | None:
         created_at=created_at,
         updated_at=updated_at,
         has_conversation=has_conversation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# store.db: the conversation's tool results
+# ---------------------------------------------------------------------------
+
+#: Prefixes that mark a Cursor store tool result as a failure (classifier
+#: rule 3).  Measured on the real corpus: 468 of 5,742 string results (8%)
+#: start with one of these.  Rule 3 is deliberately the weakest signal in the
+#: classifier -- a prefix match on model-facing prose, not a status field --
+#: so these are only consulted after the structured ``error`` / ``status``
+#: signals of a dict result, and a plain string result that merely *contains*
+#: one of these prefixes without starting with it is not an error.
+CURSOR_RESULT_ERROR_PREFIXES: tuple[str, ...] = (
+    "Error executing tool",
+    "Error: Tool execution error",
+)
+
+#: Values of a tool-result dict's ``status`` key that mean the call failed
+#: (classifier rule 2).  The real corpus carries a ``status`` key on 421 of
+#: 2,445 dict results; this is the failure half of that vocabulary.  Anything
+#: else -- ``success``, ``completed``, an unknown future spelling -- reads as
+#: not-failed, exactly the way a brand-new denial pattern must not be guessed.
+CURSOR_RESULT_FAILURE_STATUSES: tuple[str, ...] = ("error", "failed", "failure")
+
+
+@dataclass(slots=True)
+class CursorStoreToolCall:
+    """One ``tool-call`` part read from a Cursor chat ``store.db``.
+
+    ``result`` is the raw ``result`` value of the matching ``tool-result``
+    part (a string, a dict, or ``None``), found by ``toolCallId``.
+    ``has_result`` says whether such a part existed at all: a ``tool-result``
+    whose value really is JSON null has ``has_result`` True and ``result``
+    ``None`` (the call completed and returned nothing), while a call no
+    result part ever matched has ``has_result`` False -- its fate is unknown,
+    and the build must not classify it as a success.
+    """
+
+    tool_call_id: str | None
+    tool_name: str | None
+    args: dict | None
+    result: object
+    has_result: bool = False
+
+
+def _varint(data: bytes, i: int) -> tuple[int, int] | None:
+    """(value, next index) of the varint starting at *i*, or ``None`` when truncated."""
+    value = 0
+    shift = 0
+    n = len(data)
+    while i < n:
+        b = data[i]
+        i += 1
+        value |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return value, i
+        shift += 7
+        if shift > 63:
+            return None
+    return None
+
+
+def _decode_proto(data: bytes) -> tuple[list[tuple[int, bytes]], bool]:
+    """(fields, complete) from a minimal varint / length-delimited protobuf reader.
+
+    ``complete`` is False when the payload is truncated or uses a wire type
+    this reader does not know: a truncated blob must read as unreadable, not
+    as a partial list of children -- a session whose root blob is cut off
+    yields nothing, exactly like a missing file.
+    """
+    fields: list[tuple[int, bytes]] = []
+    i = 0
+    n = len(data)
+    while i < n:
+        tag = _varint(data, i)
+        if tag is None:
+            return fields, False
+        tag, i = tag
+        wire = tag & 7
+        if wire == 2:
+            length = _varint(data, i)
+            if length is None:
+                return fields, False
+            ln, i = length
+            if i + ln > n:
+                return fields, False
+            fields.append((tag >> 3, data[i : i + ln]))
+            i += ln
+        elif wire == 0:
+            value = _varint(data, i)
+            if value is None:
+                return fields, False
+            _, i = value
+        else:
+            return fields, False
+    return fields, True
+
+
+def _blob_id_candidates(value: object) -> list[object]:
+    """Query spellings for a ``latestRootBlobId``-style value.
+
+    The meta row stores its JSON hex-encoded, and the blob ids inside it are
+    the same 32-byte values the protobuf carries, but the ``blobs.id`` column
+    of the real store is TEXT holding the id's *hex* spelling while the
+    protobuf children are the *raw* 32 bytes -- so an id may arrive as either
+    spelling and must be tried in both (plus base64, in case a future Cursor
+    version switches) so the join does not depend on the column's declared
+    type.  The string branch tries ``bytes.fromhex``; the bytes branch is
+    symmetric and tries ``.hex()``.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        candidates: list[object] = [raw, raw.hex()]
+        with contextlib.suppress(binascii.Error):
+            candidates.append(base64.b64encode(raw).decode("ascii"))
+        return candidates
+    if not isinstance(value, str) or not value:
+        return []
+    candidates: list[object] = [value]
+    with contextlib.suppress(ValueError):
+        candidates.append(bytes.fromhex(value))
+    with contextlib.suppress(ValueError, binascii.Error):
+        candidates.append(base64.b64decode(value, validate=True))
+    return candidates
+
+
+def _lookup_blob(connection: sqlite3.Connection, value: object) -> bytes | None:
+    """The ``blobs.data`` bytes for one id spelling, or ``None`` when not present."""
+    for candidate in _blob_id_candidates(value):
+        try:
+            row = connection.execute(
+                "SELECT data FROM blobs WHERE id = ?", [candidate]
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is not None:
+            data = row[0]
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                return bytes(data)
+            if isinstance(data, str):
+                return data.encode("utf-8")
+    return None
+
+
+def _store_call_args(part: dict) -> dict | None:
+    args = part.get("args")
+    if isinstance(args, dict):
+        return args
+    args = part.get("input")
+    if isinstance(args, dict):
+        return args
+    return None
+
+
+def _store_call_name(part: dict) -> str | None:
+    name = part.get("toolName")
+    if isinstance(name, str):
+        return name
+    name = part.get("name")
+    if isinstance(name, str):
+        return name
+    return None
+
+
+def parse_chat_store(path: str | Path) -> list[CursorStoreToolCall]:
+    """Read the tool calls of one Cursor chat ``store.db``, in conversation order.
+
+    The store is an undocumented SQLite database.  Conversation order comes
+    from the blob graph, not from table order: ``meta`` carries a
+    hex-encoded JSON ``latestRootBlobId``; that blob is a protobuf whose
+    repeated field 1 holds the child blob ids in order; the children that
+    are JSON are the messages, and each message's ``content`` holds the
+    ``tool-call`` / ``tool-result`` parts in conversation order.  Each
+    returned call carries the raw ``result`` of its matching ``tool-result``
+    part (matched by ``toolCallId``), with ``has_result`` saying whether such
+    a part was found at all -- a call whose id never matches a result part
+    is a call whose fate the store does not record.
+
+    A missing file, an unreadable or non-SQLite file, a ``meta`` row that
+    does not decode, a root id that is not in ``blobs``, a truncated
+    protobuf, and a non-JSON child all yield ``[]`` for the session -- never
+    an exception.  This is an undocumented format; a store a future Cursor
+    version writes differently must not take a build down.
+    """
+    path = Path(path).resolve()
+    try:
+        # mode=ro: a missing file fails here instead of being created empty.
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.Error):
+        return []
+    try:
+        try:
+            rows = connection.execute("SELECT value FROM meta").fetchall()
+        except sqlite3.Error:
+            return []
+        root_id: object | None = None
+        for (value,) in rows:
+            if not isinstance(value, str):
+                continue
+            try:
+                payload = json.loads(bytes.fromhex(value).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(payload, dict):
+                candidate = payload.get("latestRootBlobId")
+                if isinstance(candidate, str) and candidate:
+                    root_id = candidate
+                    break
+        if root_id is None:
+            return []
+        root_blob = _lookup_blob(connection, root_id)
+        if root_blob is None:
+            return []
+        fields, complete = _decode_proto(root_blob)
+        if not complete:
+            return []
+        child_ids = [value for field, value in fields if field == 1]
+
+        calls: list[CursorStoreToolCall] = []
+        results: dict[str, object] = {}
+        for child_id in child_ids:
+            child = _lookup_blob(connection, child_id)
+            if child is None:
+                continue
+            try:
+                message = json.loads(child.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "tool-call":
+                    call_id = part.get("toolCallId")
+                    calls.append(
+                        CursorStoreToolCall(
+                            tool_call_id=call_id if isinstance(call_id, str) else None,
+                            tool_name=_store_call_name(part),
+                            args=_store_call_args(part),
+                            result=None,  # attached below, once all results are seen
+                        )
+                    )
+                elif part_type == "tool-result":
+                    call_id = part.get("toolCallId")
+                    if isinstance(call_id, str):
+                        results[call_id] = part.get("result")
+        for call in calls:
+            if call.tool_call_id is not None and call.tool_call_id in results:
+                call.has_result = True
+                call.result = results[call.tool_call_id]
+        return calls
+    finally:
+        connection.close()
+
+
+def classify_store_result(result: object) -> tuple[bool, str]:
+    """(is_error, outcome) for one Cursor store tool result.
+
+    Rules in order, exactly as documented in the README:
+
+    1. a dict with a non-empty ``error`` key is an error;
+    2. a dict whose ``status`` is in :data:`CURSOR_RESULT_FAILURE_STATUSES`
+       is an error;
+    3. a string starting with one of :data:`CURSOR_RESULT_ERROR_PREFIXES` is
+       an error;
+    4. anything else is ``ok``.
+
+    ``pending`` and ``denied`` are never produced: a result that exists at
+    all means the call completed, and Cursor records no denial signal.  Rule 3
+    is prefix matching on model-facing prose -- a weaker signal than the
+    other sources' status fields, which is why it is the last resort.
+    """
+    if isinstance(result, dict):
+        error = result.get("error")
+        if error is not None and error != "":
+            return True, "error"
+        status = result.get("status")
+        if isinstance(status, str) and status in CURSOR_RESULT_FAILURE_STATUSES:
+            return True, "error"
+        return False, "ok"
+    if isinstance(result, str):
+        if result.startswith(CURSOR_RESULT_ERROR_PREFIXES):
+            return True, "error"
+        return False, "ok"
+    return False, "ok"
+
+
+def store_result_text(result: object) -> str:
+    """A tool result rendered as text: a string as-is, a dict as compact JSON."""
+    if isinstance(result, str):
+        return result
+    return json.dumps(
+        result, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
     )

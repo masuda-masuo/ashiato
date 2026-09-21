@@ -812,7 +812,11 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
         print(
             f"cursor chats: {result.n_chat_metas_read} meta files read, "
             f"{result.n_chat_metas_matched} matched a session, "
-            f"{result.n_cursor_sessions_unmatched} sessions unmatched",
+            f"{result.n_cursor_sessions_unmatched} sessions unmatched; "
+            f"store results: {result.n_store_sessions_paired} sessions paired, "
+            f"{result.n_store_sessions_skipped_count} skipped (count mismatch), "
+            f"{result.n_store_sessions_skipped_name} skipped (name mismatch), "
+            f"{result.n_tool_calls_filled} tool calls filled",
             file=out,
         )
     print(

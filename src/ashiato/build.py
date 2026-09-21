@@ -43,7 +43,13 @@ import duckdb
 
 from ashiato.codex import ParsedCodexFile
 from ashiato.codex import parse_file as parse_codex_file
-from ashiato.cursor import ParsedCursorFile, parse_chat_meta
+from ashiato.cursor import (
+    ParsedCursorFile,
+    classify_store_result,
+    parse_chat_meta,
+    parse_chat_store,
+    store_result_text,
+)
 from ashiato.cursor import parse_file as parse_cursor_file
 from ashiato.opencode import ParsedOpenCodeFile
 from ashiato.opencode import parse_file as parse_opencode_file
@@ -145,6 +151,24 @@ class BuildResult:
     n_chat_metas_read: int = 0
     n_chat_metas_matched: int = 0
     n_cursor_sessions_unmatched: int = 0
+    #: The ``--cursor-chats-source`` store.db join (issue #87 stage 2): how
+    #: many distinct sessions had their tool results applied, how many were
+    #: skipped because the store's tool-call count disagreed with the
+    #: transcript's, how many were skipped because the tool names disagreed
+    #: elementwise, and how many tool_calls rows were filled.  All zero when
+    #: no chats source was given.  A partially applied session is worse than
+    #: an unapplied one -- a misaligned result attached to the wrong call is
+    #: invisible afterwards -- so a session is either paired whole or skipped
+    #: whole, and these counters make either outcome visible.
+    n_store_sessions_paired: int = 0
+    n_store_sessions_skipped_count: int = 0
+    n_store_sessions_skipped_name: int = 0
+    n_tool_calls_filled: int = 0
+    #: Of a paired session's calls, how many had no matching ``tool-result``
+    #: part and so kept NULL ``outcome`` / ``is_error`` / ``result_text``.
+    #: The store never paired them with a result, so their fate is unknown --
+    #: unknown is not success (issue #87 finding 2).
+    n_store_calls_without_result: int = 0
     missing_sources: list[str] = field(default_factory=list)
     unreadable_files: list[str] = field(default_factory=list)
     failed_files: list[str] = field(default_factory=list)
@@ -957,7 +981,7 @@ def _cursor_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
 def _cursor_tool_call_to_row(call: object) -> list[object]:
     """Map a ``CursorToolCall`` to a ``ToolCall``-shaped row for insertion.
 
-    ``outcome`` is NULL and ``is_error`` is NULL, deliberately -- *not* what
+    ``outcome`` is NULL and ``is_error`` is NULL at insert time -- *not* what
     :func:`classify_outcome` would return for these calls.  A Cursor tool_use
     block records no result at all: no output, no status, nothing, so feeding
     that absence to ``classify_outcome`` yields ``'pending'`` for every call.
@@ -965,15 +989,24 @@ def _cursor_tool_call_to_row(call: object) -> list[object]:
     session, not about the call -- and a later reader would take the whole
     Cursor corpus to be sessions that were constantly interrupted.  The
     format recording nothing is not the same as the call not finishing.
-    ``hygiene`` counts ``outcome = 'pending'`` as ``pending_tool_call`` and
-    ``nominate`` gates on ``outcome = 'error'``; a NULL is invisible to both,
-    which is exactly right for a call whose fate is genuinely unknown -- it is
-    neither evidence of failure nor evidence of success.  ``is_error = False``
-    would be the same mistake in a different column: a call with unknown fate
-    is not a call known to have succeeded.  ``ts`` is NULL for the same reason
-    -- do not fabricate an ordering -- and ``seq`` / ``block_index`` already
-    give within-file order.  ``result_text`` / ``result_truncated`` are NULL
-    too: there is no recorded result to store or truncate.
+
+    The NULL is a *pre-join default*, not a verdict: when
+    ``--cursor-chats-source`` is given, :func:`_apply_cursor_chat_stores`
+    re-reads the session's ``store.db`` (the undocumented local store that
+    holds the tool results the transcript export never records) and fills
+    ``outcome`` / ``is_error`` / ``result_text`` / ``result_truncated`` on
+    every call of a session whose store pairs with the transcript -- same
+    tool-call count and elementwise-equal tool names.  A session the store
+    cannot pair (count or name mismatch) keeps its NULLs, and a build without
+    the chats source leaves every Cursor call NULL -- ``hygiene`` counts
+    ``outcome = 'pending'`` as ``pending_tool_call`` and ``nominate`` gates
+    on ``outcome = 'error'``; a NULL is invisible to both, which is exactly
+    right for a call whose fate is genuinely unknown.
+
+    ``ts`` is NULL for the same reason -- do not fabricate an ordering -- and
+    ``seq`` / ``block_index`` already give within-file order.  The store join
+    does not change that: ``store.db`` carries no per-message timestamp, so
+    ``ts`` stays NULL after the join too.
 
     ``tool_name`` is the recorded block name.  Cursor calls every MCP tool
     through one block name, ``CallMcpTool``, and records which MCP tool it is
@@ -1186,6 +1219,151 @@ def _apply_cursor_chat_metas(
             )
     result.n_chat_metas_matched = len(matched_ids)
     result.n_cursor_sessions_unmatched = len(cursor_session_ids - matched_ids)
+
+
+def _cursor_effective_tool_name(tool_name: object, tool_input: object) -> str | None:
+    """The name a store call would use for a transcript ``tool_use`` block.
+
+    Cursor calls every MCP tool through one block name, ``CallMcpTool``, and
+    records which MCP tool it is in ``input.toolName``; the ``store.db``
+    names it directly.  ``CallMcpTool`` + ``input.toolName`` is therefore
+    equivalent to the store's ``toolName`` for the elementwise pairing check
+    -- a transcript ``CallMcpTool`` whose input carries no ``toolName``, or
+    one whose input is unreadable, has no store-side spelling and reads as
+    ``None`` (the check then fails, which is correct: the equivalence cannot
+    be proven).
+    """
+    if tool_name == CURSOR_MCP_TOOL_NAME:
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except ValueError:
+                tool_input = None
+        if isinstance(tool_input, dict):
+            real = tool_input.get("toolName")
+            return real if isinstance(real, str) else None
+        return None  # CallMcpTool with no readable input has no store-side name
+    return tool_name if isinstance(tool_name, str) else None
+
+
+def _tool_use_order_key(tool_use_id: str) -> tuple[int, int]:
+    """(seq, block_index) of a synthetic ``seq:block_index`` call id.
+
+    The parser emits calls in transcript order -- line by line, block by
+    block -- so the ingestion order a store must pair against is the
+    *numeric* (seq, block_index) order.  ``ORDER BY tool_use_id`` would be
+    lexicographic and misorder a line that issued ten or more calls; sorting
+    in Python keeps the pairing faithful.
+    """
+    seq, _, block = tool_use_id.partition(":")
+    try:
+        return int(seq), int(block)
+    except ValueError:
+        return 0, 0
+
+
+def _apply_cursor_chat_stores(
+    connection: duckdb.DuckDBPyConnection,
+    meta_files: Sequence[Path],
+    result: BuildResult,
+    *,
+    result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
+) -> None:
+    """Join ``--cursor-chats-source`` ``store.db`` files onto the ingested Cursor calls.
+
+    Every ``store.db`` sitting next to a ``meta.json`` under the chats roots
+    is re-read and re-applied on every build, exactly like the metas: the
+    incremental bookkeeping in ``source_files`` tracks *transcripts*, and a
+    ``store.db`` has no record there, so there is no cheap way to skip a
+    session whose store is unchanged -- reading them all is the honest cost
+    (a handful of small SQLite files per session).  The UPDATE is idempotent,
+    so a changed store is picked up even when the transcript it belongs to
+    was skipped as unchanged, and a re-applied store writes the same values.
+
+    A session is paired only when the store is *proven* to line up with the
+    transcript: the two tool-call counts are equal *and* the tool names agree
+    elementwise (under the MCP equivalence of
+    :func:`_cursor_effective_tool_name`).  If either check fails, nothing is
+    applied for that session -- a partially applied session is worse than an
+    unapplied one, because a misaligned result attached to the wrong call is
+    invisible afterwards -- and the skip is counted on *result*
+    (``n_store_sessions_skipped_count`` / ``n_store_sessions_skipped_name``)
+    so a silent half-match cannot hide.  Two roots can point at the same
+    session (a normal invocation), so the paired count is derived from the
+    *set* of sessions actually paired, never from the number of store files.
+
+    For a paired session, each call that has a matching ``tool-result`` part
+    gets its ``outcome`` / ``is_error`` / ``result_text`` /
+    ``result_truncated`` from the raw ``result`` via
+    :func:`ashiato.cursor.classify_store_result` and
+    :func:`ashiato.cursor.store_result_text`; a call whose id never matched a
+    result part keeps NULL in all four columns -- the store recorded no
+    result for it, so its fate is unknown, and unknown must not read as
+    success (``n_store_calls_without_result`` counts these).  ``ts`` is never
+    touched: the store carries no per-message timestamp, so it stays NULL.
+    ``tool_use_id`` is never touched either: it is the transcript-derived
+    ``seq:block_index`` identity documented in :func:`parse_file`, and the
+    store has no id the transcript carries to replace it with.
+    """
+    ingested: dict[str, list[tuple[str, str | None]]] = {}
+    rows = connection.execute(
+        "SELECT session_id, tool_use_id, tool_name, input FROM tool_calls "
+        "WHERE source = ?",
+        [SOURCE_CURSOR],
+    ).fetchall()
+    rows.sort(key=lambda row: _tool_use_order_key(row[1]))
+    for session_id, tool_use_id, tool_name, tool_input in rows:
+        ingested.setdefault(session_id, []).append(
+            (tool_use_id, _cursor_effective_tool_name(tool_name, tool_input))
+        )
+
+    seen: set[str] = set()
+    paired_ids: set[str] = set()
+    for path in meta_files:
+        session_id = path.parent.name
+        if session_id in seen:
+            continue
+        session_calls = ingested.get(session_id)
+        if not session_calls:
+            continue  # no ingested transcript calls to fill -- nothing to pair
+        store_path = path.with_name("store.db")
+        if not store_path.is_file():
+            continue  # no store to read -- the same half-match the metas count as unmatched
+        seen.add(session_id)
+        store_calls = parse_chat_store(store_path)
+        if len(store_calls) != len(session_calls):
+            result.n_store_sessions_skipped_count += 1
+            continue
+        if any(
+            store_call.tool_name != expected
+            for store_call, (_, expected) in zip(store_calls, session_calls, strict=True)
+        ):
+            result.n_store_sessions_skipped_name += 1
+            continue
+        for store_call, (tool_use_id, _) in zip(store_calls, session_calls, strict=True):
+            if not store_call.has_result:
+                # The store never paired this call with a tool-result part.
+                # Its fate is unknown: keep NULL outcome / is_error /
+                # result_text rather than read the absence as success.
+                result.n_store_calls_without_result += 1
+                continue
+            is_error, outcome = classify_store_result(store_call.result)
+            text = store_result_text(store_call.result)
+            truncated = False
+            if len(text) > result_text_limit:
+                text = text[:result_text_limit]
+                truncated = True
+            connection.execute(
+                "UPDATE tool_calls SET outcome = ?, is_error = ?, result_text = ?, "
+                "result_truncated = ? "
+                "WHERE tool_use_id = ? AND session_id = ? AND source = ?",
+                [outcome, is_error, text, truncated, tool_use_id, session_id, SOURCE_CURSOR],
+            )
+        paired_ids.add(session_id)
+        result.n_tool_calls_filled += sum(
+            1 for call in store_calls if call.has_result
+        )
+    result.n_store_sessions_paired = len(paired_ids)
 
 
 def _codex_tool_call_to_row(call: object) -> list[object]:
@@ -1515,7 +1693,10 @@ def build(
 
     *cursor_chats_sources* is the optional ``--cursor-chats-source`` join: the
     ``meta.json`` files under those roots fill ``cwd`` and the session times
-    of the Cursor sessions that match (see :func:`_apply_cursor_chat_metas`).
+    of the Cursor sessions that match, and the ``store.db`` files sitting
+    next to them fill ``outcome`` / ``is_error`` / ``result_text`` /
+    ``result_truncated`` of those sessions' tool calls (see
+    :func:`_apply_cursor_chat_metas` and :func:`_apply_cursor_chat_stores`).
     Nothing is scanned for chat metas by default.
     """
     result = BuildResult(db_path=str(Path(db_path).expanduser()))
@@ -1772,6 +1953,12 @@ def build(
 
             if cursor_chat_files:
                 _apply_cursor_chat_metas(connection, cursor_chat_files, result)
+                _apply_cursor_chat_stores(
+                    connection,
+                    cursor_chat_files,
+                    result,
+                    result_text_limit=result_text_limit,
+                )
     finally:
         connection.close()
     return result

@@ -4657,3 +4657,538 @@ def test_codex_recall_ts_lands_in_a_time_window(tmp_path: Path):
     finally:
         connection.close()
     assert rows == [("recall-win-1", "flaky retry")]
+# ---------------------------------------------------------------- cursor chat stores (issue #87 stage 2)
+
+
+def _store_blob_id(n: int) -> bytes:
+    """A deterministic 32-byte blob id."""
+    return n.to_bytes(32, "big")
+
+
+def _store_root_blob(child_ids: list[bytes]) -> bytes:
+    """A protobuf whose repeated field 1 is the child ids, in order."""
+    out = bytearray()
+    for child in child_ids:
+        out.append(0x0A)  # field 1, wire type 2
+        out.append(len(child))  # 32, one varint byte
+        out.extend(child)
+    return bytes(out)
+
+
+def _store_message(parts: list[dict]) -> bytes:
+    """One JSON message blob: a chat message whose content holds the parts."""
+    return json.dumps(
+        {"role": "assistant", "content": parts, "id": "msg", "providerOptions": {}}
+    ).encode("utf-8")
+
+
+def _write_cursor_chat_store(
+    chats_dir: Path,
+    workspace_hash: str,
+    session_id: str,
+    messages: list[bytes],
+) -> Path:
+    """The chats-layout ``store.db`` sibling of a ``meta.json``."""
+    session_dir = chats_dir / workspace_hash / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    store_path = session_dir / "store.db"
+    store_path.unlink(missing_ok=True)  # a fixture rewrite starts from a clean file
+    root_id = _store_blob_id(0)
+    child_ids = [_store_blob_id(i + 1) for i in range(len(messages))]
+    root = _store_root_blob(child_ids)
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        connection.execute(
+            "INSERT INTO meta VALUES ('conversation', ?)",
+            [json.dumps({"latestRootBlobId": root_id.hex()}).encode("utf-8").hex()],
+        )
+        connection.execute("CREATE TABLE blobs (id BLOB PRIMARY KEY, data BLOB)")
+        connection.execute("INSERT INTO blobs VALUES (?, ?)", [root_id, root])
+        connection.executemany(
+            "INSERT INTO blobs VALUES (?, ?)", zip(child_ids, messages, strict=True)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return store_path
+
+
+# Three tool calls in transcript order: Bash (2:1), Read (3:0), and a kaiba
+# recall via the MCP wrapper (4:0).  The store names the recall directly.
+STORE_TRANSCRIPT_LINES = [
+    {
+        "role": "user",
+        "message": {
+            "content": [
+                {"type": "text", "text": "<user_query>\nWhat now?\n</user_query>"}
+            ]
+        },
+    },
+    {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "pwd"}},
+            ]
+        },
+    },
+    {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "notes.md"}},
+            ]
+        },
+    },
+    {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "CallMcpTool",
+                    "input": {
+                        "server": "kaiba",
+                        "toolName": "recall",
+                        "arguments": {"query": "denial_pattern_x9", "top_k": 10},
+                    },
+                },
+            ]
+        },
+    },
+]
+
+STORE_RESULT_MESSAGES = [
+    _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}}]),
+    _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
+    _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}]),
+    _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}]),
+    _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "denial_pattern_x9", "top_k": 10}}]),
+    _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
+]
+
+
+def _write_paired_session(tmp_path: Path) -> tuple[Path, Path]:
+    """A transcript of three calls plus a matching chats session (meta + store)."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", STORE_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats, "hash1", "sess1", STORE_RESULT_MESSAGES)
+    return transcript_dir, chats
+
+
+def test_cursor_store_results_fill_outcome_is_error_and_result_text(tmp_path: Path):
+    """Criterion 3: a session whose counts and names match gets a result on every call.
+
+    The third call's result is asserted, not just the first: an off-by-one
+    that only shifts later rows must fail this test.
+    """
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    db_path = tmp_path / "paired.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+    assert result.n_store_sessions_skipped_count == 0
+    assert result.n_store_sessions_skipped_name == 0
+    assert result.n_tool_calls_filled == 3
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, outcome, is_error, result_text, result_truncated "
+            "FROM tool_calls WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("2:1", "ok", False, "/home/u/project", False),
+        ("3:0", "ok", False, "notes contents", False),
+        ("4:0", "error", True, '{"error":"boom"}', False),
+    ]
+
+
+def test_cursor_store_count_mismatch_skips_the_whole_session(tmp_path: Path):
+    """Criterion 4: one extra store call (the real 094de10c... shape) skips the session.
+
+    Every call keeps NULL outcome, and the count-mismatch counter reads 1 --
+    a partially applied session would attach results to the wrong calls.
+    """
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess1",
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "denial_pattern_x9", "top_k": 10}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
+            # The extra fourth store call -- the 094de10c... shape.
+            _store_message([{"type": "tool-call", "toolCallId": "call-4", "toolName": "Bash", "input": {}}]),
+        ],
+    )
+    db_path = tmp_path / "mismatch_count.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 0
+    assert result.n_store_sessions_skipped_count == 1
+    assert result.n_store_sessions_skipped_name == 0
+    assert result.n_tool_calls_filled == 0
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT outcome, is_error, result_text, result_truncated "
+            "FROM tool_calls WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [(None, None, None, None)] * 3
+
+
+def test_cursor_store_name_mismatch_skips_the_whole_session(tmp_path: Path):
+    """Criterion 5: names disagree at position k -> skipped entirely, name-mismatch reads 1."""
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    wrong = [
+        _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}}]),
+        _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
+        # The transcript's second call is Read; the store calls it Write.
+        _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Write", "input": {"file_path": "notes.md"}}]),
+        _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "written"}]),
+        _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {}}]),
+        _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": "ok"}]),
+    ]
+    _write_cursor_chat_store(chats, "hash1", "sess1", wrong)
+    db_path = tmp_path / "mismatch_name.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 0
+    assert result.n_store_sessions_skipped_count == 0
+    assert result.n_store_sessions_skipped_name == 1
+    assert result.n_tool_calls_filled == 0
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT outcome, is_error, result_text FROM tool_calls "
+            "WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [(None, None, None)] * 3
+
+
+def test_cursor_store_mcp_equivalence_pairs_without_a_mismatch(tmp_path: Path):
+    """Criterion 6: transcript CallMcpTool + input.toolName='recall' pairs with store 'recall'."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess1",
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "recall", "args": {"query": "denial_pattern_x9"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "matched facts"}]),
+        ],
+    )
+    db_path = tmp_path / "mcp.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+    assert result.n_store_sessions_skipped_name == 0
+    connection = connect(db_path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT outcome, is_error, result_text FROM tool_calls WHERE tool_use_id = '2:1'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == ("ok", False, "matched facts")
+
+
+def test_cursor_store_result_over_the_limit_is_truncated(tmp_path: Path):
+    """Criterion 8: a result larger than the limit sets result_truncated and truncates."""
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    long_result = "x" * 5000
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess1",
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": long_result}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "short"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": "ok"}]),
+        ],
+    )
+    db_path = tmp_path / "trunc.duckdb"
+    result = build(
+        [],
+        db_path,
+        cursor_sources=[transcript_dir],
+        cursor_chats_sources=[chats],
+        result_text_limit=10,
+    )
+    assert result.n_tool_calls_filled == 3
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, result_text, result_truncated FROM tool_calls "
+            "WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows[0] == ("2:1", "x" * 10, True)
+    assert rows[1] == ("3:0", "short", False)
+    assert rows[2] == ("4:0", "ok", False)
+
+
+def test_cursor_store_join_leaves_ts_null_everywhere(tmp_path: Path):
+    """Criterion 9: ts stays NULL on every Cursor tool_calls and events row."""
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    db_path = tmp_path / "ts_null.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(
+            connection, "SELECT count(*) FROM tool_calls WHERE ts IS NOT NULL"
+        ) == 0
+        assert scalar(
+            connection, "SELECT count(*) FROM events WHERE ts IS NOT NULL"
+        ) == 0
+        assert scalar(
+            connection, "SELECT count(*) FROM sessions WHERE started_at IS NOT NULL"
+        ) == 1  # stage 1's meta times still land -- ts was never them
+    finally:
+        connection.close()
+
+
+def test_build_without_cursor_chats_source_leaves_store_results_unread(tmp_path: Path):
+    """Criterion 10: without --cursor-chats-source the build is today's build.
+
+    The store file exists on disk but is never read: NULL outcome, no
+    results, and the same row counts as a chats-joined build minus the fill.
+    """
+    transcript_dir, _ = _write_paired_session(tmp_path)
+    db_path = tmp_path / "no_flag.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir])
+    assert result.n_store_sessions_paired == 0
+    assert result.n_tool_calls_filled == 0
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 3
+        rows = connection.execute(
+            "SELECT outcome, is_error, result_text, result_truncated "
+            "FROM tool_calls WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+        assert rows == [(None, None, None, None)] * 3
+    finally:
+        connection.close()
+
+
+def test_cursor_store_join_keeps_stage_one_meta_values(tmp_path: Path):
+    """Criterion 11: cwd, session times and the distinct-session counters still hold.
+
+    The store join fills the result columns; the meta join still fills cwd
+    and the session times, and neither overwrites the other's columns.
+    """
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    db_path = tmp_path / "stage1.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_chat_metas_read == 1
+    assert result.n_chat_metas_matched == 1
+    assert result.n_store_sessions_paired == 1
+    connection = connect(db_path, read_only=True)
+    try:
+        session = connection.execute(
+            "SELECT cwd, started_at, ended_at FROM sessions WHERE session_id = 'sess1'"
+        ).fetchone()
+        assert session == (
+            "/home/masuda/dev/projects/kairanban",
+            datetime.fromtimestamp(CHAT_CREATED_MS / 1000, tz=UTC).replace(tzinfo=None),
+            datetime.fromtimestamp(CHAT_UPDATED_MS / 1000, tz=UTC).replace(tzinfo=None),
+        )
+        assert scalar(connection, "SELECT count(*) FROM tool_calls WHERE cwd IS NULL") == 0
+        assert scalar(
+            connection,
+            "SELECT count(*) FROM tool_calls WHERE outcome IS NOT NULL",
+        ) == 3
+    finally:
+        connection.close()
+
+
+def test_cursor_store_results_are_reapplied_when_the_store_changes(tmp_path: Path):
+    """A changed store.db is picked up even when the transcript was skipped as unchanged.
+
+    The store files are re-read on every build (they have no entry in the
+    incremental bookkeeping, which tracks transcripts only), so the second
+    build applies the new result to a session whose transcript was skipped.
+    """
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    db_path = tmp_path / "reapply.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess1",
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "new output"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
+        ],
+    )
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_skipped == 1  # the transcript itself was skipped
+    assert again.n_store_sessions_paired == 1
+    assert again.n_tool_calls_filled == 3
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, result_text FROM tool_calls "
+            "WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows[0] == ("2:1", "new output")
+
+
+def test_cursor_store_join_is_idempotent_on_rebuild(tmp_path: Path):
+    """A second build over unchanged bytes re-pairs and rewrites the same values."""
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    db_path = tmp_path / "idempotent.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_store_sessions_paired == 1
+    assert again.n_tool_calls_filled == 3
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT outcome, is_error, result_text FROM tool_calls "
+            "WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("ok", False, "/home/u/project"),
+        ("ok", False, "notes contents"),
+        ("error", True, '{"error":"boom"}'),
+    ]
+
+
+def test_duplicate_store_roots_count_sessions_not_files(tmp_path: Path):
+    """Two roots pointing at the same session pair once, not twice."""
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    _write_cursor_chat_meta(chats, "hash2", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats, "hash2", "sess1", STORE_RESULT_MESSAGES)
+    db_path = tmp_path / "dup_store.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+    assert result.n_tool_calls_filled == 3
+
+
+def test_a_store_with_no_transcript_session_creates_nothing(tmp_path: Path):
+    """A store whose session has no ingested transcript is not read and not counted."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / "sess1.jsonl", CURSOR_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", "sess1", NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats, "hash1", "ghost-session", STORE_RESULT_MESSAGES)
+    db_path = tmp_path / "ghost.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 0
+    assert result.n_tool_calls_filled == 0
+    connection = connect(db_path, read_only=True)
+    try:
+        assert scalar(connection, "SELECT count(*) FROM tool_calls") == 1
+    finally:
+        connection.close()
+
+
+def test_cli_build_reports_the_store_join(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """The CLI line reports sessions paired / skipped and tool calls filled."""
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    db_path = tmp_path / "cli_store.duckdb"
+    assert (
+        main(
+            [
+                "build",
+                "--cursor-source",
+                str(transcript_dir),
+                "--cursor-chats-source",
+                str(chats),
+                "--db",
+                str(db_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "store results: 1 sessions paired, 0 skipped (count mismatch), 0 skipped (name mismatch), 3 tool calls filled" in out
+def test_tool_use_order_key_sorts_block_indices_numerically():
+    """Ingestion order is (seq, block_index) numeric -- never lexicographic.
+
+    A transcript line that issued ten or more calls produces ids like
+    ``3:10``; lexicographic order would put ``3:10`` before ``3:2`` and
+    mispair a store whose calls come in numeric order.
+    """
+    from ashiato.build import _tool_use_order_key
+
+    ids = ["3:10", "3:2", "2:1", "10:0", "3:1"]
+    assert sorted(ids, key=_tool_use_order_key) == ["2:1", "3:1", "3:2", "3:10", "10:0"]
+    # A non-conforming id must not raise -- it sorts first, harmlessly.
+    assert _tool_use_order_key("nope") == (0, 0)
+def test_cursor_store_call_without_a_result_keeps_null_outcome(tmp_path: Path):
+    """Criterion 4 (finding 2): a paired call with no tool-result keeps NULLs.
+
+    The session still pairs (counts and names match), but the middle call has
+    no matching ``tool-result`` part -- the store never recorded its outcome.
+    Unknown is not success: that row must keep NULL outcome / is_error /
+    result_text, asserted on the built database, while the calls that do have
+    results are classified exactly as before.  The without-result calls are
+    counted separately (``n_store_calls_without_result``) and fill nothing.
+    """
+    transcript_dir, chats = _write_paired_session(tmp_path)
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess1",
+        [
+            _store_message([{"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u/project"}]),
+            # call-2 Read has NO tool-result part anywhere in the store.
+            _store_message([{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}]),
+            _store_message([{"type": "tool-call", "toolCallId": "call-3", "toolName": "recall", "args": {"query": "denial_pattern_x9", "top_k": 10}}]),
+            _store_message([{"type": "tool-result", "toolCallId": "call-3", "result": {"error": "boom"}}]),
+        ],
+    )
+    db_path = tmp_path / "no_result.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+    assert result.n_tool_calls_filled == 2
+    assert result.n_store_calls_without_result == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT tool_use_id, outcome, is_error, result_text, result_truncated "
+            "FROM tool_calls WHERE session_id = 'sess1' ORDER BY seq, tool_use_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("2:1", "ok", False, "/home/u/project", False),
+        ("3:0", None, None, None, None),  # no result part -> fate unknown
+        ("4:0", "error", True, '{"error":"boom"}', False),
+    ]

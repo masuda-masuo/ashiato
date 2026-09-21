@@ -206,7 +206,16 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: ``updatedAtMs``.  The same Cursor source bytes yield different rows than
 #: version 14 (which left all three ``cwd`` columns and the session times
 #: NULL), so existing databases must be rebuilt.
-FORMAT_VERSION = 15
+#: Version 16 = Cursor tool results now come from the undocumented
+#: ``~/.cursor/chats/<workspace-hash>/<session-uuid>/store.db`` when
+#: ``--cursor-chats-source`` is given (issue #87): a session whose store
+#: pairs with its transcript (same tool-call count, elementwise-equal tool
+#: names) has ``outcome`` / ``is_error`` / ``result_text`` /
+#: ``result_truncated`` filled from the raw ``result`` of each call's
+#: ``tool-result`` part.  The same Cursor source bytes yield rows where
+#: version 15 left all four columns NULL, so existing databases must be
+#: rebuilt.
+FORMAT_VERSION = 16
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental
