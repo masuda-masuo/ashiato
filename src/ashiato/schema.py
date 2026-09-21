@@ -215,7 +215,18 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: ``tool-result`` part.  The same Cursor source bytes yield rows where
 #: version 15 left all four columns NULL, so existing databases must be
 #: rebuilt.
-FORMAT_VERSION = 16
+#: Version 17 = for a session whose ``store.db`` pairs with its transcript,
+#: the Cursor ``events`` rows are now *replaced* by store-derived ones
+#: (issue #87 stage 3): the system / user / assistant messages of the store
+#: become one ``events`` row per ``text`` / ``reasoning`` /
+#: ``redacted-reasoning`` part, carrying the real ``role`` (NULL on the
+#: transcript rows), the system prompt the transcript never had, and the
+#: reasoning; ``seq`` / ``block_index`` become the store message index /
+#: part index and ``event_id`` becomes ``cursor:store:{file_path}:{seq}:
+#: {block_index}``.  The same Cursor source bytes yield rows where version
+#: 16 kept the role-less transcript text chunks, so existing databases must
+#: be rebuilt.
+FORMAT_VERSION = 17
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it
 #: has no ``file_path`` column, so it must not join the per-file incremental

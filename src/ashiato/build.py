@@ -169,6 +169,17 @@ class BuildResult:
     #: The store never paired them with a result, so their fate is unknown --
     #: unknown is not success (issue #87 finding 2).
     n_store_calls_without_result: int = 0
+    #: The ``--cursor-chats-source`` store.db conversation join (issue #87
+    #: stage 3): how many messages and how many ``content`` parts were read
+    #: from the stores of sessions that were read at all (paired or not), and
+    #: how many of those parts carried a part type this build does not
+    #: recognise -- ``text`` / ``reasoning`` / ``redacted-reasoning`` become
+    #: ``events`` rows and ``tool-call`` / ``tool-result`` are stage 2's, so
+    #: anything else is counted here, never dropped silently.  All zero when
+    #: no chats source was given.
+    n_store_messages_read: int = 0
+    n_store_parts_read: int = 0
+    n_store_parts_unclassified: int = 0
     missing_sources: list[str] = field(default_factory=list)
     unreadable_files: list[str] = field(default_factory=list)
     failed_files: list[str] = field(default_factory=list)
@@ -934,8 +945,109 @@ def _insert_opencode_parsed(
     )
 
 
+#: Part types of a Cursor store message that become ``events`` rows, and
+#: the event ``type`` spelling each maps to -- the same vocabulary the Codex
+#: path uses, not a second one (issue #87 stage 3).
+CURSOR_STORE_EVENT_PART_TYPES: dict[str, str] = {
+    "text": "text",
+    "reasoning": "reasoning",
+    "redacted-reasoning": "redacted_reasoning",
+}
+
+#: The part types the build recognises at all.  ``tool-call`` /
+#: ``tool-result`` are stage 2's -- they fill ``tool_calls``, never
+#: ``events`` -- and the three event types map through
+#: :data:`CURSOR_STORE_EVENT_PART_TYPES`.  A part whose type is outside this
+#: set is counted as unclassified (``n_store_parts_unclassified``), never
+#: dropped silently.
+CURSOR_STORE_KNOWN_PART_TYPES: frozenset[str] = frozenset(
+    ("text", "reasoning", "redacted-reasoning", "tool-call", "tool-result")
+)
+
+
+def _cursor_store_part_to_event(
+    message: object,
+    part: object,
+    *,
+    session_id: str,
+    file_path: str,
+    cwd: str | None,
+    block_index: int,
+) -> tuple[object, ...]:
+    """Map one store ``text`` / ``reasoning`` / ``redacted-reasoning`` part to an ``Event`` row.
+
+    ``event_id`` is ``cursor:store:{file_path}:{seq}:{block_index}`` --
+    deterministic (a rebuild over the same store rewrites the same rows) and
+    distinct within a session because it is derived from the session and the
+    *position*, never from the store message's ``id``: measured on the real
+    corpus, 4,649 of 24,913 message ids duplicate another id in the same
+    session, so the message id cannot identify a row (issue #87 premise 4).
+    ``seq`` is the message's 0-based index among the store's JSON messages in
+    table order and ``block_index`` the part's 0-based index within the
+    message, so ordering is reconstructible without a timestamp; ``ts`` is
+    NULL -- the store carries no per-message timestamp (measured twice).
+
+    ``role`` is the message's role verbatim (``system`` / ``user`` /
+    ``assistant``).  ``text`` is the part's text; a ``redacted-reasoning``
+    part has none and reads NULL, never a placeholder.  ``is_meta`` is True
+    exactly for the ``system`` role -- the same rule the Codex path applies
+    to its ``developer`` role -- so the system prompt never joins the
+    exchange stream ``topics`` / ``grep`` / ``orphans`` read.  ``cwd`` is
+    the value stage 1 already set on the session.  ``raw`` holds the same
+    extracted part text, like every other Cursor event row.
+    """
+    from ashiato.cursor import CursorStoreMessage as _CSM
+    from ashiato.cursor import CursorStorePart as _CSP
+
+    assert isinstance(message, _CSM)
+    assert isinstance(part, _CSP)
+    event_type = (
+        CURSOR_STORE_EVENT_PART_TYPES.get(part.type) if isinstance(part.type, str) else None
+    )
+    assert event_type is not None
+    role = message.role
+    text = part.text if part.type != "redacted-reasoning" else None
+    return (
+        f"cursor:store:{file_path}:{message.message_index}:{block_index}",  # event_id
+        session_id,
+        file_path,
+        SOURCE_CURSOR,
+        message.message_index,  # seq -- 0-based message index in table order
+        None,                   # ts -- the store carries no per-message timestamp
+        event_type,
+        role,
+        None,                   # parent_uuid
+        None,                   # depth
+        None,                   # is_sidechain
+        role == "system",       # is_meta -- the Codex rule, applied to system
+        None,                   # permission_mode
+        None,                   # effort
+        None,                   # request_id
+        None,                   # message_id
+        None,                   # model
+        cwd,
+        None,                   # git_branch
+        text,
+        text,                   # raw -- the extracted part text, like the other sources
+    )
+
+
 def _cursor_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     """Map a ``CursorTextChunk`` to an ``Event``-shaped row for insertion.
+
+    This is the *transcript-derived* fallback row: it exists so a Cursor
+    session is visible in ``events`` even when no chats store is read.  Its
+    ``role`` is NULL because the transcript export records no role -- but the
+    text itself is not exclusively assistant text: the transcript's text
+    blocks mix user and assistant messages (measured on a 60-session sample,
+    373 of 558 store user texts and 1,255 of 1,335 store assistant texts
+    appear verbatim in the transcript), so these rows are text chunks with
+    ``role`` NULL, nothing more specific.  When ``--cursor-chats-source``
+    pairs the session with its ``store.db``, :func:`_apply_cursor_chat_stores`
+    deletes these rows and inserts store-derived ones that carry the real
+    ``role``, the system prompt and the reasoning (issue #87 stage 3) -- the
+    transcript rows and the store rows would otherwise duplicate nearly all
+    of the text.
 
     ``event_id`` is synthesised and file-path-scoped, the same way the
     opencode and Codex paths' are -- ``seq`` alone does not distinguish two
@@ -943,7 +1055,7 @@ def _cursor_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     id (the parser can emit several text chunks from one transcript line).
     ``ts`` is NULL: a Cursor transcript records no timestamp at all, and
     ``seq`` / ``block_index`` already order the blocks within a file.  Every
-    column Cursor has no value for -- ``role``, ``parent_uuid``, ``depth``,
+    column Cursor has no value for -- ``parent_uuid``, ``depth``,
     ``is_sidechain``, ``is_meta``, the permission/effort fields, ``model``,
     ``cwd``, ``git_branch`` -- is NULL, never a placeholder.
     """
@@ -1080,13 +1192,17 @@ def _insert_cursor_parsed(
 
     Unlike opencode, one file *is* one session: ``ParsedCursorFile`` carries a
     file-level ``session_id`` (the transcript file name's uuid stem), so one
-    ``sessions`` row per file, one ``events`` row per assistant text chunk,
+    ``sessions`` row per file, one ``events`` row per transcript text chunk
+    (``role`` NULL -- the export records no role; the transcript's text
+    blocks are a mix of user and assistant messages, issue #87 premise 1),
     and one ``tool_calls`` row per tool_use block, all with ``source =
-    'cursor'``.  ``ts`` stays NULL everywhere -- Cursor records no timestamp
-    at all -- and ``source_files.n_events`` / ``n_tool_calls`` reflect the
-    rows actually inserted, not a hardcoded zero.  The kaiba-ledger join
-    feeds ``recall_calls`` only: the main tables are built purely from what
-    the transcript records.
+    'cursor'``.  These ``events`` rows are the pre-store fallback: when
+    ``--cursor-chats-source`` pairs the session with its ``store.db``,
+    :func:`_apply_cursor_chat_stores` replaces them with store-derived rows
+    that carry the real ``role``, the system prompt and the reasoning.  The
+    kaiba-ledger join feeds ``recall_calls`` only: the main tables are built
+    purely from what the transcript records (until the store join replaces
+    the events).
     """
     session = Session(
         session_id=parsed.session_id,
@@ -1243,6 +1359,7 @@ def _apply_cursor_chat_stores(
     result: BuildResult,
     *,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
+    scratch: Path | None = None,
 ) -> None:
     """Join ``--cursor-chats-source`` ``store.db`` files onto the ingested Cursor calls.
 
@@ -1289,6 +1406,30 @@ def _apply_cursor_chat_stores(
     ``tool_use_id`` is never touched either: it is the transcript-derived
     ``seq:block_index`` identity documented in :func:`parse_file`, and the
     store has no id the transcript carries to replace it with.
+
+    Every store that is read contributes ``n_store_messages_read`` /
+    ``n_store_parts_read`` (paired or not), and a part whose type is not one
+    of the recognised five is counted in ``n_store_parts_unclassified`` --
+    counted, never dropped silently (issue #87 stage 3).
+
+    For a paired session the transcript-derived ``events`` rows are
+    *replaced*, not added to: the store's system / user / assistant messages
+    carry the roles, the system prompt and the reasoning the transcript rows
+    never had, and keeping both would duplicate nearly all of the text
+    (issue #87 premise 1 -- measured, 1,255 of 1,335 store assistant texts
+    appear verbatim in the transcript).  The new rows follow
+    :func:`_cursor_store_part_to_event`: one row per ``text`` / ``reasoning``
+    / ``redacted-reasoning`` part of every non-``tool`` message, in
+    conversation order, with ``seq`` = 0-based message index, ``block_index``
+    = part index, ``ts`` NULL, ``event_id`` derived from session + position,
+    ``cwd`` as stage 1 set it, ``is_meta`` True only for the ``system`` role.
+    ``sessions.n_events`` / ``source_files.n_events`` are updated to the
+    replaced row count so the recorded numbers stay truthful.  An unpaired
+    session keeps exactly the transcript-derived rows it had -- this join
+    never touches them.  A store that disappears between builds is not
+    un-applied: like a vanished meta (stage 1) it leaves the rows from the
+    last build in place, which is the same additive convention the result
+    columns follow.
     """
     ingested: dict[str, list[tuple[str, str | None]]] = {}
     rows = connection.execute(
@@ -1315,17 +1456,27 @@ def _apply_cursor_chat_stores(
         if not store_path.is_file():
             continue  # no store to read -- the same half-match the metas count as unmatched
         seen.add(session_id)
-        store_calls = parse_chat_store(store_path)
-        if len(store_calls) != len(session_calls):
+        conversation = parse_chat_store(store_path)
+        result.n_store_messages_read += len(conversation.messages)
+        result.n_store_parts_read += sum(
+            len(message.parts) for message in conversation.messages
+        )
+        result.n_store_parts_unclassified += sum(
+            1
+            for message in conversation.messages
+            for part in message.parts
+            if part.type not in CURSOR_STORE_KNOWN_PART_TYPES
+        )
+        if len(conversation) != len(session_calls):
             result.n_store_sessions_skipped_count += 1
             continue
         if any(
             store_call.tool_name != expected
-            for store_call, (_, expected) in zip(store_calls, session_calls, strict=True)
+            for store_call, (_, expected) in zip(conversation, session_calls, strict=True)
         ):
             result.n_store_sessions_skipped_name += 1
             continue
-        for store_call, (tool_use_id, _) in zip(store_calls, session_calls, strict=True):
+        for store_call, (tool_use_id, _) in zip(conversation, session_calls, strict=True):
             if not store_call.has_result:
                 # The store never paired this call with a tool-result part.
                 # Its fate is unknown: keep NULL outcome / is_error /
@@ -1344,9 +1495,46 @@ def _apply_cursor_chat_stores(
                 "WHERE tool_use_id = ? AND session_id = ? AND source = ?",
                 [outcome, is_error, text, truncated, tool_use_id, session_id, SOURCE_CURSOR],
             )
+        # issue #87 stage 3: the paired session's events are replaced by the
+        # store's conversation (roles, system prompt, reasoning) -- adding on
+        # top would duplicate nearly all of the text (premise 1).
+        session_row = connection.execute(
+            "SELECT file_path, cwd FROM sessions "
+            "WHERE session_id = ? AND source = ?",
+            [session_id, SOURCE_CURSOR],
+        ).fetchone()
+        if session_row is not None:
+            file_path, cwd = session_row
+            event_rows = [
+                _cursor_store_part_to_event(
+                    message,
+                    part,
+                    session_id=session_id,
+                    file_path=file_path,
+                    cwd=cwd,
+                    block_index=block_index,
+                )
+                for message in conversation.messages
+                if message.role != "tool"  # tool messages are stage 2's, never events
+                for block_index, part in enumerate(message.parts)
+                if part.type in CURSOR_STORE_EVENT_PART_TYPES
+            ]
+            connection.execute(
+                "DELETE FROM events WHERE session_id = ? AND source = ?",
+                [session_id, SOURCE_CURSOR],
+            )
+            _insert_rows(connection, "events", event_rows, scratch=scratch)
+            connection.execute(
+                "UPDATE sessions SET n_events = ? WHERE session_id = ? AND source = ?",
+                [len(event_rows), session_id, SOURCE_CURSOR],
+            )
+            connection.execute(
+                "UPDATE source_files SET n_events = ? WHERE file_path = ?",
+                [len(event_rows), file_path],
+            )
         paired_ids.add(session_id)
         result.n_tool_calls_filled += sum(
-            1 for call in store_calls if call.has_result
+            1 for call in conversation if call.has_result
         )
     result.n_store_sessions_paired = len(paired_ids)
 
@@ -1680,7 +1868,9 @@ def build(
     ``meta.json`` files under those roots fill ``cwd`` and the session times
     of the Cursor sessions that match, and the ``store.db`` files sitting
     next to them fill ``outcome`` / ``is_error`` / ``result_text`` /
-    ``result_truncated`` of those sessions' tool calls (see
+    ``result_truncated`` of those sessions' tool calls and *replace* the
+    ``events`` of a paired session with store-derived rows carrying the
+    roles, the system prompt and the reasoning (see
     :func:`_apply_cursor_chat_metas` and :func:`_apply_cursor_chat_stores`).
     Nothing is scanned for chat metas by default.
     """
@@ -1943,6 +2133,7 @@ def build(
                     cursor_chat_files,
                     result,
                     result_text_limit=result_text_limit,
+                    scratch=scratch,
                 )
     finally:
         connection.close()

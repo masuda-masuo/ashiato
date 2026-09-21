@@ -30,6 +30,7 @@ from ashiato.build import (
     iter_transcripts,
 )
 from ashiato.cli import main
+from ashiato.cursor import parse_chat_store
 from ashiato.opencode import OpenCodeToolCall, ParsedOpenCodeFile
 from ashiato.parser import EVENT_COLUMNS, SESSION_COLUMNS, TOOL_CALL_COLUMNS
 from ashiato.recall import (
@@ -5202,3 +5203,414 @@ def test_cursor_store_call_without_a_result_keeps_null_outcome(tmp_path: Path):
         ("3:0", None, None, None, None),  # no result part -> fate unknown
         ("4:0", "error", True, '{"error":"boom"}', False),
     ]
+
+
+# ---------------------------------------------------------------- cursor chat stores (issue #87 stage 3): events from the store
+
+
+def _store_chat_message(role: str, content: object, message_id: str | None = "msg") -> bytes:
+    """One JSON message blob with an explicit role; content is a part list or a bare string.
+
+    The real store writes the system prompt and the initial user_info
+    message as bare ``content`` strings, and message ``id`` is *not* unique
+    within a session (issue #87 premise 4) -- both shapes need fixtures.
+    """
+    record: dict = {"role": role, "content": content}
+    if message_id is not None:
+        record["id"] = message_id
+    return json.dumps(record).encode("utf-8")
+
+
+#: A chats ``store.db`` whose conversation matches ``STORE_TRANSCRIPT_LINES``:
+#: three tool calls (Bash, Read, CallMcpTool) plus the messages that make up
+#: the conversation -- the system prompt (a bare string, like the real
+#: store), a user text, an assistant turn with reasoning + text + a call, an
+#: assistant turn with a redacted reasoning + a call, and the tool results.
+#: Every message deliberately shares the same ``id`` so the fixtures exercise
+#: the premise-4 rule that ``event_id`` must never come from the message id.
+STAGE3_STORE_MESSAGES = [
+    _store_chat_message("system", "You are a coding assistant.", "same-id"),
+    _store_chat_message("user", [{"type": "text", "text": "What now?"}], "same-id"),
+    _store_chat_message(
+        "assistant",
+        [
+            {"type": "reasoning", "text": "thinking step one", "signature": "sig"},
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}},
+        ],
+        "same-id",
+    ),
+    _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u"}], "same-id"),
+    _store_chat_message(
+        "assistant",
+        [{"type": "tool-call", "toolCallId": "call-2", "toolName": "Read", "input": {"file_path": "notes.md"}}],
+        "same-id",
+    ),
+    _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-2", "result": "notes contents"}], "same-id"),
+    _store_chat_message(
+        "assistant",
+        [
+            {"type": "redacted-reasoning"},
+            {"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {"server": "kaiba", "toolName": "recall", "arguments": {"query": "q"}}},
+        ],
+        "same-id",
+    ),
+    _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-3", "result": "facts"}], "same-id"),
+]
+
+
+def _write_stage3_session(tmp_path: Path, *, session_id: str = "sess1") -> tuple[Path, Path]:
+    """A transcript of three calls plus a chats session whose store holds the conversation."""
+    transcript_dir = tmp_path / "cursor"
+    transcript_dir.mkdir()
+    _write_cursor_transcript(transcript_dir / f"{session_id}.jsonl", STORE_TRANSCRIPT_LINES)
+    chats = tmp_path / "chats"
+    _write_cursor_chat_meta(chats, "hash1", session_id, NORMAL_CHAT_META)
+    _write_cursor_chat_store(chats, "hash1", session_id, STAGE3_STORE_MESSAGES)
+    return transcript_dir, chats
+
+
+def test_cursor_store_events_carry_roles_system_prompt_and_reasoning(tmp_path: Path):
+    """Criteria 1+2: a paired session's events are the store's conversation.
+
+    System, user and assistant messages in conversation order with the real
+    role; reasoning parts as ``reasoning`` rows; the system prompt present
+    exactly once (the transcript never had it); ``is_meta`` True only for
+    the system role, like Codex's ``developer`` rule; ``cwd`` as stage 1 set
+    it.  ``seq`` is the 0-based message index and the part index rides in
+    the ``event_id`` (``...:seq:block``), the way the transcript rows encode
+    ``block_index`` -- the schema has no ``block_index`` column.  The store
+    message ids are all the same string -- the event_id never comes from
+    them (premise 4).
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "stage3.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, seq, type, role, text, is_meta, cwd "
+            "FROM events WHERE session_id = 'sess1'"
+        ).fetchall()
+    finally:
+        connection.close()
+    rows.sort(key=lambda row: _store_event_position(row[0]))
+    assert [(r[1], r[2], r[3], r[4], r[5]) for r in rows] == [
+        (0, "text", "system", "You are a coding assistant.", True),
+        (1, "text", "user", "What now?", False),
+        (2, "reasoning", "assistant", "thinking step one", False),
+        (2, "text", "assistant", "Let me check.", False),
+        (6, "redacted_reasoning", "assistant", None, False),
+    ]
+    assert all(r[6] == "/home/testuser/dev/projects/kairanban" for r in rows)  # stage 1's cwd
+    assert all(r[0].startswith(f"cursor:store:{(transcript_dir / 'sess1.jsonl').resolve()!s}") for r in rows)
+    # The system prompt is present exactly once (criterion 2).
+    assert sum(1 for r in rows if r[3] == "system") == 1
+
+
+def test_cursor_store_events_replace_without_duplicating_text(tmp_path: Path):
+    """Criterion 4: every store text part appears exactly once, no transcript row left.
+
+    The pre-store transcript row ("Let me check." via ``cursor:text:``) is
+    gone -- keeping it would duplicate the store's text (premise 1) -- and
+    the events row count equals the store's event-part count for the session.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "replace.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, text FROM events WHERE session_id = 'sess1'"
+        ).fetchall()
+        texts = [text for _, text in rows if text is not None]
+        count = len(rows)
+    finally:
+        connection.close()
+    assert count == 5
+    assert sorted(texts) == [
+        "Let me check.",
+        "What now?",
+        "You are a coding assistant.",
+        "thinking step one",
+    ]
+    assert all(not event_id.startswith("cursor:text:") for event_id, _ in rows)
+
+    # The row count equals the store's event-part count for the session.
+    store_path = chats / "hash1" / "sess1" / "store.db"
+    conversation = parse_chat_store(store_path)
+    expected = sum(
+        1
+        for message in conversation.messages
+        if message.role != "tool"
+        for part in message.parts
+        if part.type in ("text", "reasoning", "redacted-reasoning")
+    )
+    assert count == expected
+    assert result_events_count(db_path, "sess1") == expected
+
+
+def result_events_count(db_path: Path, session_id: str) -> int:
+    connection = connect(db_path, read_only=True)
+    try:
+        return connection.execute(
+            "SELECT count(*) FROM events WHERE session_id = ?", [session_id]
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+
+def _store_event_position(event_id: str) -> tuple[int, int]:
+    """(seq, block_index) of a store-derived event id ``cursor:store:...:seq:block``.
+
+    ``seq`` is the 0-based store message index (the ``events.seq`` column)
+    and the trailing number is the part index within the message -- the
+    schema has no ``block_index`` column, so the part index rides in the
+    ``event_id`` exactly the way the transcript rows encode it.
+    """
+    _, seq, block = event_id.rsplit(":", 2)
+    return int(seq), int(block)
+
+
+def test_cursor_store_duplicate_message_ids_still_yield_distinct_event_ids(tmp_path: Path):
+    """Criterion 5: every Cursor event_id is distinct within its session.
+
+    Every store message in the fixture carries the same ``id`` (premise 4:
+    4,649 of 24,913 real ids duplicate another id in the same session), so
+    an ``event_id`` derived from the message id would collide; the scheme
+    derives it from the session and the position instead.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "distinct.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    connection = connect(db_path, read_only=True)
+    try:
+        ids = connection.execute(
+            "SELECT event_id FROM events WHERE session_id = 'sess1'"
+        ).fetchall()
+    finally:
+        connection.close()
+    flat = [event_id for (event_id,) in ids]
+    assert len(flat) == len(set(flat))
+    assert len(flat) == 5
+
+
+def test_cursor_store_events_ts_null_and_no_tool_role_rows(tmp_path: Path):
+    """Criterion 6: ts stays NULL on every replaced row, and tool messages produce none."""
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "tsnull.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    connection = connect(db_path, read_only=True)
+    try:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE session_id = 'sess1' AND ts IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE session_id = 'sess1' AND role = 'tool'"
+            ).fetchone()[0]
+            == 0
+        )
+        # The store's three tool-result parts never became events either.
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE session_id = 'sess1' AND type = 'tool-result'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_unpaired_session_keeps_byte_identical_transcript_events(tmp_path: Path):
+    """Criterion 3: a session that fails the pairing check keeps today's events.
+
+    The store's second tool is named ``Write`` where the transcript says
+    ``Read``, so the name check refuses the session: its ``events`` stay the
+    transcript-derived rows -- ``role`` NULL, ``cursor:text:`` ids, the same
+    rows a build without the chats source would produce.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    wrong = [
+        _store_chat_message("system", "You are a coding assistant."),
+        _store_chat_message("user", [{"type": "text", "text": "What now?"}]),
+        _store_chat_message(
+            "assistant",
+            [
+                {"type": "reasoning", "text": "thinking step one"},
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool-call", "toolCallId": "call-1", "toolName": "Bash", "input": {"command": "pwd"}},
+            ],
+        ),
+        _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-1", "result": "/home/u"}]),
+        _store_chat_message(
+            "assistant",
+            [{"type": "tool-call", "toolCallId": "call-2", "toolName": "Write", "input": {"file_path": "notes.md"}}],
+        ),
+        _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-2", "result": "written"}]),
+        _store_chat_message(
+            "assistant",
+            [{"type": "tool-call", "toolCallId": "call-3", "toolName": "CallMcpTool", "args": {}}],
+        ),
+        _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "call-3", "result": "facts"}]),
+    ]
+    _write_cursor_chat_store(chats, "hash1", "sess1", wrong)
+    db_path = tmp_path / "unpaired.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 0
+    assert result.n_store_sessions_skipped_name == 1
+
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, seq, type, role, text FROM events WHERE session_id = 'sess1'"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [(
+        f"cursor:text:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:0",
+        2,
+        "text",
+        None,
+        "Let me check.",
+    )]
+
+
+def test_cursor_store_reports_messages_parts_and_unclassified(tmp_path: Path):
+    """Criterion 7: the build reports how many messages/parts it read and what it could not classify.
+
+    An unknown part type in a second paired session's store is counted
+    (``n_store_parts_unclassified``), never dropped silently, while the
+    session's events still replace normally.
+    """
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    _write_cursor_transcript(transcript_dir / "sess2.jsonl", STORE_TRANSCRIPT_LINES)
+    _write_cursor_chat_meta(chats, "hash1", "sess2", NORMAL_CHAT_META)
+    _write_cursor_chat_store(
+        chats,
+        "hash1",
+        "sess2",
+        [
+            _store_chat_message(
+                "assistant",
+                [
+                    {"type": "mystery", "text": "zz"},
+                    {"type": "tool-call", "toolCallId": "c1", "toolName": "Bash", "input": {}},
+                ],
+            ),
+            _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "c1", "result": "r"}]),
+            _store_chat_message("assistant", [{"type": "tool-call", "toolCallId": "c2", "toolName": "Read", "input": {}}]),
+            _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "c2", "result": "r"}]),
+            _store_chat_message(
+                "assistant", [{"type": "tool-call", "toolCallId": "c3", "toolName": "CallMcpTool", "args": {}}]
+            ),
+            _store_chat_message("tool", [{"type": "tool-result", "toolCallId": "c3", "result": "r"}]),
+        ],
+    )
+    db_path = tmp_path / "counts.duckdb"
+    result = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert result.n_store_sessions_paired == 2
+    # sess1: 8 messages, 11 parts, no unknown types; sess2: 6 messages, 7
+    # parts, one unknown type ("mystery").
+    assert result.n_store_messages_read == 14
+    assert result.n_store_parts_read == 18
+    assert result.n_store_parts_unclassified == 1
+    # The mystery part produced no event row, and the replacement still ran.
+    assert result_events_count(db_path, "sess2") == 0
+
+
+def test_cli_build_reports_store_conversation_counts(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """Criterion 7 surfaced: the CLI line reports the read/unclassified counts."""
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "cli_stage3.duckdb"
+    assert (
+        main(
+            [
+                "build",
+                "--cursor-source",
+                str(transcript_dir),
+                "--cursor-chats-source",
+                str(chats),
+                "--db",
+                str(db_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "8 messages read, 11 parts read, 0 parts unclassified" in out
+
+
+def test_cursor_store_events_replacement_is_idempotent_on_rebuild(tmp_path: Path):
+    """A second build over unchanged bytes rewrites the same events, no duplication."""
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "idem3.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    again = build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    assert again.n_store_sessions_paired == 1
+    assert result_events_count(db_path, "sess1") == 5
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, type, role, text FROM events WHERE session_id = 'sess1'"
+        ).fetchall()
+    finally:
+        connection.close()
+    rows.sort(key=lambda row: _store_event_position(row[0]))
+    assert [(r[0], r[1], r[2], r[3]) for r in rows] == [
+        (f"cursor:store:{(transcript_dir / 'sess1.jsonl').resolve()!s}:0:0", "text", "system", "You are a coding assistant."),
+        (f"cursor:store:{(transcript_dir / 'sess1.jsonl').resolve()!s}:1:0", "text", "user", "What now?"),
+        (f"cursor:store:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:0", "reasoning", "assistant", "thinking step one"),
+        (f"cursor:store:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:1", "text", "assistant", "Let me check."),
+        (f"cursor:store:{(transcript_dir / 'sess1.jsonl').resolve()!s}:6:0", "redacted_reasoning", "assistant", None),
+    ]
+
+
+def test_cursor_store_events_update_sessions_and_source_files_counts(tmp_path: Path):
+    """The replaced row count lands in sessions.n_events and source_files.n_events."""
+    transcript_dir, chats = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "counts3.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir], cursor_chats_sources=[chats])
+    connection = connect(db_path, read_only=True)
+    try:
+        n_events = connection.execute(
+            "SELECT n_events FROM sessions WHERE session_id = 'sess1'"
+        ).fetchone()[0]
+        assert n_events == 5
+        file_n_events = connection.execute(
+            "SELECT n_events FROM source_files"
+        ).fetchone()[0]
+        assert file_n_events == 5
+    finally:
+        connection.close()
+
+
+def test_cursor_store_events_without_chats_source_are_unchanged(tmp_path: Path):
+    """Criterion 8: a build without --cursor-chats-source is today's build.
+
+    The store exists on disk but is never read: the events are the
+    transcript-derived rows with ``role`` NULL.
+    """
+    transcript_dir, _ = _write_stage3_session(tmp_path)
+    db_path = tmp_path / "noflag3.duckdb"
+    build([], db_path, cursor_sources=[transcript_dir])
+    connection = connect(db_path, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, seq, type, role, text FROM events WHERE session_id = 'sess1'"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [(
+        f"cursor:text:{(transcript_dir / 'sess1.jsonl').resolve()!s}:2:0",
+        2,
+        "text",
+        None,
+        "Let me check.",
+    )]

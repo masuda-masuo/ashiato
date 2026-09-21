@@ -816,7 +816,10 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
             f"store results: {result.n_store_sessions_paired} sessions paired, "
             f"{result.n_store_sessions_skipped_count} skipped (count mismatch), "
             f"{result.n_store_sessions_skipped_name} skipped (name mismatch), "
-            f"{result.n_tool_calls_filled} tool calls filled",
+            f"{result.n_tool_calls_filled} tool calls filled, "
+            f"{result.n_store_messages_read} messages read, "
+            f"{result.n_store_parts_read} parts read, "
+            f"{result.n_store_parts_unclassified} parts unclassified",
             file=out,
         )
     print(
