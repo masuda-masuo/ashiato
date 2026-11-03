@@ -18,9 +18,9 @@ import duckdb
 from ashiato.build import SchemaOutOfDate, assert_readable, connect
 from ashiato.orphans import (
     collect_sessions,
+    human_prose,
     is_compaction_summary,
     is_headless,
-    strip_harness,
     tokenize,
 )
 from ashiato.pending import GH_TIMEOUT_SECONDS, _gh_api
@@ -114,7 +114,7 @@ def human_text_rows(connection: duckdb.DuckDBPyConnection) -> Iterator[dict[str,
     for file_path, session_id, source, started, entrypoint, ts, text, raw in _fetchmany(cursor):
         if is_headless(entrypoint) or is_compaction_summary(raw):
             continue
-        prose = strip_harness(text or "").strip()
+        prose = human_prose(text, source)
         when = _utc_naive(ts) or _utc_naive(started)
         if not prose or when is None:
             continue
@@ -534,7 +534,9 @@ def render_text(report: dict[str, Any], out: Any) -> None:
         for repo_name, items in sorted(repos.items()):
             groups = []
             for kind in ("pr", "issue"):
-                values = [x for x in items if x["kind"] == kind]
+                values = sorted(
+                    (x for x in items if x["kind"] == kind), key=lambda item: item["number"]
+                )
                 if values:
                     nums = ", ".join(f"#{x['number']}" for x in values)
                     groups.append(f"{len(values)} {kind} ({nums})")

@@ -129,9 +129,60 @@ _UUID_RE = re.compile(
 _ALNUM_ID_RE = re.compile(r"^[a-z0-9]+$")
 
 
+CURSOR_CONTEXT_TAGS = (
+    "user_info",
+    "rules",
+    "agent_skills",
+    "agent_transcripts",
+    "timestamp",
+    "attached_files",
+    "manually_attached_skills",
+    "cursor_commands",
+    "system_reminder",
+)
+CODEX_CONTEXT_TAGS = (
+    "environment_context",
+    "recommended_plugins",
+    "codex_internal_context",
+)
+_USER_QUERY_RE = re.compile(
+    r"<user_query(?:\s[^>]*)?>((?:(?!<user_query(?:\s|>)).)*?)</user_query>", re.DOTALL
+)
+
+
+def _remove_complete_blocks(text: str, tags: tuple[str, ...]) -> str:
+    """Remove complete, optionally attributed context blocks for *tags*."""
+    for tag in tags:
+        block_re = re.compile(
+            rf"<{re.escape(tag)}(?:\s[^>]*)?>"  # opener
+            rf"(?:(?!<{re.escape(tag)}(?:\s|>)).)*?"  # no nested same-tag opener
+            rf"</{re.escape(tag)}>",
+            re.DOTALL,
+        )
+        text = block_re.sub("", text)
+    return text
+
+
 def strip_harness(text: str) -> str:
     """*text* without the harness wrapper blocks."""
     return _HARNESS_BLOCK_RE.sub("", text)
+
+
+def human_prose(text: str | None, source: str | None) -> str:
+    """Return one user row's human-authored prose for its recorded source."""
+    if text is None:
+        return ""
+    prose = strip_harness(text)
+    if source == "cursor":
+        queries = _USER_QUERY_RE.findall(prose)
+        if queries:
+            return "\n".join(
+                cleaned for query in queries if (cleaned := strip_harness(query).strip())
+            )
+        return _remove_complete_blocks(prose, CURSOR_CONTEXT_TAGS).strip()
+    if source == "codex":
+        return _remove_complete_blocks(prose, CODEX_CONTEXT_TAGS).strip()
+    return prose.strip()
 
 
 def tokenize(text: str) -> list[str]:
@@ -196,7 +247,8 @@ _EVENTS_QUERY = """
         s.entrypoint,
         e.role,
         e.text,
-        e.raw
+        e.raw,
+        s.source
     FROM events e
     JOIN sessions s ON e.file_path = s.file_path
     WHERE e.role IN ('user', 'assistant')
@@ -217,6 +269,7 @@ class SessionProse:
     project_dir: str | None
     n_tool_calls: int | None
     entrypoint: str | None = None
+    source: str | None = None
     human_chars: int = 0
     first_utterance: str = ""
     has_prose: bool = False
@@ -228,7 +281,7 @@ class SessionProse:
         if not text:
             return
         if role == "user":
-            prose = strip_harness(text).strip()
+            prose = human_prose(text, self.source)
             if not prose:
                 return
             self.human_chars += len(prose)
@@ -267,6 +320,7 @@ def collect_sessions(connection: duckdb.DuckDBPyConnection) -> list[SessionProse
         role,
         text,
         raw,
+        source,
     ) in _iter_rows(connection):
         if current is None or current.file_path != file_path:
             current = SessionProse(
@@ -276,6 +330,7 @@ def collect_sessions(connection: duckdb.DuckDBPyConnection) -> list[SessionProse
                 project_dir,
                 n_tool_calls,
                 entrypoint=entrypoint,
+                source=source,
             )
             sessions.append(current)
         # A compaction summary is a machine-written recap of earlier content,

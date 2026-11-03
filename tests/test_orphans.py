@@ -23,6 +23,7 @@ from ashiato.orphans import (
     collect_sessions,
     default_sink_dirs,
     find_orphans,
+    human_prose,
     is_compaction_summary,
     is_headless,
     load_sinks,
@@ -1622,4 +1623,74 @@ def test_update_reviewed_concurrent_writers_lose_no_marks(tmp_path: Path) -> Non
     assert {f"b-{i:03d}" for i in range(n)} <= ids
 
 
+# ---------------------------------------------------------------- source-aware human prose
 
+
+def test_human_prose_source_rules() -> None:
+    cursor = (
+        "<user_info>zorblax</user_info><rules>zorblax</rules>"
+        "<timestamp>zorblax</timestamp><user_query> alpha </user_query>"
+        "<user_query>beta</user_query>"
+    )
+    assert human_prose(cursor, "cursor") == "alpha\nbeta"
+    assert human_prose(
+        "<user_info>zorblax</user_info><rules>zorblax</rules>"
+        "<agent_skills>x</agent_skills><agent_transcripts>x</agent_transcripts>"
+        "<timestamp>x</timestamp><attached_files>x</attached_files>"
+        "<manually_attached_skills>x</manually_attached_skills>"
+        "<cursor_commands>x</cursor_commands><system_reminder>x</system_reminder>"
+        "keep this",
+        "cursor",
+    ) == "keep this"
+    assert human_prose(
+        "<environment_context>zorblax</environment_context>"
+        "<recommended_plugins>zorblax</recommended_plugins>"
+        "<codex_internal_context>x</codex_internal_context>keep this",
+        "codex",
+    ) == "keep this"
+    assert human_prose("<rules>keep</rules> hi", "claude_code") == "<rules>keep</rules> hi"
+    assert human_prose("<rules>open only", "cursor") == "<rules>open only"
+    assert human_prose(
+        "<user_query>keep <system-reminder>drop</system-reminder> words</user_query>",
+        "cursor",
+    ) == "keep  words"
+    assert human_prose("<environment_context>stay</environment_context>", None) == (
+        "<environment_context>stay</environment_context>"
+    )
+    assert human_prose(None, "cursor") == ""
+
+
+def test_human_prose_unclosed_same_tag_openers() -> None:
+    assert (
+        human_prose("<rules>my own text <rules>inj</rules> tail", "cursor")
+        == "<rules>my own text  tail"
+    )
+    assert (
+        human_prose("<user_query>draft <user_query>real</user_query>", "cursor")
+        == "real"
+    )
+    assert (
+        human_prose(
+            "<environment_context>mine <environment_context>E</environment_context> go",
+            "codex",
+        )
+        == "<environment_context>mine  go"
+    )
+
+
+def test_collect_sessions_uses_cursor_user_queries(tmp_path: Path) -> None:
+    db = make_db(
+        tmp_path,
+        [("ses-cursor", "2026-08-01", [human(
+            "<user_info>zorblax</user_info><user_query>unique query words</user_query>"
+        )])],
+    )
+    connection = connect(db)
+    try:
+        connection.execute("UPDATE sessions SET source = 'cursor'")
+        session = collect_sessions(connection)[0]
+        assert session.human_chars == len("unique query words")
+        assert "zorblax" not in session.terms
+        assert "unique" in session.terms
+    finally:
+        connection.close()
