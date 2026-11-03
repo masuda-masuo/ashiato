@@ -58,7 +58,7 @@ ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min
 ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--mark-reviewed ID]... [--unmark-reviewed ID]... [--reviewed-file PATH] [--show-reviewed] [--json]
 ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]... [--model NAME] [--json]
 ashiato pending [--db PATH] [--gh] [--owner NAME] [--repo OWNER/NAME] [--all-summaries] [--since TS] [--until TS] [--show-resolved] [--json]
-ashiato review [--db PATH] [--since TS] [--until TS] [--bucket week|month] [--tz NAME] [--themes N] [--gh] [--json]
+ashiato review [--db PATH] [--since TS] [--until TS] [--bucket week|month] [--tz NAME] [--themes N] [--owner NAME]... [--gh] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato topics SESSION_PREFIX [--db PATH] [--window N] [--terms N] [--json]
@@ -305,12 +305,19 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   - **Outputs** are GitHub PR / issue URLs (`github.com/<owner>/<repo>/(pull|issues)/<n>`)
     and Google Drive document URLs (`docs.google.com/(document|spreadsheets|presentation)/d/<id>`)
     found in `tool_calls.result_text` of every source, headless sessions included. There is
-    no list of "producing" tools: every source writes through different tools.
+    no list of "producing" tools: every source writes through different tools. GitHub outputs
+    are limited to the given owners' repositories (`--owner NAME`, repeatable and
+    case-insensitive). By default, the owner with the most distinct issue/PR keys in the
+    corpus is selected and printed in the header. URLs for other owners are counted only as
+    `references` and are never looked up with `--gh`, because an issue in another owner's
+    repository first appears when it is read.
   - **First appearance is creation.** A URL belongs to the session, source and time of its
     first appearance in the whole corpus (ties broken by `tool_use_id`), because nothing can
     be read before it exists; every later appearance is a reference, not an output. Calls
-    whose `ts` is NULL cannot be ordered: a URL seen only in such calls is counted as
-    `undated` (by source, report-wide) and never claimed as an output.
+    whose `ts` is NULL cannot be ordered: owner GitHub keys and Drive keys seen only in such
+    calls are counted as `undated` (by source, report-wide) and never claimed as outputs.
+  - **Sessions** are counted by `session_id` per source; one Claude Code session can span
+    several files. When a session id is NULL, its file path identifies that session.
   - **One output per GitHub number.** Issues and PRs share one number space, so `/issues/7`
     and `/pull/7` are the same output; the key is `(owner, repo, number)` with owner and repo
     lowercased, and anything after the number (`#issuecomment-...`, `/files`, a query
@@ -344,7 +351,9 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   - Known limits: outputs created outside the corpus (in the GitHub web UI, or by a tool
     ashiato does not ingest) appear late or not at all -- `--gh` catches the late ones as
     `outside`; `undated` sources (Cursor calls carry no `ts`) are counted, never ordered;
-    Drive outputs cannot be verified; the stripping is deliberately narrow, so uppercase
+    Drive outputs can be neither limited by owner nor verified, so an existing document first
+    seen in a search or read result is also counted as an output (Drive outputs are always
+    `unchecked`, which keeps them apart); the stripping is deliberately narrow, so uppercase
     `OK` and path fragments such as `bin` / `lib` survive into themes; and kanji runs are not
     segmented (a tokenizer limit shared with `orphans` and `topics`).
 

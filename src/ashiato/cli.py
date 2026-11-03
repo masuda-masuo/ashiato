@@ -469,6 +469,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="IANA time zone (default local)",
     )
+    review_parser.add_argument(
+        "--owner", action="append", help="GitHub owner to include (repeatable)"
+    )
     review_parser.add_argument("--gh", action="store_true", help="check GitHub outputs with gh api")
     review_parser.add_argument(
         "--themes",
@@ -1687,6 +1690,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tz=args.tz,
             gh=args.gh,
             themes=args.themes,
+            owners=args.owner,
             json_output=args.json_output,
             out=out,
             err=err,

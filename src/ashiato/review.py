@@ -186,7 +186,10 @@ def _parse_created(value: Any) -> datetime | None:
 
 def _extract_outputs(
     connection: duckdb.DuckDBPyConnection,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    owners: Sequence[str] | None,
+    since: datetime | None,
+    until: datetime | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], list[str], bool]:
     cursor = connection.execute("""
         SELECT tool_use_id, session_id, file_path, source, ts, result_text
         FROM tool_calls
@@ -222,9 +225,26 @@ def _extract_outputs(
             entry = {**call, "drive_type": match.group("kind").lower(), "doc_id": match.group("id")}
             (undated_calls if ts is None else dated)[key].append(entry)
 
+    inferred = owners is None
+    if inferred:
+        distinct_keys: set[tuple[str, str, int]] = set()
+        for key in (*dated.keys(), *undated_calls.keys()):
+            if key[0] == "github":
+                distinct_keys.add((key[1], key[2], key[3]))
+        counts = Counter(owner for owner, _repo, _number in distinct_keys)
+        selected_owners = [min(counts, key=lambda owner: (-counts[owner], owner))] if counts else []
+    else:
+        selected_owners = sorted({owner.lower() for owner in owners})
+
+    allowed = set(selected_owners)
     outputs: list[dict[str, Any]] = []
+    references_by_source: Counter[str] = Counter()
     for key, appearances in dated.items():
         first = min(appearances, key=lambda x: (x["ts"], x["tool_use_id"]))
+        if key[0] == "github" and key[1] not in allowed:
+            if _in_window(first["ts"], since, until):
+                references_by_source[first["source"] or "unknown"] += 1
+            continue
         if key[0] == "github":
             is_pr = any(row["is_pr_ref"] for row in [*appearances, *undated_calls.get(key, [])])
             kind = "pr" if is_pr else "issue"
@@ -250,19 +270,26 @@ def _extract_outputs(
             }
         outputs.append(output)
 
-    undated_sources: dict[str, int] = defaultdict(int)
+    undated_sources: Counter[str] = Counter()
     for key, appearances in undated_calls.items():
         if key in dated:
             continue
         first = min(appearances, key=lambda x: x["tool_use_id"])
-        undated_sources[first["source"] or "unknown"] += 1
+        source = first["source"] or "unknown"
+        if key[0] == "github" and key[1] not in allowed:
+            references_by_source[source] += 1
+        else:
+            undated_sources[source] += 1
     outputs.sort(key=lambda out: (out["first_seen"], out["url"], out["tool_use_id"]))
     for output in outputs:
         output.pop("tool_use_id", None)
     return outputs, {
         "count": sum(undated_sources.values()),
         "by_source": dict(sorted(undated_sources.items())),
-    }
+    }, {
+        "count": sum(references_by_source.values()),
+        "by_source": dict(sorted(references_by_source.items())),
+    }, selected_owners, inferred
 
 
 def _first_fields(first: dict[str, Any]) -> dict[str, Any]:
@@ -284,6 +311,7 @@ def build_report(
     tz: Any | None = None,
     gh: bool = False,
     themes: int = 10,
+    owners: Sequence[str] | None = None,
     gh_call: Callable[[Sequence[str]], tuple[bool, Any, str]] | None = None,
 ) -> dict[str, Any]:
     """Derive the complete report without printing or parsing command-line arguments."""
@@ -301,20 +329,48 @@ def build_report(
         FROM sessions
     """).fetchall()
     dated_items: list[datetime] = []
-    session_rows = []
+    grouped_sessions: dict[tuple[str, str], dict[str, Any]] = {}
     for file_path, session_id, source, started, entrypoint in sessions:
+        source_name = source or "unknown"
+        session_key = (source_name, session_id if session_id is not None else file_path)
         when = _utc_naive(started)
+        current = grouped_sessions.get(session_key)
+        if current is None:
+            grouped_sessions[session_key] = {
+                "file_path": file_path,
+                "session_id": session_id,
+                "source": source_name,
+                "when": when,
+                "non_headless": not is_headless(entrypoint),
+            }
+        else:
+            if when is not None and (current["when"] is None or when < current["when"]):
+                current["when"] = when
+                current["file_path"] = file_path
+                current["session_id"] = session_id
+            current["non_headless"] = current["non_headless"] or not is_headless(entrypoint)
+    session_rows = []
+    for session in grouped_sessions.values():
+        when = session["when"]
         if when is None or not _in_window(when, since, until):
             continue
         dated_items.append(when)
         session_rows.append(
-            (file_path, session_id, source or "unknown", when, not is_headless(entrypoint))
+            (
+                session["file_path"],
+                session["session_id"],
+                session["source"],
+                when,
+                session["non_headless"],
+            )
         )
 
     text_rows = [row for row in human_text_rows(connection) if _in_window(row["ts"], since, until)]
     idf = _idf(collect_sessions(connection)) if themes else {}
     dated_items.extend(row["ts"] for row in text_rows)
-    outputs, undated = _extract_outputs(connection)
+    outputs, undated, references, report_owners, owners_inferred = _extract_outputs(
+        connection, owners, since, until
+    )
     outputs = [item for item in outputs if _in_window(item["first_seen"], since, until)]
     dated_items.extend(item["first_seen"] for item in outputs)
 
@@ -417,6 +473,9 @@ def build_report(
         "since": since.isoformat() if since else None,
         "until": until.isoformat() if until else None,
         "gh": gh,
+        "owners": report_owners,
+        "owners_inferred": owners_inferred,
+        "references": references,
         "undated": undated,
         "buckets": list(by_label.values()),
     }
@@ -437,6 +496,22 @@ def render_text(report: dict[str, Any], out: Any) -> None:
     undated = report["undated"]
     sources = (
         ", ".join(f"{source}={count}" for source, count in undated["by_source"].items()) or "none"
+    )
+    print(
+        f"owners: {', '.join(report['owners']) or 'none'} "
+        f"({'inferred' if report['owners_inferred'] else 'given'})",
+        file=out,
+    )
+    references = report["references"]
+    reference_sources = (
+        ", ".join(
+            f"{source}={count}" for source, count in references["by_source"].items()
+        )
+        or "none"
+    )
+    print(
+        f"references: {references['count']} ({reference_sources})",
+        file=out,
     )
     print(f"undated outputs: {undated['count']} ({sources})", file=out)
     for bucket in report["buckets"]:
@@ -486,6 +561,7 @@ def run(
     out: Any,
     err: Any,
     themes: int = 10,
+    owners: Sequence[str] | None = None,
     gh_call: Callable[[Sequence[str]], tuple[bool, Any, str]] | None = None,
 ) -> int:
     """Open the database read-only, derive and render the review report."""
@@ -503,6 +579,7 @@ def run(
             tz=tz,
             gh=gh,
             themes=themes,
+            owners=owners,
             gh_call=gh_call,
         )
     except (SchemaOutOfDate, duckdb.Error, ValueError) as error:
