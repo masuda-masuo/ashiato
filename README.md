@@ -605,10 +605,14 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   needs to write) is never blocked by the dashboard. **During a rebuild** -- or when the
   database is missing or out of date -- pages answer `503` (`Retry-After: 30`) saying the
   database is being rebuilt, and the server keeps running; an unexpected error in a page is
-  a `500` naming the error, and the server keeps running too. The slow analyses
+  a `500` naming the error, and the server keeps running too. `/healthz` is a cheap health
+  check that opens the database read-only and returns `200 ok` or `503` with
+  `Retry-After: 30`; it is loopback Host only and supports GET and HEAD. The slow analyses
   (`orphans`, `memory-authors`) are cached per page, keyed by the database file's
-  modification time and size, and recomputed when either changes; the freshness banner is
-  not cached, since it compares the transcript directories against the database. `--port`
+  modification time and size, and recomputed when either changes. The overview's database
+  summary, including the freshness banner, is cached for 60 seconds keyed by the database
+  file's modification time and size, and computed once at a time; concurrent requests wait
+  for and share the one running walk. `--port`
   defaults to `8772` (`0` picks a free port); the URL is printed on start. `--sink PATH`
   (repeatable), `--no-default-sinks` and `--reviewed-file PATH` are passed to the orphans
   page exactly as

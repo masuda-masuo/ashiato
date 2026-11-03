@@ -30,15 +30,17 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 
 from ashiato import serve
-from ashiato.build import build
+from ashiato.build import build, database_info
 from ashiato.cli import main
 
 PAD = "we were talking through the general shape of things together and going back and forth. "
@@ -223,6 +225,30 @@ def served(fixture: Fixture) -> Iterator[Served]:
         thread.join(10)
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+@pytest.fixture
+def served_with_clock(fixture: Fixture) -> Iterator[tuple[Served, FakeClock]]:
+    clock = FakeClock()
+    server = serve.make_server(
+        fixture.db, port=0, default_sinks=False, memory_dirs=[fixture.memory_dir], clock=clock
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield Served(server), clock
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(10)
+
+
 def _cli_json(*args: str, capsys: pytest.CaptureFixture[str]) -> Any:
     code = main(list(args))
     captured = capsys.readouterr()
@@ -260,17 +286,124 @@ def test_overview_shows_counts_freshness_and_tiles(served: Served) -> None:
     assert 'href="/session/sess-alpha"' in reply.body  # the densest candidate
 
 
-def test_overview_marks_a_stale_database_and_reads_freshness_live(
-    served: Served, fixture: Fixture
+def test_overview_caches_freshness_until_timeout_or_database_change(
+    served_with_clock: tuple[Served, FakeClock], fixture: Fixture
 ) -> None:
+    served, clock = served_with_clock
     assert 'data-freshness="current"' in served.get("/").body
     extra = _transcript("sess-new", "2026-03-04", [("user", "a brand new session")])
     (fixture.transcripts / "sess-new.jsonl").write_text(extra, encoding="utf-8")
+
+    body = served.get("/").body
+    assert 'data-freshness="current"' in body
+    clock.value += 60
     body = served.get("/").body
     assert 'data-freshness="stale"' in body
     assert "1 new or changed file under recorded roots" in body
     assert served.get("/api/overview.json").json()["freshness"] == {"state": "stale", "gap": 1}
 
+
+
+def test_database_info_cache_is_single_flight_and_expires_on_clock_or_stamp(
+    served_with_clock: tuple[Served, FakeClock],
+    fixture: Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served, clock = served_with_clock
+    calls = 0
+    calls_lock = threading.Lock()
+    real = database_info
+
+    def sleeping_info(path: Path) -> Any:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.5)
+        return real(path)
+
+    monkeypatch.setattr(serve, "database_info", sleeping_info)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        replies = list(pool.map(lambda _: served.get("/"), range(10)))
+    assert all(reply.status == 200 for reply in replies)
+    assert calls == 1
+
+    assert served.get("/").status == 200
+    assert calls == 1
+    clock.value += 60
+    assert served.get("/").status == 200
+    assert calls == 2
+
+    stat = fixture.db.stat()
+    os.utime(fixture.db, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    assert served.get("/").status == 200
+    assert calls == 3
+
+
+def test_healthz_stays_responsive_while_overview_info_is_blocked(
+    served_with_clock: tuple[Served, FakeClock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served, _ = served_with_clock
+    entered = threading.Event()
+    release = threading.Event()
+    real = database_info
+
+    def blocked_info(path: Path) -> Any:
+        entered.set()
+        if not release.wait(timeout=10):
+            raise TimeoutError("test did not release database_info")
+        return real(path)
+
+    monkeypatch.setattr(serve, "database_info", blocked_info)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        overview = pool.submit(served.get, "/")
+        assert entered.wait(timeout=5)
+        started = time.monotonic()
+        health = served.get("/healthz")
+        elapsed = time.monotonic() - started
+        assert not overview.done()
+        time.sleep(max(0.0, 3.0 - (time.monotonic() - started)))
+        release.set()
+        assert overview.result(timeout=10).status == 200
+
+    assert health.status == 200
+    assert health.body == "ok\n"
+    assert elapsed < 1
+
+
+def test_healthz_checks_only_database_probe(
+    served: Served, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("healthz reached an analysis")
+
+    monkeypatch.setattr(serve, "database_info", unexpected)
+    monkeypatch.setattr(serve, "find_orphans", unexpected)
+    reply = served.get("/healthz")
+    assert reply.status == 200
+    assert reply.headers["content-type"] == "text/plain; charset=utf-8"
+    assert reply.body == "ok\n"
+
+
+def test_healthz_missing_database_host_and_head(fixture: Fixture) -> None:
+    app = serve.App(serve.Dashboard(fixture.db.parent / "missing.duckdb", default_sinks=False))
+    missing = app.handle("/healthz", host_header="127.0.0.1")
+    assert missing.status == 503
+    assert dict(missing.headers)["Retry-After"] == "30"
+
+    served_app = serve.App(serve.Dashboard(fixture.db, default_sinks=False))
+    assert served_app.handle("/healthz", host_header="evil.example").status == 403
+    server = serve.make_server(fixture.db, port=0, default_sinks=False)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        reply = Served(server).get("/healthz", method="HEAD")
+        assert reply.status == 200
+        assert reply.body == ""
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(10)
 
 def test_orphans_page_lists_the_candidate(served: Served) -> None:
     reply = served.get("/orphans")
