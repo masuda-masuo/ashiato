@@ -29,6 +29,14 @@ KNOWN_BLOCKS = {
     "document",
 }
 SKIPPED_BLOCKS = {"token_budget", "flag", "image", "document"}
+#: Meta blocks and the field their text is read from (measured on a real
+#: export: ``injected_prompt_block`` has no ``text``, its text is ``prompt``).
+_TEXT_FIELD = {"injected_prompt_block": "prompt", "thinking": "thinking"}
+
+
+def _has_text(block: dict[str, Any], key: str) -> bool:
+    value = block.get(key)
+    return isinstance(value, str) and bool(value)
 
 
 @dataclass(slots=True)
@@ -97,6 +105,10 @@ def parse_export(path: str | Path) -> ParsedClaudeAiExport:
                         parsed.skipped_blocks[kind] += 1
                     elif kind not in KNOWN_BLOCKS:
                         parsed.unknown_blocks[kind] += 1
+                    elif kind in _TEXT_FIELD and not _has_text(block, _TEXT_FIELD[kind]):
+                        # A meta block whose text field is absent produces no
+                        # row; count it rather than drop it silently.
+                        parsed.unknown_blocks[f"{kind}:<no {_TEXT_FIELD[kind]}>"] += 1
         except (KeyError, TypeError, ValueError):
             parsed.malformed += 1
     return parsed

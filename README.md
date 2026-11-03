@@ -116,11 +116,18 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
 
   | export block | database result |
   | --- | --- |
-  | `text` | `events` text; role is user for human messages and assistant otherwise |
-  | `thinking`, `injected_prompt_block` | `events` text with `is_meta = TRUE` |
+  | `text` | text from `text`; `events` text, role is user for human messages and assistant otherwise |
+  | `thinking` | text from `thinking`; `events` text with `is_meta = TRUE` |
+  | `injected_prompt_block` | text from `prompt`; `events` text with `is_meta = TRUE` |
   | `tool_use` + `tool_result` | one paired `tool_calls` row; uses without a result are pending |
   | `token_budget`, `flag`, `image`, `document` | skipped and counted by type |
   | any other block type | skipped and reported by type as unknown |
+
+  Empty, missing, or non-string `prompt` and `thinking` fields produce no event and are
+  counted as `injected_prompt_block:<no prompt>` and `thinking:<no thinking>`. MCP tools are
+  identified by a name beginning `mcp__` or by `<server>:<tool>` with both sides non-empty;
+  integration display names and server URLs do not affect classification. `result_text` is
+  truncated at the configured limit, like the other sources.
 - `--db` defaults to `$XDG_DATA_HOME/ashiato/ashiato.duckdb`, falling back to
   `~/.local/share/ashiato/ashiato.duckdb`. Parent directories are created as needed.
 - `build` is incremental: a file whose path, size and mtime are unchanged since the last

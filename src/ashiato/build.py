@@ -2319,7 +2319,9 @@ def build(
                 except (OSError, ValueError, zipfile.BadZipFile, KeyError):
                     result.claude_ai_malformed += 1
                     continue
-                _store_claude_ai_export(connection, parsed_export, known, scratch, built_at, result)
+                _store_claude_ai_export(
+                    connection, parsed_export, known, scratch, built_at, result, result_text_limit
+                )
 
             if cursor_chat_files:
                 _apply_cursor_chat_metas(connection, cursor_chat_files, result)
@@ -2425,7 +2427,9 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
     finally:
         connection.close()
 
-def _store_claude_ai_export(connection, parsed, known, scratch, built_at, result):
+def _store_claude_ai_export(
+    connection, parsed, known, scratch, built_at, result, result_text_limit
+):
     """Replace changed conversations independently, retaining absent conversations."""
     from ashiato.parser import Event, Session, ToolCall, parse_timestamp
 
@@ -2474,7 +2478,8 @@ def _store_claude_ai_export(connection, parsed, known, scratch, built_at, result
                 elif kind == "thinking":
                     text_value, meta = block.get("thinking"), True
                 elif kind == "injected_prompt_block":
-                    text_value, meta = block.get("text"), True
+                    # Missing / empty text is counted by the parser.
+                    text_value, meta = block.get("prompt"), True
                 elif kind == "tool_use":
                     uses[block.get("id")] = (block, seq)
                 elif kind == "tool_result":
@@ -2518,6 +2523,16 @@ def _store_claude_ai_export(connection, parsed, known, scratch, built_at, result
                 if result_value is not None
                 else None
             )
+            result_truncated = False
+            if result_text is not None and len(result_text) > result_text_limit:
+                result_text = result_text[:result_text_limit]
+                result_truncated = True
+            tool_name = block.get("name") if isinstance(block.get("name"), str) else None
+            tool_kind, mcp_server = split_tool_name(tool_name)
+            if tool_kind != "mcp" and tool_name and ":" in tool_name:
+                server, tool = tool_name.split(":", 1)
+                if server and tool:
+                    tool_kind, mcp_server = "mcp", server
             input_value = block.get("input")
             calls.append(
                 ToolCall(
@@ -2531,29 +2546,19 @@ def _store_claude_ai_export(connection, parsed, known, scratch, built_at, result
                     # is no event to point at (same as Codex, issue #75).
                     call_event_id=None,  # type: ignore[arg-type]
                     result_event_id=None,
-                    tool_name=block.get("name") if isinstance(block.get("name"), str) else None,
-                    tool_kind=(
-                        "mcp"
-                        if block.get("integration_name") or block.get("mcp_server_url")
-                        else "builtin"
-                    ),
-                    mcp_server=(
-                        block.get("integration_name") or block.get("mcp_server_url")
-                        if isinstance(
-                            block.get("integration_name") or block.get("mcp_server_url"), str
-                        )
-                        else None
-                    ),
+                    tool_name=tool_name,
+                    tool_kind=tool_kind,
+                    mcp_server=mcp_server,
                     input=json.dumps(input_value, ensure_ascii=False)
                     if input_value is not None
                     else None,
-                    input_summary=None,
+                    input_summary=summarize_input(tool_name, input_value),
                     outcome=(
                         "pending" if result_block is None else ("error" if is_error else "ok")
                     ),
                     is_error=is_error,
                     result_text=result_text,
-                    result_truncated=False,
+                    result_truncated=result_truncated,
                     duration_ms=None,
                     permission_mode=None,
                     denied_by=None,

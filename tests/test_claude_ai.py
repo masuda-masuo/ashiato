@@ -26,7 +26,7 @@ def _export():
         "human",
         "2026-01-01T00:00:00Z",
         {"type": "text", "text": "synthetic human prompt"},
-        {"type": "injected_prompt_block", "text": "synthetic injected secret"},
+        {"type": "injected_prompt_block", "prompt": "synthetic injected secret"},
     )
     branch = _msg(
         "msg-old-branch",
@@ -302,3 +302,176 @@ def test_updated_export_replaces_only_changed_conversation_and_keeps_missing(tmp
         ).fetchone()[0] == 3
     finally:
         connection.close()
+
+
+
+def test_prompt_field_is_meta_and_missing_prompt_is_counted(tmp_path, capsys):
+    conversation = {
+        "uuid": "prompt-field-conversation",
+        "name": "Synthetic Prompt Field",
+        "created_at": "2026-03-01T00:00:00Z",
+        "updated_at": "2026-03-01T00:01:00Z",
+        "chat_messages": [
+            _msg(
+                "prompt-field-message",
+                "00000000-0000-4000-8000-000000000000",
+                "human",
+                "2026-03-01T00:00:00Z",
+                {"type": "text", "text": "synthetic user text"},
+                {"type": "injected_prompt_block", "prompt": "synthetic prompt secret"},
+                {"type": "injected_prompt_block"},
+                {"type": "thinking"},
+            )
+        ],
+    }
+    export = tmp_path / "prompt-field.json"
+    db = tmp_path / "prompt-field.duckdb"
+    _write(export, [conversation])
+
+    assert main(["build", "--claude-ai-export", str(export), "--db", str(db)]) == 0
+    rendered = capsys.readouterr().out
+    assert "injected_prompt_block:<no prompt>=1" in rendered
+    assert "thinking:<no thinking>=1" in rendered
+
+    # Counted per build, like the other block counters: an unchanged
+    # conversation still reports them.
+    assert main(["build", "--claude-ai-export", str(export), "--db", str(db)]) == 0
+    rendered = capsys.readouterr().out
+    assert "1 unchanged" in rendered
+    assert "injected_prompt_block:<no prompt>=1" in rendered
+    assert "thinking:<no thinking>=1" in rendered
+
+    connection = connect(db, read_only=True)
+    try:
+        assert connection.execute(
+            "SELECT text, is_meta FROM events WHERE text='synthetic prompt secret'"
+        ).fetchone() == ("synthetic prompt secret", True)
+        assert connection.execute(
+            "SELECT count(*) FROM events WHERE session_id='prompt-field-conversation'"
+        ).fetchone()[0] == 3
+    finally:
+        connection.close()
+
+    assert main(["grep", "synthetic user text", "--role", "user", "--db", str(db)]) == 0
+    grep_out = capsys.readouterr().out
+    assert "synthetic user text" in grep_out
+    assert "synthetic prompt secret" not in grep_out
+    assert main(["topics", "prompt-field-conversation", "--db", str(db)]) == 0
+    assert "synthetic prompt secret" not in capsys.readouterr().out
+    assert main(
+        [
+            "orphans",
+            "--db",
+            str(db),
+            "--no-default-sinks",
+            "--min-human-chars",
+            "0",
+            "--min-orphans",
+            "0",
+            "--min-tf",
+            "1",
+            "--limit",
+            "0",
+        ]
+    ) == 0
+    assert "synthetic prompt secret" not in capsys.readouterr().out
+
+
+def test_tool_kind_truncation_and_input_summary(tmp_path):
+    from ashiato.parser import DEFAULT_RESULT_TEXT_LIMIT, summarize_input
+
+    tool_blocks = [
+        {
+            "type": "tool_use",
+            "id": "web-use",
+            "name": "web_fetch",
+            "integration_name": "Web Fetch",
+            "input": {"url": "https://example.invalid/page"},
+        },
+        {
+            "type": "tool_use",
+            "id": "github-use",
+            "name": "github:create_issue",
+            "input": {"title": "Synthetic issue"},
+        },
+        {
+            "type": "tool_use",
+            "id": "drive-use",
+            "name": "mcp__Google_Drive__create_file",
+            "input": {"name": "synthetic.txt"},
+        },
+        {
+            "type": "tool_use",
+            "id": "long-use",
+            "name": "long_result",
+            "input": {"value": "long"},
+        },
+        {
+            "type": "tool_use",
+            "id": "short-use",
+            "name": "short_result",
+            "input": {"value": "short"},
+        },
+    ]
+    result_blocks = [
+        {
+            "type": "tool_result",
+            "tool_use_id": "long-use",
+            "content": "x" * (DEFAULT_RESULT_TEXT_LIMIT + 10),
+        },
+        {"type": "tool_result", "tool_use_id": "short-use", "content": "short output"},
+    ]
+    conversation = {
+        "uuid": "tool-fields-conversation",
+        "name": "Synthetic Tool Fields",
+        "created_at": "2026-03-02T00:00:00Z",
+        "updated_at": "2026-03-02T00:01:00Z",
+        "chat_messages": [
+            _msg(
+                "tool-fields-message",
+                "00000000-0000-4000-8000-000000000000",
+                "assistant",
+                "2026-03-02T00:00:00Z",
+                *tool_blocks,
+            ),
+            _msg(
+                "tool-results-message",
+                "tool-fields-message",
+                "assistant",
+                "2026-03-02T00:00:01Z",
+                *result_blocks,
+            ),
+        ],
+    }
+    export = tmp_path / "tool-fields.json"
+    db = tmp_path / "tool-fields.duckdb"
+    _write(export, [conversation])
+    build([], db, claude_ai_exports=[export])
+
+    connection = connect(db, read_only=True)
+    try:
+        rows = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                """
+                SELECT tool_use_id, tool_kind, mcp_server, input, input_summary,
+                       result_text, result_truncated
+                FROM tool_calls
+                WHERE session_id='tool-fields-conversation'
+                """
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+
+    assert rows["web-use"][:2] == ("builtin", None)
+    assert rows["github-use"][:2] == ("mcp", "github")
+    assert rows["drive-use"][:2] == ("mcp", "Google_Drive")
+    assert rows["long-use"][-2:] == ("x" * DEFAULT_RESULT_TEXT_LIMIT, True)
+    assert rows["short-use"][-2:] == ("short output", False)
+    for use_id, name, input_value in (
+        ("web-use", "web_fetch", {"url": "https://example.invalid/page"}),
+        ("github-use", "github:create_issue", {"title": "Synthetic issue"}),
+        ("drive-use", "mcp__Google_Drive__create_file", {"name": "synthetic.txt"}),
+    ):
+        assert rows[use_id][3] == summarize_input(name, input_value)
