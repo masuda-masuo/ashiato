@@ -22,7 +22,7 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
   machine is the owner name and `owner/repo/number` — never transcript text.
 - **Source coverage is per format, not unconditional.** Which tables a transcript format
   populates, and what `events.raw` holds there, differs per source -- a count over
-  `tool_calls` means "Claude Code plus Codex", never "all four agents":
+  `tool_calls` means "a subset of the sources", never "all agents":
 
   | source | populates | `events.raw` holds |
   | --- | --- | --- |
@@ -30,8 +30,9 @@ nothing.) The single exception is `pending --gh`, which lists the owner's
   | Codex | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted message text (not the source line) for text events; the verbatim item JSON for `context_compaction` rows -- lifecycle, turn-context and token-usage records are not modelled at all |
   | opencode | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted assistant message text (not the source line) for text events -- `ts` is NULL there, since opencode text parts carry no timestamp; one `sessions` row per distinct session id in the file (tool parts and text parts carry their own); one `tool_calls` row per *terminal* tool part -- `completed` or `error`, with the failure message in `result_text` and `duration_ms` from the part's `time`; job lifecycle events and `pending`/`running` tool parts are not modelled at all |
   | Cursor | `sessions`, `events`, `tool_calls`, `recall_calls` | the extracted message text (not the source line) for text events -- the transcript export records no role, so these rows carry `role` NULL and their text is a mix of user and assistant messages; `ts` is NULL there, since the agent-transcript export records no timestamps at all (`seq` / `block_index` order the rows within a file instead); one `sessions` row per file (a Cursor transcript file is one session -- its file-name uuid stem); one `tool_calls` row per `tool_use` block -- the export records no tool result whatsoever (no `tool_result` blocks, ever), so with `--cursor-chats-source` the results are filled from Cursor's own undocumented local store (`~/.cursor/chats/<workspace-hash>/<session-uuid>/`): the `meta.json` supplies `cwd` and the session times, and the sibling `store.db` supplies `outcome` / `is_error` / `result_text` / `result_truncated` for every call of a session whose store pairs with the transcript (same tool-call count and elementwise-equal tool names, compared as plain recorded strings -- the store records the same MCP block name the transcript does, `CallMcpTool` or `CallDynamicTool`, both verbatim on both sides, so there is no MCP name equivalence to apply). That verdict is a weaker signal than the other sources' status fields -- a named, documented classifier that reads a dict `error` key, a failing dict `status`, an error-prefixed result string, or a shell result whose first line is a nonzero `Exit code` -- and `ts` still stays NULL, since the store carries no per-message timestamp either. For a paired session the `events` rows are *replaced* by store-derived ones: the store's system / user / assistant messages become one row per `text` / `reasoning` / `redacted-reasoning` part, in conversation order, carrying the real `role`, the system prompt the transcript never had, and the model's reasoning, with `seq` = 0-based store message index, the part index riding in `event_id` (`cursor:store:...:seq:block`), and `is_meta` True only for the `system` role. An unpaired session, and any build without the chats source, keeps the transcript-derived rows exactly as they are. Without the chats source, or for a session the store cannot pair, `outcome` / `is_error` stay NULL, and a call whose fate is genuinely unknown must not read as interrupted (`pending`) or as succeeded (`ok`) |
+  | claude.ai | `sessions`, `events`, `tool_calls` | extracted block text for events; title in a separate `ai-title` event; tool input/result in `tool_calls` |
 
-  `source_files` (per-file bookkeeping) is populated by all four.
+  `source_files` bookkeeping also tracks claude.ai conversations by synthetic key.
 
 ## Install
 
@@ -110,6 +111,27 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   second explicit list means it never gets swept into the plain `--source` scan
   even though both use the `*.jsonl` extension. Nothing is scanned for Codex
   sessions by default -- pass `--codex-source` to opt in.
+- `--claude-ai-export PATH` is repeatable and accepts a `conversations-*.zip` or extracted `conversations.json`. Nothing is auto-detected. Conversations are archived independently: changed `updated_at` values replace only that conversation, and conversations absent from a later snapshot remain stored. For each conversation, only the ancestry from the latest-created leaf to its root is imported; off-path messages are counted. The export format is undocumented and this behavior reflects the measured shape only. It contains no project link, so imports have no project association. A conversation is re-imported whenever its `updated_at` *differs* from the stored one (not only when it is newer), so pass exports oldest-first: building an older export after a newer one brings back the older versions of the conversations that changed in between.
+  Block mapping:
+
+  | export block | database result |
+  | --- | --- |
+  | `text` | text from `text`; `events` text, role is user for human messages and assistant otherwise |
+  | `thinking` | text from `thinking`; `events` text with `is_meta = TRUE` |
+  | `injected_prompt_block` | text from `prompt`; `events` text with `is_meta = TRUE` |
+  | `tool_use` + `tool_result` | one paired `tool_calls` row; uses without a result are pending |
+  | `token_budget`, `flag`, `image`, `document` | skipped and counted by type |
+  | any other block type | skipped and reported by type as unknown |
+
+  A `prompt` / `thinking` field that is present but empty produces no event and is counted
+  under skipped blocks as `injected_prompt_block:<empty>` / `thinking:<empty>` -- the normal
+  state (about half of real `thinking` blocks are empty). A field that is missing or not a
+  string produces no event and is counted under unknown blocks as
+  `injected_prompt_block:<no prompt>` / `thinking:<no thinking>`, since it may mean the format
+  changed. MCP tools are
+  identified by a name beginning `mcp__` or by `<server>:<tool>` with both sides non-empty;
+  integration display names and server URLs do not affect classification. `result_text` is
+  truncated at the configured limit, like the other sources.
 - `--db` defaults to `$XDG_DATA_HOME/ashiato/ashiato.duckdb`, falling back to
   `~/.local/share/ashiato/ashiato.duckdb`. Parent directories are created as needed.
 - `build` is incremental: a file whose path, size and mtime are unchanged since the last
