@@ -33,6 +33,7 @@ SOURCE_CLAUDE_CODE = "claude_code"
 SOURCE_OPENCODE = "opencode"
 SOURCE_CURSOR = "cursor"
 SOURCE_CODEX = "codex"
+SOURCE_CLAUDE_AI = "claude_ai"
 
 SESSION_TABLE: tuple[Column, ...] = (
     ("session_id", "VARCHAR"),
@@ -243,6 +244,10 @@ SOURCE_FILE_TABLE: tuple[Column, ...] = (
 #: source bytes yield different rows than version 18 (``permission_mode`` was
 #: NULL for every Claude Code row, ``denied_by`` / ``denial_reason`` are new),
 #: so existing databases must be rebuilt.
+#: Not bumped for the claude.ai source (issue #105): it adds a new, opt-in
+#: input (``--claude-ai-export``) and changes no row derived from any
+#: existing source's bytes, and it adds no column.  An existing database
+#: holds no claude.ai rows to be stale, so a rebuild would buy nothing.
 FORMAT_VERSION = 19
 
 #: Key-value table holding format metadata.  Deliberately not in ``TABLES``: it

@@ -33,6 +33,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ from pathlib import Path
 
 import duckdb
 
+from ashiato.claude_ai import parse_export as parse_claude_ai_export
 from ashiato.codex import ParsedCodexFile
 from ashiato.codex import parse_file as parse_codex_file
 from ashiato.cursor import (
@@ -92,6 +94,7 @@ from ashiato.schema import (
     RECALL_FOLLOWUPS_SQL,
     REQUIRED_VIEWS,
     SCHEMA_SQL,
+    SOURCE_CLAUDE_AI,
     SOURCE_CODEX,
     SOURCE_CURSOR,
     SOURCE_OPENCODE,
@@ -199,6 +202,18 @@ class BuildResult:
     #: Rows are still produced with NULL output/ts; this is just so the CLI
     #: can tell the caller why.
     kaiba_db_unavailable: str | None = None
+    claude_ai_conversations_found: int = 0
+    claude_ai_conversations_imported: int = 0
+    claude_ai_conversations_with_messages: int = 0
+    claude_ai_conversations_unchanged: int = 0
+    claude_ai_messages_imported: int = 0
+    claude_ai_off_path_messages: int = 0
+    claude_ai_events: int = 0
+    claude_ai_tool_calls: int = 0
+    claude_ai_skipped_blocks: dict[str, int] = field(default_factory=dict)
+    claude_ai_unknown_blocks: dict[str, int] = field(default_factory=dict)
+    claude_ai_malformed: int = 0
+    claude_ai_failed: int = 0
 
 
 @dataclass
@@ -2016,6 +2031,7 @@ def build(
     cursor_sources: Sequence[str | Path] = (),
     cursor_chats_sources: Sequence[str | Path] = (),
     codex_sources: Sequence[str | Path] = (),
+    claude_ai_exports: Sequence[str | Path] = (),
     kaiba_db_path: str | Path | None = None,
     denial_patterns: Sequence[str] = DENIAL_PATTERNS,
     result_text_limit: int = DEFAULT_RESULT_TEXT_LIMIT,
@@ -2039,11 +2055,23 @@ def build(
     cursor_files, cursor_missing = iter_cursor_sources(cursor_sources)
     cursor_chat_files, cursor_chat_missing = iter_cursor_chat_sources(cursor_chats_sources)
     codex_files, codex_missing = iter_codex_sources(codex_sources)
+    claude_ai_paths = [Path(p).expanduser() for p in claude_ai_exports]
+    claude_ai_missing = [str(p) for p in claude_ai_paths if not p.is_file()]
+    claude_ai_paths = [p for p in claude_ai_paths if p.is_file()]
     result.missing_sources = (
-        claude_missing + opencode_missing + cursor_missing + cursor_chat_missing + codex_missing
+        claude_missing
+        + opencode_missing
+        + cursor_missing
+        + cursor_chat_missing
+        + codex_missing
+        + claude_ai_missing
     )
     result.n_files = (
-        len(claude_files) + len(opencode_files) + len(cursor_files) + len(codex_files)
+        len(claude_files)
+        + len(opencode_files)
+        + len(cursor_files)
+        + len(codex_files)
+        + len(claude_ai_paths)
     )
 
     kaiba_recalls_by_query: dict[str, list[tuple[datetime | None, str]]] = {}
@@ -2285,6 +2313,14 @@ def build(
                 result.n_tool_calls += len(parsed_codex.tool_calls)
                 result.n_parse_errors += parsed_codex.n_parse_errors
 
+            for export_path in claude_ai_paths:
+                try:
+                    parsed_export = parse_claude_ai_export(export_path)
+                except (OSError, ValueError, zipfile.BadZipFile, KeyError):
+                    result.claude_ai_malformed += 1
+                    continue
+                _store_claude_ai_export(connection, parsed_export, known, scratch, built_at, result)
+
             if cursor_chat_files:
                 _apply_cursor_chat_metas(connection, cursor_chat_files, result)
                 _apply_cursor_chat_stores(
@@ -2388,3 +2424,237 @@ def database_info(db_path: str | Path) -> DatabaseInfo:
         )
     finally:
         connection.close()
+
+def _store_claude_ai_export(connection, parsed, known, scratch, built_at, result):
+    """Replace changed conversations independently, retaining absent conversations."""
+    from ashiato.parser import Event, Session, ToolCall, parse_timestamp
+
+    result.claude_ai_conversations_found += len(parsed.conversations) + parsed.malformed
+    result.claude_ai_malformed += parsed.malformed
+    result.claude_ai_conversations_with_messages += sum(
+        c.message_count > 0 for c in parsed.conversations
+    )
+    for kind, count in parsed.skipped_blocks.items():
+        result.claude_ai_skipped_blocks[kind] = result.claude_ai_skipped_blocks.get(kind, 0) + count
+    for kind, count in parsed.unknown_blocks.items():
+        result.claude_ai_unknown_blocks[kind] = result.claude_ai_unknown_blocks.get(kind, 0) + count
+
+    for conv in parsed.conversations:
+        key = "claude-ai:" + conv.uuid
+        updated = conv.updated_at
+        # parse_timestamp returns naive UTC; pin it so the marker never
+        # depends on the machine's local timezone.
+        marker = updated.replace(tzinfo=UTC).timestamp() if updated else 0.0
+        previous = known.get(key)
+        if previous is not None and abs(previous[1] - marker) < _MTIME_TOLERANCE:
+            result.claude_ai_conversations_unchanged += 1
+            result.claude_ai_off_path_messages += conv.off_path
+            continue
+
+        events = []
+        uses = {}
+        results = {}
+        calls = []
+        seq = 0
+        for message in conv.messages:
+            role = "user" if message.get("sender") == "human" else "assistant"
+            ts = parse_timestamp(message.get("created_at"))
+            message_id = message.get("uuid") if isinstance(message.get("uuid"), str) else None
+            blocks = message.get("content", [])
+            if not isinstance(blocks, list):
+                continue
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get("type")
+                text_value = None
+                meta = False
+                if kind == "text":
+                    text_value = block.get("text")
+                elif kind == "thinking":
+                    text_value, meta = block.get("thinking"), True
+                elif kind == "injected_prompt_block":
+                    text_value, meta = block.get("text"), True
+                elif kind == "tool_use":
+                    uses[block.get("id")] = (block, seq)
+                elif kind == "tool_result":
+                    results[block.get("tool_use_id")] = block
+                if isinstance(text_value, str) and text_value:
+                    events.append(
+                        Event(
+                            event_id=f"claude_ai:{conv.uuid}:{seq}",
+                            session_id=conv.uuid,
+                            file_path=key,
+                            source=SOURCE_CLAUDE_AI,
+                            seq=seq,
+                            ts=ts,
+                            type="text",
+                            role=role,
+                            parent_uuid=None,
+                            depth=0,
+                            is_sidechain=False,
+                            is_meta=meta,
+                            permission_mode=None,
+                            effort=None,
+                            request_id=None,
+                            message_id=message_id,
+                            model=None,
+                            cwd=None,
+                            git_branch=None,
+                            text=text_value,
+                            raw=json.dumps(block, ensure_ascii=False),
+                        )
+                    )
+                    seq += 1
+
+        for use_id, (block, call_seq) in uses.items():
+            result_block = results.get(use_id)
+            is_error = bool(result_block and result_block.get("is_error"))
+            result_value = result_block.get("content") if result_block else None
+            result_text = (
+                result_value
+                if isinstance(result_value, str)
+                else json.dumps(result_value, ensure_ascii=False)
+                if result_value is not None
+                else None
+            )
+            input_value = block.get("input")
+            calls.append(
+                ToolCall(
+                    tool_use_id=str(use_id),
+                    session_id=conv.uuid,
+                    file_path=key,
+                    source=SOURCE_CLAUDE_AI,
+                    seq=call_seq,
+                    ts=parse_timestamp(block.get("start_timestamp")),
+                    # A tool_use block gets no events row of its own, so there
+                    # is no event to point at (same as Codex, issue #75).
+                    call_event_id=None,  # type: ignore[arg-type]
+                    result_event_id=None,
+                    tool_name=block.get("name") if isinstance(block.get("name"), str) else None,
+                    tool_kind=(
+                        "mcp"
+                        if block.get("integration_name") or block.get("mcp_server_url")
+                        else "builtin"
+                    ),
+                    mcp_server=(
+                        block.get("integration_name") or block.get("mcp_server_url")
+                        if isinstance(
+                            block.get("integration_name") or block.get("mcp_server_url"), str
+                        )
+                        else None
+                    ),
+                    input=json.dumps(input_value, ensure_ascii=False)
+                    if input_value is not None
+                    else None,
+                    input_summary=None,
+                    outcome=(
+                        "pending" if result_block is None else ("error" if is_error else "ok")
+                    ),
+                    is_error=is_error,
+                    result_text=result_text,
+                    result_truncated=False,
+                    duration_ms=None,
+                    permission_mode=None,
+                    denied_by=None,
+                    denial_reason=None,
+                    cwd=None,
+                    is_sidechain=False,
+                    parent_tool_use_id=None,
+                )
+            )
+
+        title = Event(
+            event_id=f"claude_ai:{conv.uuid}:title",
+            session_id=conv.uuid,
+            file_path=key,
+            source=SOURCE_CLAUDE_AI,
+            seq=-1,
+            ts=conv.created_at,
+            type="ai-title",
+            role=None,
+            parent_uuid=None,
+            depth=0,
+            is_sidechain=False,
+            is_meta=True,
+            permission_mode=None,
+            effort=None,
+            request_id=None,
+            message_id=None,
+            model=None,
+            cwd=None,
+            git_branch=None,
+            text="",
+            raw=json.dumps({"title": conv.name}, ensure_ascii=False),
+        )
+        all_events = [title, *events]
+        session = Session(
+            session_id=conv.uuid,
+            file_path=key,
+            source=SOURCE_CLAUDE_AI,
+            project_dir=None,
+            cwd=None,
+            git_branch=None,
+            cc_version=None,
+            entrypoint="claude_ai",
+            started_at=conv.created_at,
+            ended_at=updated,
+            n_events=len(all_events),
+            n_tool_calls=len(calls),
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+        )
+
+        def insert(
+            attempt,
+            session=session,
+            all_events=all_events,
+            calls=calls,
+            key=key,
+            marker=marker,
+            updated=updated,
+        ):
+            _insert_rows(connection, "sessions", [_session_row(session)], scratch=attempt)
+            _insert_rows(connection, "events", [_event_row(e) for e in all_events], scratch=attempt)
+            _insert_rows(
+                connection, "tool_calls", [_tool_call_row(c) for c in calls], scratch=attempt
+            )
+            _insert_rows(
+                connection,
+                "source_files",
+                [
+                    (
+                        key,
+                        0,
+                        marker,
+                        updated.isoformat() if updated else "",
+                        len(all_events),
+                        len(calls),
+                        0,
+                        built_at,
+                    )
+                ],
+                scratch=attempt,
+            )
+
+        if _store_file(
+            connection,
+            key=key,
+            replace=previous is not None,
+            scratch=scratch,
+            insert=insert,
+            result=result,
+        ):
+            known[key] = (0, marker)
+            result.claude_ai_conversations_imported += 1
+            result.claude_ai_messages_imported += len(conv.messages)
+            result.claude_ai_off_path_messages += conv.off_path
+            result.claude_ai_events += len(all_events)
+            result.claude_ai_tool_calls += len(calls)
+            result.n_sessions += 1
+            result.n_events += len(all_events)
+            result.n_tool_calls += len(calls)
+        else:
+            result.claude_ai_failed += 1

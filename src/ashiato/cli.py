@@ -129,6 +129,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser.add_argument(
+        "--claude-ai-export", action="append", dest="claude_ai_export", metavar="PATH",
+        help="claude.ai conversations ZIP or conversations.json (repeatable)",
+    )
+    build_parser.add_argument(
         "--kaiba-db",
         metavar="PATH",
         help="kaiba sqlite db used to fill in Cursor recall output/ts (default ~/.kaiba/kaiba.db)",
@@ -773,6 +777,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     cursor_sources = args.cursor_source or []
     cursor_chats_sources = args.cursor_chats_source or []
     codex_sources = args.codex_source or []
+    claude_ai_exports = args.claude_ai_export or []
     kaiba_db_path = Path(args.kaiba_db).expanduser() if args.kaiba_db else None
     db_path = _resolve_db(args.db)
     try:
@@ -783,6 +788,7 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
             cursor_sources=cursor_sources,
             cursor_chats_sources=cursor_chats_sources,
             codex_sources=codex_sources,
+            claude_ai_exports=claude_ai_exports,
             kaiba_db_path=kaiba_db_path,
         )
     except SchemaOutOfDate as error:
@@ -794,7 +800,8 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
     for path in result.unreadable_files:
         print(f"warning: could not read: {path}", file=err)
     for path in result.failed_files:
-        print(f"warning: could not store: {path}", file=err)
+        if not path.startswith("claude-ai:"):
+            print(f"warning: could not store: {path}", file=err)
     if result.kaiba_db_unavailable:
         print(
             f"notice: no kaiba db at {result.kaiba_db_unavailable} -- "
@@ -808,6 +815,29 @@ def _run_build(args: argparse.Namespace, out: Any, err: Any) -> int:
         f"{result.n_files} found",
         file=out,
     )
+    if claude_ai_exports:
+        print(
+            f"claude.ai: {result.claude_ai_conversations_found} conversations found, "
+            f"{result.claude_ai_conversations_imported} imported, "
+            f"{result.claude_ai_conversations_unchanged} unchanged, "
+            f"{result.claude_ai_conversations_with_messages} with messages; "
+            f"{result.claude_ai_messages_imported} messages, "
+            f"{result.claude_ai_off_path_messages} off-path, "
+            f"{result.claude_ai_events} events, {result.claude_ai_tool_calls} tool calls, "
+            f"{result.claude_ai_malformed} malformed, {result.claude_ai_failed} failed", file=out
+        )
+        if result.claude_ai_skipped_blocks:
+            print(
+                "claude.ai skipped blocks: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(result.claude_ai_skipped_blocks.items())),
+                file=out,
+            )
+        if result.claude_ai_unknown_blocks:
+            print(
+                "claude.ai unknown blocks: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(result.claude_ai_unknown_blocks.items())),
+                file=out,
+            )
     if cursor_chats_sources:
         print(
             f"cursor chats: {result.n_chat_metas_read} meta files read, "
