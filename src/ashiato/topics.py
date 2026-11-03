@@ -129,6 +129,8 @@ def _uuid_of(raw: str | None) -> str | None:
         record = json.loads(raw)
     except ValueError:
         return None
+    if not isinstance(record, dict):
+        return None
     value = record.get("uuid")
     return value if isinstance(value, str) and value else None
 
@@ -317,6 +319,8 @@ def _title(
         try:
             record = json.loads(raw)
         except ValueError:
+            continue
+        if not isinstance(record, dict):
             continue
         title = None
         for key in ("title", "aiTitle", "text"):

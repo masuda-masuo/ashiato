@@ -164,8 +164,9 @@ def is_compaction_summary(raw: str | None) -> bool:
     a previous conversation ...\") is a user row whose JSON carries
     ``\"isCompactSummary\": true``.  ``raw`` is not always valid JSON (other
     source formats store different text there), so it is parsed defensively:
-    anything unparseable, or missing the flag, is not a summary.  Machine-written
-    recaps of earlier content must not count as human prose.
+    anything unparseable, any JSON that is not an object (a codex row's ``raw``
+    can be a bare number), or missing the flag, is not a summary.
+    Machine-written recaps of earlier content must not count as human prose.
     """
     if not raw:
         return False
@@ -173,7 +174,7 @@ def is_compaction_summary(raw: str | None) -> bool:
         record = json.loads(raw)
     except ValueError:
         return False
-    return record.get("isCompactSummary") is True
+    return isinstance(record, dict) and record.get("isCompactSummary") is True
 
 
 # ---------------------------------------------------------------------------
