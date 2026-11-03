@@ -40,9 +40,12 @@ sink files (a memo written after reading a candidate must retire it on the next 
 not at the nightly rebuild) and of the reviewed file next to the database (a mark made
 with ``ashiato orphans --mark-reviewed`` must hide the candidate on the next reload too),
 and ``memory-authors`` re-checks, on every hit, that each file
-it reports as present or missing still is.  ``info`` is the exception: its freshness gap
-reads the transcript directories, not the database, so caching it by the database's
-stamp would hide exactly the staleness it exists to show.
+it reports as present or missing still is.  ``info`` (behind the overview) is cached
+differently: its freshness gap reads the transcript directories, not the database, so
+a stamp-only key would hide exactly the staleness it exists to show.  It is kept for at
+most ``INFO_CACHE_SECONDS`` (60 s) under the database stamp and computed single-flight,
+so a burst of requests shares one walk of the recorded roots.  ``/healthz`` only opens
+the database and never reaches any of these.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import traceback
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator, Sequence
@@ -117,6 +121,7 @@ _HOST_HEADER_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 #: Rows per page, as the issue fixes them.
 ORPHANS_LIMIT = 30
 DENIALS_LIMIT = 50
+INFO_CACHE_SECONDS = 60
 
 #: Sent on every response.  The page needs inline CSS and one inline script and
 #: one form, and nothing else: no fetch, no image, no frame.
@@ -170,8 +175,10 @@ class Dashboard:
         default_sinks: bool = True,
         memory_dirs: Sequence[Path] = (),
         reviewed_file: Path | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.db_path = Path(db_path)
+        self.clock = clock
         self.sinks = list(sinks)
         self.default_sinks = default_sinks
         self.memory_dirs = list(memory_dirs)
@@ -276,6 +283,22 @@ class Dashboard:
             self._cache[name] = (key, value)
             return value
 
+    def _database_info(self) -> DatabaseInfo:
+        """Return the full database summary, cached by stamp for a short interval."""
+        stamp = self.stamp()
+        with self._locks["database_info"]:
+            now = self.clock()
+            cached = self._cache.get("database_info")
+            if (
+                cached is not None
+                and cached[0] == stamp
+                and now - cached[1][0] < INFO_CACHE_SECONDS
+            ):
+                return cached[1][1]
+            info = database_info(self.db_path)
+            self._cache["database_info"] = (stamp, (self.clock(), info))
+            return info
+
     # -- analyses --------------------------------------------------------
 
     def orphans(self) -> dict[str, Any]:
@@ -368,11 +391,11 @@ class Dashboard:
         }
 
     def overview(self) -> dict[str, Any]:
-        """``info`` plus one tile each; freshness is read live, never cached."""
+        """``info`` plus one tile each; freshness is cached briefly with the database summary."""
         candidates = self.orphans()["candidates"]
         unattributed = self.memory()["unattributed"]
         denied = len(self.denials()["denials"])
-        info = database_info(self.db_path)
+        info = self._database_info()
         try:
             stat = self.db_path.stat()
         except OSError as error:
@@ -1320,6 +1343,9 @@ class App:
         def overview_page() -> Response:
             return _html(render_overview(dashboard.overview()))
 
+        def health_page() -> Response:
+            return Response(200, "text/plain; charset=utf-8", b"ok\n")
+
         def orphans_page() -> Response:
             return _html(render_orphans(
                 dashboard.orphans(), self._csrf_token, show_reviewed=show_reviewed,
@@ -1333,6 +1359,7 @@ class App:
 
         pages: dict[str, Callable[[], Response]] = {
             "/": overview_page,
+            "/healthz": health_page,
             "/orphans": orphans_page,
             "/memory": memory_page,
             "/denials": denials_page,
@@ -1457,6 +1484,7 @@ def make_server(
     default_sinks: bool = True,
     memory_dirs: Sequence[Path] = (),
     reviewed_file: Path | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> ThreadingHTTPServer:
     """A bound, not yet serving, dashboard server.  ``ValueError`` for a non-loopback *host*."""
     address = bind_address(host)
@@ -1466,6 +1494,7 @@ def make_server(
         default_sinks=default_sinks,
         memory_dirs=memory_dirs,
         reviewed_file=reviewed_file,
+        clock=clock,
     )
     server_class = _Server6 if ":" in address else _Server4
     return server_class((address, port), _make_handler(App(dashboard)))
