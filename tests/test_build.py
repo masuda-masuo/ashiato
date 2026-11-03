@@ -6597,3 +6597,140 @@ def test_denial_reason_stops_at_the_advice_the_harness_appends() -> None:
         )
         assert denied_by == "classifier"
         assert reason == expected, body
+
+
+def _reference_count_files_per_root(
+    known: dict[str, tuple[int, float]], roots: list[str]
+) -> list[tuple[str, int]]:
+    """Reference copy of the original implementation for comparison tests."""
+    sorted_roots = sorted(roots, key=len, reverse=True)
+    counts: dict[str, int] = {root: 0 for root in roots}
+    for file_path in known:
+        file_p = Path(file_path)
+        for root in sorted_roots:
+            try:
+                file_p.relative_to(root)
+                counts[root] += 1
+                break
+            except ValueError:
+                continue
+    return [(root, counts[root]) for root in roots]
+
+
+def test_count_files_per_root_matches_reference() -> None:
+    roots = ["/z-unused", "/a/b/", "/a", "/a/b", "/z"]
+    known = {
+        "/a/top.jsonl": (1, 1.0),
+        "/a/b/child.jsonl": (2, 2.0),
+        "/a/bc/sibling.jsonl": (3, 3.0),
+        "/a/b": (4, 4.0),
+        "claude-ai:12345678-1234-1234-1234-123456789abc": (5, 5.0),
+        "/outside/file.jsonl": (6, 6.0),
+        "/z/file.jsonl": (7, 7.0),
+    }
+
+    expected = _reference_count_files_per_root(known, roots)
+    assert expected == [
+        ("/z-unused", 0),
+        ("/a/b/", 2),
+        ("/a", 2),
+        ("/a/b", 0),
+        ("/z", 1),
+    ]
+    assert build_module._count_files_per_root(known, roots) == expected
+
+
+def test_count_files_per_root_matches_reference_with_filesystem_root() -> None:
+    roots = ["/", "/a"]
+    known = {
+        "/a/x.jsonl": (1, 1.0),
+        "/b/y.jsonl": (2, 2.0),
+        "/": (3, 3.0),
+        "claude-ai:12345678-1234-1234-1234-123456789abc": (4, 4.0),
+    }
+
+    expected = _reference_count_files_per_root(known, roots)
+    assert expected == [("/", 2), ("/a", 1)]
+    assert build_module._count_files_per_root(known, roots) == expected
+
+
+# ---------------------------------------------------------------- opencode walk boundaries
+
+
+def test_opencode_walk_stops_below_a_job_directory(tmp_path: Path):
+    job = tmp_path / "hash" / "jobs" / "job"
+    deep = job / "codex-home" / "a" / "b"
+    deep.mkdir(parents=True)
+    job_event = job / "events.ndjson"
+    deep_event = deep / "other.ndjson"
+    job_event.write_text("{}\n", encoding="utf-8")
+    deep_event.write_text("{}\n", encoding="utf-8")
+
+    files, missing = iter_opencode_sources([tmp_path])
+
+    assert files == [job_event]
+    assert missing == []
+
+
+def test_opencode_walk_descends_through_directories_without_ndjson(tmp_path: Path):
+    deep = tmp_path / "hash" / "jobs" / "job"
+    deep.mkdir(parents=True)
+    event = deep / "events.ndjson"
+    event.write_text("{}\n", encoding="utf-8")
+
+    files, missing = iter_opencode_sources([tmp_path])
+
+    assert files == [event]
+    assert missing == []
+
+
+def test_opencode_walk_does_not_follow_symlinked_directories(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "events.ndjson").write_text("{}\n", encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "linked").symlink_to(target, target_is_directory=True)
+
+    files, missing = iter_opencode_sources([source])
+
+    assert files == []
+    assert missing == []
+
+
+def test_opencode_walk_keeps_claude_code_subagent_discovery(tmp_path: Path):
+    session_dir = tmp_path / "session"
+    subagents = session_dir / "subagents"
+    subagents.mkdir(parents=True)
+    transcript = tmp_path / "session.jsonl"
+    agent_transcript = subagents / "agent.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    agent_transcript.write_text("", encoding="utf-8")
+
+    files, missing = iter_transcripts([tmp_path])
+
+    assert files == [transcript, agent_transcript]
+    assert missing == []
+
+
+def test_opencode_walk_freshness_ignores_files_below_job_directories(tmp_path: Path):
+    job = tmp_path / "hash" / "jobs" / "job"
+    deep = job / "codex-home" / "a" / "b"
+    deep.mkdir(parents=True)
+    (job / "events.ndjson").write_text("{}\n", encoding="utf-8")
+    (deep / "other.ndjson").write_text("{}\n", encoding="utf-8")
+
+    connection = connect(tmp_path / "freshness.duckdb")
+    try:
+        create_schema(connection)
+        gap = build_module._compute_freshness_gap(
+            connection,
+            [],
+            [str(tmp_path)],
+            [],
+            [],
+        )
+    finally:
+        connection.close()
+
+    assert gap == 1

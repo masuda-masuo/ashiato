@@ -69,8 +69,10 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
 - `--source` defaults to `~/.claude/projects`, is repeatable, and is searched recursively
   for `*.jsonl` Claude Code transcripts.
 - `--opencode-source` is repeatable and is searched recursively for `*.ndjson` opencode
-  job event streams (`~/.kusabi/*/jobs/*/events.ndjson` on a machine that has them). It is
-  a separate list on purpose: the two formats live in unrelated directory trees, and a
+  job event streams (`~/.kusabi/*/jobs/*/events.ndjson` on a machine that has them).
+  Once a directory directly contains `*.ndjson` (a job directory), nothing below it is
+  searched, so per-job work directories such as `codex-home` are skipped. It is a
+  separate list on purpose: the two formats live in unrelated directory trees, and a
   second explicit list means ashiato never has to sniff a file's format to know which
   parser to run. Nothing is scanned for `*.ndjson` by default -- pass `--opencode-source`
   to opt in.

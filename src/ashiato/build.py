@@ -28,6 +28,7 @@ call also needs kaiba's own ``recalls`` ledger (``kaiba_db_path`` /
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -481,19 +482,25 @@ def _count_files_per_root(
     This makes the per-root counts deterministic regardless of the order in
     which roots are passed. Roots that match no files still appear with count 0.
     """
-    # Sort roots by length (descending) so the most specific root is checked first.
-    # We keep the original order for equal-length roots to preserve stability.
+    # Sort the original strings so ordering and stability match the old behavior.
     sorted_roots = sorted(roots, key=len, reverse=True)
+    # The prefix for a root is its normalized form plus a separator; the
+    # filesystem root "/" already ends in one.
+    root_paths: dict[str, tuple[str, str]] = {}
+    for root in roots:
+        normalized = str(Path(root))
+        prefix = normalized if normalized.endswith(os.sep) else normalized + os.sep
+        root_paths[root] = (normalized, prefix)
     counts: dict[str, int] = {root: 0 for root in roots}
     for file_path in known:
-        file_p = Path(file_path)
+        # Synthetic source keys (for example claude-ai:<uuid>) are not paths.
+        if not file_path.startswith("/"):
+            continue
         for root in sorted_roots:
-            try:
-                file_p.relative_to(root)
+            normalized, prefix = root_paths[root]
+            if file_path == normalized or file_path.startswith(prefix):
                 counts[root] += 1
                 break  # Attributed to the most specific containing root
-            except ValueError:
-                continue
     return [(root, counts[root]) for root in roots]
 
 
@@ -524,7 +531,7 @@ def _compute_freshness_gap(
             gap += 1
 
     # Check opencode sources (*.ndjson)
-    for file_path in _iter_sources(opencode_sources, "*.ndjson")[0]:
+    for file_path in iter_opencode_sources(opencode_sources)[0]:
         key = str(file_path.resolve())
         try:
             stat = file_path.stat()
@@ -556,11 +563,16 @@ def _compute_freshness_gap(
     return gap
 
 
-def _iter_sources(sources: Sequence[str | Path], pattern: str) -> tuple[list[Path], list[str]]:
+def _iter_sources(
+    sources: Sequence[str | Path],
+    pattern: str,
+    walker: Callable[[Path, str], Sequence[Path]] | None = None,
+) -> tuple[list[Path], list[str]]:
     """(matching files, sources that do not exist).
 
-    Directories are searched recursively for *pattern*.  The result is sorted
-    and deduplicated so a build is reproducible regardless of walk order.  A
+    Directories are searched recursively for *pattern* (or by *walker* when
+    given).  The result is sorted and deduplicated so a build is reproducible
+    regardless of walk order.  A
     source that is itself a file is accepted whatever its name -- the caller
     already said what it is by which source list it went in.
     """
@@ -569,7 +581,8 @@ def _iter_sources(sources: Sequence[str | Path], pattern: str) -> tuple[list[Pat
     for source in sources:
         path = Path(source).expanduser()
         if path.is_dir():
-            for candidate in path.rglob(pattern):
+            candidates = walker(path, pattern) if walker is not None else path.rglob(pattern)
+            for candidate in candidates:
                 if candidate.is_file():
                     found[str(candidate.resolve())] = candidate
         elif path.is_file():
@@ -577,6 +590,36 @@ def _iter_sources(sources: Sequence[str | Path], pattern: str) -> tuple[list[Pat
         else:
             missing.append(str(path))
     return [found[key] for key in sorted(found)], missing
+
+
+def _walk_opencode_directory(root: Path, pattern: str) -> list[Path]:
+    """Walk opencode directories, stopping below directories with event files."""
+    pending = [root]
+    files: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                children = list(entries)
+        except OSError:
+            continue
+
+        matching_files: list[Path] = []
+        subdirectories: list[Path] = []
+        for entry in children:
+            try:
+                if entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
+                    matching_files.append(Path(entry.path))
+                elif entry.is_dir(follow_symlinks=False):
+                    subdirectories.append(Path(entry.path))
+            except OSError:
+                continue
+
+        if matching_files:
+            files.extend(matching_files)
+        else:
+            pending.extend(subdirectories)
+    return files
 
 
 def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
@@ -590,9 +633,10 @@ def iter_transcripts(sources: Sequence[str | Path]) -> tuple[list[Path], list[st
 def iter_opencode_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
     """(opencode events.ndjson files, sources that do not exist).
 
-    Directories are searched recursively for ``*.ndjson``.
+    Directories are searched for ``*.ndjson``. Once a directory directly
+    contains an event file, its subdirectories are not searched.
     """
-    return _iter_sources(sources, "*.ndjson")
+    return _iter_sources(sources, "*.ndjson", walker=_walk_opencode_directory)
 
 
 def iter_cursor_sources(sources: Sequence[str | Path]) -> tuple[list[Path], list[str]]:
