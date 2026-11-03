@@ -6652,3 +6652,85 @@ def test_count_files_per_root_matches_reference_with_filesystem_root() -> None:
     expected = _reference_count_files_per_root(known, roots)
     assert expected == [("/", 2), ("/a", 1)]
     assert build_module._count_files_per_root(known, roots) == expected
+
+
+# ---------------------------------------------------------------- opencode walk boundaries
+
+
+def test_opencode_walk_stops_below_a_job_directory(tmp_path: Path):
+    job = tmp_path / "hash" / "jobs" / "job"
+    deep = job / "codex-home" / "a" / "b"
+    deep.mkdir(parents=True)
+    job_event = job / "events.ndjson"
+    deep_event = deep / "other.ndjson"
+    job_event.write_text("{}\n", encoding="utf-8")
+    deep_event.write_text("{}\n", encoding="utf-8")
+
+    files, missing = iter_opencode_sources([tmp_path])
+
+    assert files == [job_event]
+    assert missing == []
+
+
+def test_opencode_walk_descends_through_directories_without_ndjson(tmp_path: Path):
+    deep = tmp_path / "hash" / "jobs" / "job"
+    deep.mkdir(parents=True)
+    event = deep / "events.ndjson"
+    event.write_text("{}\n", encoding="utf-8")
+
+    files, missing = iter_opencode_sources([tmp_path])
+
+    assert files == [event]
+    assert missing == []
+
+
+def test_opencode_walk_does_not_follow_symlinked_directories(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "events.ndjson").write_text("{}\n", encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "linked").symlink_to(target, target_is_directory=True)
+
+    files, missing = iter_opencode_sources([source])
+
+    assert files == []
+    assert missing == []
+
+
+def test_opencode_walk_keeps_claude_code_subagent_discovery(tmp_path: Path):
+    session_dir = tmp_path / "session"
+    subagents = session_dir / "subagents"
+    subagents.mkdir(parents=True)
+    transcript = tmp_path / "session.jsonl"
+    agent_transcript = subagents / "agent.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    agent_transcript.write_text("", encoding="utf-8")
+
+    files, missing = iter_transcripts([tmp_path])
+
+    assert files == [transcript, agent_transcript]
+    assert missing == []
+
+
+def test_opencode_walk_freshness_ignores_files_below_job_directories(tmp_path: Path):
+    job = tmp_path / "hash" / "jobs" / "job"
+    deep = job / "codex-home" / "a" / "b"
+    deep.mkdir(parents=True)
+    (job / "events.ndjson").write_text("{}\n", encoding="utf-8")
+    (deep / "other.ndjson").write_text("{}\n", encoding="utf-8")
+
+    connection = connect(tmp_path / "freshness.duckdb")
+    try:
+        create_schema(connection)
+        gap = build_module._compute_freshness_gap(
+            connection,
+            [],
+            [str(tmp_path)],
+            [],
+            [],
+        )
+    finally:
+        connection.close()
+
+    assert gap == 1
