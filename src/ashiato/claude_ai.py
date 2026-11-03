@@ -34,10 +34,6 @@ SKIPPED_BLOCKS = {"token_budget", "flag", "image", "document"}
 _TEXT_FIELD = {"injected_prompt_block": "prompt", "thinking": "thinking"}
 
 
-def _has_text(block: dict[str, Any], key: str) -> bool:
-    value = block.get(key)
-    return isinstance(value, str) and bool(value)
-
 
 @dataclass(slots=True)
 class ClaudeAiConversation:
@@ -105,10 +101,18 @@ def parse_export(path: str | Path) -> ParsedClaudeAiExport:
                         parsed.skipped_blocks[kind] += 1
                     elif kind not in KNOWN_BLOCKS:
                         parsed.unknown_blocks[kind] += 1
-                    elif kind in _TEXT_FIELD and not _has_text(block, _TEXT_FIELD[kind]):
-                        # A meta block whose text field is absent produces no
-                        # row; count it rather than drop it silently.
-                        parsed.unknown_blocks[f"{kind}:<no {_TEXT_FIELD[kind]}>"] += 1
+                    elif kind in _TEXT_FIELD:
+                        # Neither case produces a row; both are counted.
+                        field_name = _TEXT_FIELD[kind]
+                        value = block.get(field_name)
+                        if not isinstance(value, str):
+                            # Field absent or not a string: the format may
+                            # have changed, so this is an alarm.
+                            parsed.unknown_blocks[f"{kind}:<no {field_name}>"] += 1
+                        elif not value:
+                            # Present but empty: the normal state (2,192 of
+                            # 4,584 thinking blocks in a real export).
+                            parsed.skipped_blocks[f"{kind}:<empty>"] += 1
         except (KeyError, TypeError, ValueError):
             parsed.malformed += 1
     return parsed

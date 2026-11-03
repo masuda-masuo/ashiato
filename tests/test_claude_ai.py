@@ -321,6 +321,8 @@ def test_prompt_field_is_meta_and_missing_prompt_is_counted(tmp_path, capsys):
                 {"type": "injected_prompt_block", "prompt": "synthetic prompt secret"},
                 {"type": "injected_prompt_block"},
                 {"type": "thinking"},
+                {"type": "injected_prompt_block", "prompt": ""},
+                {"type": "thinking", "thinking": ""},
             )
         ],
     }
@@ -328,10 +330,21 @@ def test_prompt_field_is_meta_and_missing_prompt_is_counted(tmp_path, capsys):
     db = tmp_path / "prompt-field.duckdb"
     _write(export, [conversation])
 
+    def block_lines(rendered: str) -> tuple[str, str]:
+        lines = rendered.splitlines()
+        skipped = next(x for x in lines if x.startswith("claude.ai skipped blocks:"))
+        unknown = next(x for x in lines if x.startswith("claude.ai unknown blocks:"))
+        return skipped, unknown
+
     assert main(["build", "--claude-ai-export", str(export), "--db", str(db)]) == 0
     rendered = capsys.readouterr().out
-    assert "injected_prompt_block:<no prompt>=1" in rendered
-    assert "thinking:<no thinking>=1" in rendered
+    # A missing field is an alarm (unknown); an empty one is normal (skipped).
+    skipped, unknown = block_lines(rendered)
+    assert "injected_prompt_block:<no prompt>=1" in unknown
+    assert "thinking:<no thinking>=1" in unknown
+    assert "<empty>" not in unknown
+    assert "injected_prompt_block:<empty>=1" in skipped
+    assert "thinking:<empty>=1" in skipped
 
     # Counted per build, like the other block counters: an unchanged
     # conversation still reports them.

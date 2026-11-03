@@ -123,8 +123,12 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   | `token_budget`, `flag`, `image`, `document` | skipped and counted by type |
   | any other block type | skipped and reported by type as unknown |
 
-  Empty, missing, or non-string `prompt` and `thinking` fields produce no event and are
-  counted as `injected_prompt_block:<no prompt>` and `thinking:<no thinking>`. MCP tools are
+  A `prompt` / `thinking` field that is present but empty produces no event and is counted
+  under skipped blocks as `injected_prompt_block:<empty>` / `thinking:<empty>` -- the normal
+  state (about half of real `thinking` blocks are empty). A field that is missing or not a
+  string produces no event and is counted under unknown blocks as
+  `injected_prompt_block:<no prompt>` / `thinking:<no thinking>`, since it may mean the format
+  changed. MCP tools are
   identified by a name beginning `mcp__` or by `<server>:<tool>` with both sides non-empty;
   integration display names and server URLs do not affect classification. `result_text` is
   truncated at the configured limit, like the other sources.
