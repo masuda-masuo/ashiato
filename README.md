@@ -16,10 +16,11 @@ is a single query.
 - **No network call by default.** Transcripts contain secrets and never leave the machine. DuckDB
   extension autoinstall is switched off explicitly. (`ashiato serve` listens on loopback
   only; accepting a connection from this machine is not an outbound call, and it fetches
-nothing.) The single exception is `pending --gh`, which lists the owner's
-  repositories once (`gh repo list <owner> --limit 200 --json name`) and checks
-  issue/PR references through the `gh` CLI; the only data that leaves the
-  machine is the owner name and `owner/repo/number` — never transcript text.
+nothing.) The exceptions are `pending --gh` and `review --gh`. `pending --gh` lists the
+  owner's repositories once (`gh repo list <owner> --limit 200 --json name`) and checks
+  issue/PR references through the `gh` CLI; `review --gh` checks the GitHub outputs inside
+  its window the same way. The only data that leaves the machine is the owner name and
+  `owner/repo/number` — never transcript text.
 - **Source coverage is per format, not unconditional.** Which tables a transcript format
   populates, and what `events.raw` holds there, differs per source -- a count over
   `tool_calls` means "a subset of the sources", never "all agents":
@@ -57,6 +58,7 @@ ashiato nominate [--db PATH] [--since TS] [--until TS] [--min-sessions N] [--min
 ashiato orphans [--db PATH] [--since TS] [--until TS] [--sink PATH]... [--no-default-sinks] [--min-tf N] [--min-human-chars N] [--min-orphans N] [--include-headless] [--limit N] [--mark-reviewed ID]... [--unmark-reviewed ID]... [--reviewed-file PATH] [--show-reviewed] [--json]
 ashiato memory-authors [--db PATH] [--since TS] [--until TS] [--memory-dir PATH]... [--model NAME] [--json]
 ashiato pending [--db PATH] [--gh] [--owner NAME] [--repo OWNER/NAME] [--all-summaries] [--since TS] [--until TS] [--show-resolved] [--json]
+ashiato review [--db PATH] [--since TS] [--until TS] [--bucket week|month] [--tz NAME] [--themes N] [--gh] [--json]
 ashiato hygiene [--db PATH] [--since TS] [--until TS] [--format table|json]
 ashiato session-trace SESSION_PREFIX [--db PATH] [--format table|json] [--limit N] [--max-excerpt-chars N]
 ashiato topics SESSION_PREFIX [--db PATH] [--window N] [--terms N] [--json]
@@ -288,6 +290,63 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   (recorded as `Bash`), so their memory edits appear as `bash_mentions` at best, and memory
   writes made from Cursor sessions are not visible in the database at all. Exit code `0` on
   success and `1` when the database cannot be read.
+
+- `review` reports, period by period, what the human talked about with LLMs and what was
+  produced, across every source in the database. Read-only, like `orphans` and `pending`.
+  Buckets are months (default) or weeks (`--bucket week`, weeks start on Monday), computed in
+  `--tz NAME` (an IANA zone; default the machine's local zone, printed in the header);
+  stored timestamps stay naive UTC. `--since TS` / `--until TS` are inclusive, as in
+  `pending`. Per bucket it shows sessions per source (in `--json` as
+  `{"sessions": N, "non_headless": N}`), human characters typed, the top themes, and the
+  outputs grouped by repository (PR / issue counts with numbers) plus a Drive document count.
+  `--json` prints the same with one record per output: `url`, `kind`, `repo`, `number`,
+  `doc_id`, `first_seen`, `session_id`, `file_path`, `source`, `status` (with `--gh` also
+  `created_at`, `author`, and `error` for `unknown`).
+  - **Outputs** are GitHub PR / issue URLs (`github.com/<owner>/<repo>/(pull|issues)/<n>`)
+    and Google Drive document URLs (`docs.google.com/(document|spreadsheets|presentation)/d/<id>`)
+    found in `tool_calls.result_text` of every source, headless sessions included. There is
+    no list of "producing" tools: every source writes through different tools.
+  - **First appearance is creation.** A URL belongs to the session, source and time of its
+    first appearance in the whole corpus (ties broken by `tool_use_id`), because nothing can
+    be read before it exists; every later appearance is a reference, not an output. Calls
+    whose `ts` is NULL cannot be ordered: a URL seen only in such calls is counted as
+    `undated` (by source, report-wide) and never claimed as an output.
+  - **One output per GitHub number.** Issues and PRs share one number space, so `/issues/7`
+    and `/pull/7` are the same output; the key is `(owner, repo, number)` with owner and repo
+    lowercased, and anything after the number (`#issuecomment-...`, `/files`, a query
+    string) is not part of it. `api.github.com` URLs are not outputs. The kind comes from
+    GitHub with `--gh` (a `pull_request` key means PR); without it, a URL seen anywhere in
+    the corpus in `/pull/` form is a PR, otherwise an issue. A Drive output's key is the
+    document id.
+  - **`--gh`** (opt-in, read-only `gh api repos/<o>/<r>/issues/<n>`, once per output) adds
+    `created_at` and `author` and marks each GitHub output `confirmed` (first seen from 2
+    minutes before to 10 minutes after `created_at`) or `outside` (first seen later: created
+    outside the corpus); a failed lookup, or a first sighting more than 2 minutes before
+    `created_at`, is `unknown` with the reason in `error`. Only outputs inside
+    `--since` / `--until` are looked up: the corpus holds thousands of URLs, and checking all
+    of them would spend GitHub's hourly API limit (5,000 requests) for nothing. Without
+    `--gh` every output is `unchecked` and nothing runs; Drive outputs are always
+    `unchecked`.
+  - **Themes** are the top terms (`--themes N`, default 10; 0 disables) of the *human* text
+    in the bucket: user-role `events` with `is_meta` not true, from non-headless sessions,
+    without sidechains, tool results, compaction summaries or harness wrappers (the
+    `orphans` definition). Assistant text and worker briefs would drown out the human's
+    words. Weighting is tf-idf with the `orphans` / `topics` tokenizer, document frequency
+    over all sessions (independent of the window), dropping terms in more than 30% of
+    sessions, as in `topics`.
+  - **Pasted blocks are removed before themes** (themes only; `orphans`, `topics` and the
+    character count are unchanged): code fences (a line starting with ```` ``` ```` or `~~~`
+    up to the next line starting with the same marker, or to the end when unclosed) are
+    dropped whole, and a shell prompt at the start of a line -- PowerShell `PS C:\...>` /
+    `PS /...>`, `user@host:path$ ` / `user@host:path# `, or a bare `$ ` -- is removed while
+    the command typed after it is kept. Pasted logs and code are not what the human talked
+    about; dropping whole prompt lines would also drop the typed commands (`git`, ...).
+  - Known limits: outputs created outside the corpus (in the GitHub web UI, or by a tool
+    ashiato does not ingest) appear late or not at all -- `--gh` catches the late ones as
+    `outside`; `undated` sources (Cursor calls carry no `ts`) are counted, never ordered;
+    Drive outputs cannot be verified; the stripping is deliberately narrow, so uppercase
+    `OK` and path fragments such as `bin` / `lib` survive into themes; and kanji runs are not
+    segmented (a tokenizer limit shared with `orphans` and `topics`).
 
 - `pending` reports open items left in compaction summaries. When a Claude Code session runs
   out of context it writes a compaction summary with a numbered "Pending Tasks" section — the
