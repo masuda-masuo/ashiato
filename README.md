@@ -221,9 +221,12 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   `--sink` the sinks are every existing `~/.claude/projects/*/memory` directory, and
   `--no-default-sinks` turns that default off. A sink path that does not exist is a warning on
   stderr, not an error, and with no sink text at all every unique term counts as an orphan
-  (say so on stderr). Terms are lowercased words of 4+ Latin characters, katakana runs and
-  kanji runs; code identifiers (containing `_`), hex/UUID ids and mixed letter+digit tokens
-  such as `bk7tgrw6i` or `urllib3` are dropped. Uniqueness is
+  (say so on stderr). Terms include 2-letter Latin words only when all uppercase in the
+  original text, and 3-letter Latin words in any case except a small English stoplist; 4+
+  letter Latin words, katakana runs and kanji runs are also included. Short words do not
+  match inside longer tokens (`mcp-host`, `gpt4o`), right after a dot (`.py`, `.com`) or right
+  before one that starts an extension (`foo.js`). Code identifiers (containing `_`), hex/UUID
+  ids and mixed letter+digit tokens such as `bk7tgrw6i` or `urllib3` are dropped. Uniqueness is
   always measured over every session that has prose -- headless ones included -- so
   `--since TS` / `--until TS` only
   restrict which sessions are *nominated*, and a window never makes an old topic look unique.

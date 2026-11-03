@@ -96,10 +96,25 @@ _HARNESS_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-# Latin words of 4+ characters, katakana runs of 3+ (U+30A1-U+30F4 and the
-# long-vowel mark U+30FC) and kanji runs of 2+ (U+4E00-U+9FA5 and U+3005).
+# Standalone short Latin words, 4+ character Latin words, katakana runs of
+# 3+ (U+30A1-U+30F4 and the long-vowel mark U+30FC), and kanji runs of 2+
+# (U+4E00-U+9FA5 and U+3005). Short words cannot be part of identifiers or
+# dotted extensions; slash is intentionally a valid boundary.
 _TOKEN_RE = re.compile(
-    r"[A-Za-z][A-Za-z0-9_\-]{3,}|[ァ-ヴー]{3,}|[一-龥々]{2,}"
+    r"(?<![A-Za-z0-9_.-])(?P<short>[A-Za-z]{2,3})(?![A-Za-z0-9_-]|\.[A-Za-z0-9])"
+    r"|[A-Za-z][A-Za-z0-9_\-]{3,}|[ァ-ヴー]{3,}|[一-龥々]{2,}"
+)
+# English 3-letter function words that are never terms, in any case.  Words
+# that can be technical terms (``run``, ``app``, ``git``, ``get``, ``set``,
+# ``new``, ``use``, ...) are deliberately absent.  2-letter words need no list:
+# only all-uppercase ones are kept.
+_SHORT_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the", "and", "for", "not", "you", "are", "but", "was", "has", "had", "his",
+        "her", "him", "she", "its", "our", "who", "why", "how", "can", "may", "did",
+        "all", "any", "nor", "yet", "too", "via", "per", "etc", "one", "two", "now",
+        "see", "say", "got", "own", "few", "yes", "ago", "don", "isn", "won",
+    }
 )
 _HEX_ID_RE = re.compile(r"^[0-9a-f]{7,}$|[0-9a-f]{8}-")
 # A whole UUID is removed before tokenising: one that starts with digits would
@@ -123,7 +138,14 @@ def tokenize(text: str) -> list[str]:
     """Lowercased terms of *text*, minus code identifiers and id-like tokens."""
     terms = []
     for match in _TOKEN_RE.finditer(_UUID_RE.sub(" ", text)):
-        term = match.group().lower()
+        original = match.group()
+        short = match.group("short")
+        if short is not None:
+            if len(short) == 2 and not short.isupper():
+                continue
+            if len(short) == 3 and short.lower() in _SHORT_STOPWORDS:
+                continue
+        term = original.lower()
         # A token with ``_`` is a code identifier -- its real sink is the repo.
         if "_" in term or _HEX_ID_RE.search(term):
             continue

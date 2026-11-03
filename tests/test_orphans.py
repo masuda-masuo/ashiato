@@ -188,7 +188,28 @@ def test_strip_harness_is_non_greedy() -> None:
 
 def test_tokenize_lowercases_and_finds_latin_katakana_kanji() -> None:
     terms = tokenize("Design memory-server プロトコル 設計 API abc 猫")
-    assert terms == ["design", "memory-server", "プロトコル", "設計"]
+    assert terms == ["design", "memory-server", "プロトコル", "設計", "api", "abc"]
+
+
+def test_tokenize_keeps_short_technical_terms_with_boundaries() -> None:
+    # ``file`` is a 4+ letter word and keeps its old rule; ``py`` follows a dot.
+    assert tokenize("MCP と mcp と AI と PR、file.py と the") == [
+        "mcp",
+        "mcp",
+        "ai",
+        "pr",
+        "file",
+    ]
+    assert tokenize("AWS aws AwS") == ["aws", "aws", "aws"]
+    assert tokenize("AI ai Ai aI") == ["ai"]
+    assert tokenize("THE The the") == []
+    assert tokenize("MCP.") == ["mcp"]
+    assert tokenize("CI/CD") == ["ci", "cd"]
+    assert tokenize("MCPサーバー") == ["mcp", "サーバー"]
+
+
+def test_tokenize_does_not_extract_short_words_from_longer_tokens() -> None:
+    assert tokenize("mcp-host sunaba_mcp gpt4o example.com foo.js") == ["mcp-host", "example"]
 
 
 def test_tokenize_drops_code_identifiers_and_hex_ids() -> None:
