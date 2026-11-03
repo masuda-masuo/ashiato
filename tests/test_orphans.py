@@ -23,6 +23,7 @@ from ashiato.orphans import (
     collect_sessions,
     default_sink_dirs,
     find_orphans,
+    is_compaction_summary,
     is_headless,
     load_sinks,
     read_reviewed,
@@ -221,6 +222,34 @@ def test_tokenize_drops_code_identifiers_and_hex_ids() -> None:
 
 
 # ---------------------------------------------------------------- unit: sinks
+
+
+@pytest.mark.parametrize("raw", ["1", '"text"', "[1, 2]", "null", "true"])
+def test_non_object_json_raw_is_not_a_compaction_summary(raw: str) -> None:
+    # Issue #110: a codex row's ``raw`` was a bare JSON number in the real DB.
+    assert is_compaction_summary(raw) is False
+
+
+def test_orphans_runs_when_a_user_row_raw_is_a_json_number(
+    corpus: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    connection = connect(corpus)
+    try:
+        changed = connection.execute(
+            "UPDATE events SET raw = '1' WHERE session_id = 'ses-b' AND role = 'user'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert changed is not None and changed[0] >= 1
+
+    payload = _run_json(
+        corpus, "--min-human-chars", "100", "--min-orphans", "1", capsys=capsys
+    )
+    # Same result as test_unique_term_is_orphan_and_shared_term_is_not: the
+    # row's text still counts, only its unreadable ``raw`` is ignored.
+    candidates = _by_id(payload)
+    assert set(candidates) == {"ses-a"}
+    assert candidates["ses-a"]["orphan_terms"] == ["wibbleframe", "zorblax"]
 
 
 def test_load_sinks_walks_directories_and_lowercases(tmp_path: Path) -> None:

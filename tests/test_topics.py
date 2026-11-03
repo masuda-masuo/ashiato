@@ -339,6 +339,29 @@ def test_ai_title_is_the_fallback_when_no_custom_title_exists(tmp_path: Path) ->
     assert payload["title_kind"] == "ai-title"
 
 
+def test_outline_skips_raw_that_is_json_but_not_an_object(tmp_path: Path) -> None:
+    # Issue #110: a codex row's ``raw`` was a bare JSON number in the real DB.
+    records = exchange_records("ses-num", "2026-08-01", A_EXCHANGES[:2])
+    records.append(title_record("ses-num", "2026-08-01T10:00:02Z", "ai-title", "AI TITLE"))
+    records.append(title_record("ses-num", "2026-08-01T10:00:04Z", "custom-title", "MY TITLE"))
+    db = make_db(tmp_path, [("ses-num", "2026-08-01", records)])
+    connection = connect(db)
+    try:
+        changed = connection.execute(
+            "UPDATE events SET raw = '1' WHERE session_id = 'ses-num' "
+            "AND (role = 'user' OR type = 'custom-title')"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert changed is not None and changed[0] == 3  # two human rows + the custom title
+
+    payload = _outline_of(db, "ses-num")
+    assert payload["n_exchanges"] == 2
+    # The unreadable custom title falls back to the readable ai-title.
+    assert payload["title"] == "AI TITLE"
+    assert payload["title_kind"] == "ai-title"
+
+
 def test_no_title_events_leaves_title_null(corpus: Path) -> None:
     payload = _outline_of(corpus, "ses-outline")
     assert payload["title"] is None
