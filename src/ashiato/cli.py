@@ -45,6 +45,8 @@ from ashiato.orphans import (
 )
 from ashiato.orphans import run as orphans_run
 from ashiato.pending import run as pending_run
+from ashiato.review import local_zone, parse_zone
+from ashiato.review import run as review_run
 from ashiato.salvage import DEFAULT_LIMIT as DEFAULT_SALVAGE_LIMIT
 from ashiato.salvage import DEFAULT_WINDOW_MINUTES, default_kaiba_db_path, nominate, open_kaiba
 from ashiato.schema import (
@@ -447,6 +449,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", dest="json_output", help="output as JSON"
     )
 
+    review_parser = subparsers.add_parser(
+        "review", help="report human activity and outputs by period"
+    )
+    review_parser.add_argument("--db", metavar="PATH", help="database path")
+    review_parser.add_argument(
+        "--since", type=_parse_since, metavar="TS", help="inclusive start timestamp"
+    )
+    review_parser.add_argument(
+        "--until", type=_parse_since, metavar="TS", help="inclusive end timestamp"
+    )
+    review_parser.add_argument(
+        "--bucket", choices=("week", "month"), default="month", help="bucket size (default month)"
+    )
+    review_parser.add_argument(
+        "--tz",
+        type=parse_zone,
+        default=local_zone(),
+        metavar="NAME",
+        help="IANA time zone (default local)",
+    )
+    review_parser.add_argument(
+        "--owner", action="append", help="GitHub owner to include (repeatable)"
+    )
+    review_parser.add_argument("--gh", action="store_true", help="check GitHub outputs with gh api")
+    review_parser.add_argument(
+        "--themes",
+        type=_nonnegative_int,
+        default=10,
+        metavar="N",
+        help="number of top themes per bucket (default 10; 0 disables)",
+    )
+    review_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="output as JSON"
+    )
+
     pending_parser = subparsers.add_parser(
         "pending",
         help="open items left in compaction summaries, checked against GitHub",
@@ -685,6 +722,17 @@ def _parse_repo(value: str) -> tuple[str, str]:
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise argparse.ArgumentTypeError(f"invalid repo: {value!r} (expected OWNER/NAME)")
     return parts[0], parts[1]
+
+
+def _nonnegative_int(value: str) -> int:
+    """An argparse integer that is zero or greater."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value}") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
 
 
 def _parse_since(value: str) -> datetime:
@@ -1633,6 +1681,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_memory_authors(args, out, err)
     if args.command == "pending":
         return _run_pending(args, out, err)
+    if args.command == "review":
+        return review_run(
+            _resolve_db(args.db),
+            since=args.since,
+            until=args.until,
+            bucket=args.bucket,
+            tz=args.tz,
+            gh=args.gh,
+            themes=args.themes,
+            owners=args.owner,
+            json_output=args.json_output,
+            out=out,
+            err=err,
+        )
     if args.command == "hygiene":
         return _run_hygiene(args, out, err)
     if args.command == "compare-periods":
