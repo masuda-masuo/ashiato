@@ -481,19 +481,25 @@ def _count_files_per_root(
     This makes the per-root counts deterministic regardless of the order in
     which roots are passed. Roots that match no files still appear with count 0.
     """
-    # Sort roots by length (descending) so the most specific root is checked first.
-    # We keep the original order for equal-length roots to preserve stability.
+    # Sort the original strings so ordering and stability match the old behavior.
     sorted_roots = sorted(roots, key=len, reverse=True)
+    # The prefix for a root is its normalized form plus a separator; the
+    # filesystem root "/" already ends in one.
+    root_paths: dict[str, tuple[str, str]] = {}
+    for root in roots:
+        normalized = str(Path(root))
+        prefix = normalized if normalized.endswith(os.sep) else normalized + os.sep
+        root_paths[root] = (normalized, prefix)
     counts: dict[str, int] = {root: 0 for root in roots}
     for file_path in known:
-        file_p = Path(file_path)
+        # Synthetic source keys (for example claude-ai:<uuid>) are not paths.
+        if not file_path.startswith("/"):
+            continue
         for root in sorted_roots:
-            try:
-                file_p.relative_to(root)
+            normalized, prefix = root_paths[root]
+            if file_path == normalized or file_path.startswith(prefix):
                 counts[root] += 1
                 break  # Attributed to the most specific containing root
-            except ValueError:
-                continue
     return [(root, counts[root]) for root in roots]
 
 
