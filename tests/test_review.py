@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,7 +12,7 @@ import pytest
 
 from ashiato.build import build
 from ashiato.cli import main
-from ashiato.review import build_report, human_text_rows, strip_pasted
+from ashiato.review import build_report, human_text_rows, render_json, render_text, strip_pasted
 
 
 def db_with_data(sessions=(), events=(), calls=()):
@@ -690,4 +691,46 @@ def test_session_id_counts_distinct_sessions_by_source_and_file_fallback():
     assert march["codex"] == {"sessions": 1, "non_headless": 1}
     assert march["cursor"] == {"sessions": 2, "non_headless": 1}
     assert "2026-04" not in buckets
+    connection.close()
+
+
+def test_cursor_source_human_text_uses_user_query_only():
+    connection = db_with_data(
+        sessions=[("cursor.jsonl", "sid-cursor", "cursor", dt("2026-03-01T00:00:00"), "cli")],
+        events=[(
+            "cursor.jsonl", "sid-cursor", 0, dt("2026-03-01T00:00:00"), "user",
+            "<user_info>zorblax</user_info><user_query>only querytopic remains</user_query>",
+            "{}", False, False,
+        )],
+    )
+    report = build_report(connection, tz=ZoneInfo("UTC"))
+    bucket = report["buckets"][0]
+    assert bucket["human_chars"] == len("only querytopic remains")
+    assert "zorblax" not in {item["term"] for item in bucket["themes"]}
+    connection.close()
+
+
+def test_text_output_sorts_numbers_by_kind_but_json_keeps_appearance_order():
+    connection = db_with_data(
+        sessions=[("outputs.jsonl", "sid", "claude_code", dt("2026-03-01T00:00:00"), "cli")],
+        calls=[
+            ("first", "sid", "outputs.jsonl", "claude_code", dt("2026-03-01T10:00:00"),
+             "https://github.com/acme/widgets/pull/163"),
+            ("second", "sid", "outputs.jsonl", "claude_code", dt("2026-03-01T10:01:00"),
+             "https://github.com/acme/widgets/issues/149"),
+            ("third", "sid", "outputs.jsonl", "claude_code", dt("2026-03-01T10:02:00"),
+             "https://github.com/acme/widgets/pull/83"),
+            ("fourth", "sid", "outputs.jsonl", "claude_code", dt("2026-03-01T10:03:00"),
+             "https://github.com/acme/widgets/issues/37"),
+        ],
+    )
+    report = build_report(connection, tz=ZoneInfo("UTC"))
+    output = io.StringIO()
+    render_text(report, out=output)
+    assert "2 pr (#83, #163), 2 issue (#37, #149)" in output.getvalue()
+    json_output = io.StringIO()
+    render_json(report, out=json_output)
+    document = json.loads(json_output.getvalue())
+    json_order = [item["number"] for item in document["buckets"][0]["outputs"]]
+    assert json_order == [163, 149, 83, 37]
     connection.close()

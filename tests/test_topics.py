@@ -519,3 +519,35 @@ def test_window_below_one_raises_valueerror(corpus: Path, window: int) -> None:
             outline(connection, "ses-outline", window=window)
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------- source-aware human prose
+
+
+def test_outline_uses_cursor_user_query_only(tmp_path: Path) -> None:
+    records = exchange_records(
+        "ses-cursor",
+        "2026-08-01",
+        [("<user_info>zorblax</user_info><user_query>uniqueword querytopic</user_query>", "assistant answer")],
+    )
+    db = make_db(
+        tmp_path,
+        [
+            ("ses-cursor", "2026-08-01", records),
+            *[
+                (f"ses-filler-{i}", f"2026-08-0{i + 2}", exchange_records(
+                    f"ses-filler-{i}", f"2026-08-0{i + 2}", [("ordinary filler words", "ordinary answer")]
+                ))
+                for i in range(3)
+            ],
+        ],
+    )
+    connection = connect(db)
+    try:
+        connection.execute("UPDATE sessions SET source = 'cursor' WHERE session_id = 'ses-cursor'")
+        result = outline(connection, "ses-cursor")
+        terms = {term for segment in result["segments"] for term in segment["terms"]}
+        assert "zorblax" not in terms
+        assert "uniqueword" in terms
+    finally:
+        connection.close()

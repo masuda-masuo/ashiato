@@ -56,8 +56,8 @@ import duckdb
 from ashiato.build import SchemaOutOfDate, assert_readable, connect
 from ashiato.orphans import (
     collect_sessions,
+    human_prose,
     is_compaction_summary,
-    strip_harness,
     tokenize,
 )
 from ashiato.session_trace import SessionResolutionError, resolve_session
@@ -79,12 +79,14 @@ MAX_DF_RATIO = 0.3
 #: rebuild the exchange stream (``raw`` holds the uuid and the compaction
 #: flag).  Ordered by file then line so two builds of the same bytes agree.
 _SESSION_QUERY = """
-    SELECT event_id, seq, ts, role, text, raw, is_meta, is_sidechain
-    FROM events
-    WHERE session_id = ?
-      AND NOT COALESCE(is_meta, FALSE)
-      AND NOT COALESCE(is_sidechain, FALSE)
-    ORDER BY file_path, seq
+    SELECT e.event_id, e.seq, e.ts, e.role, e.text, e.raw,
+           e.is_meta, e.is_sidechain, s.source
+    FROM events e
+    JOIN sessions s ON e.file_path = s.file_path
+    WHERE e.session_id = ?
+      AND NOT COALESCE(e.is_meta, FALSE)
+      AND NOT COALESCE(e.is_sidechain, FALSE)
+    ORDER BY e.file_path, e.seq
 """
 
 #: Title events: the human's ``custom-title`` and Claude Code's ``ai-title``,
@@ -156,7 +158,7 @@ def _exchanges(rows: Sequence[tuple[Any, ...]]) -> list[Exchange]:
     exchanges: list[Exchange] = []
     seen_uuids: set[str] = set()
     current: Exchange | None = None
-    for event_id, seq, ts, role, text, raw, _is_meta, _is_sidechain in rows:
+    for event_id, seq, ts, role, text, raw, _is_meta, _is_sidechain, source in rows:
         if role == "user":
             if _is_tool_result(role, raw) or is_compaction_summary(raw):
                 continue
@@ -169,7 +171,7 @@ def _exchanges(rows: Sequence[tuple[Any, ...]]) -> list[Exchange]:
             continue
         seen_uuids.add(uuid)
         if role == "user":
-            prose = strip_harness(text).strip()
+            prose = human_prose(text, source)
             if not prose:
                 continue
             current = Exchange(index=len(exchanges), seq=seq, ts=ts, human_text=prose)

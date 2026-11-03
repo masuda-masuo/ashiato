@@ -203,7 +203,15 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
 - `orphans` nominates one-off discussion topics that left no trace. A design chat, a
   "what do you think about X" or a story idea happens once and never reaches a PR, a memory
   file or a ledger, and neither `nominate` (which needs repetition across sessions) nor
-  `salvage` (which needs tool-call evidence) can see it. `orphans` finds candidates
+  `salvage` (which needs tool-call evidence) can see it. Human prose is source-aware:
+  Claude Code, claude.ai, opencode, unknown sources and missing sources strip harness tags
+  only; Cursor keeps only complete `<user_query>` contents, or removes complete
+  `<user_info>`, `<rules>`, `<agent_skills>`, `<agent_transcripts>`, `<timestamp>`,
+  `<attached_files>`, `<manually_attached_skills>`, `<cursor_commands>` and
+  `<system_reminder>` blocks when no query block exists; Codex removes complete
+  `<environment_context>`,
+  `<recommended_plugins>` and `<codex_internal_context>` blocks. Unclosed blocks stay
+  verbatim. `orphans` finds candidates
   deterministically -- no LLM, no embeddings -- so a reader only has to look at the top few. A
   session is nominated when *all* of these hold: (1) it is **unique** -- it contains terms that
   occur in no other session in the whole database, at least `--min-tf N` times (default 3);
@@ -292,8 +300,9 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   success and `1` when the database cannot be read.
 
 - `review` reports, period by period, what the human talked about with LLMs and what was
-  produced, across every source in the database. Read-only, like `orphans` and `pending`.
-  Buckets are months (default) or weeks (`--bucket week`, weeks start on Monday), computed in
+  produced, across every source in the database. Read-only, like `orphans` and `pending`;
+  human text uses the source-aware prose rules described under `orphans`. Buckets are months
+  (default) or weeks (`--bucket week`, weeks start on Monday), computed in
   `--tz NAME` (an IANA zone; default the machine's local zone, printed in the header);
   stored timestamps stay naive UTC. `--since TS` / `--until TS` are inclusive, as in
   `pending`. Per bucket it shows sessions per source (in `--json` as
@@ -524,7 +533,8 @@ ashiato serve [--db PATH] [--host HOST] [--port N] [--sink PATH]... [--no-defaul
   embeddings -- because a session's stored title (`ai-title`) is generated once
   from the first prompt and never updated, so a long session's label says
   nothing about what it was really about. The outline is derived from the
-  session's own words in four mechanical steps: (1) **exchanges** -- the
+  session's own words (using the source-aware human-prose rules described under `orphans`)
+  in four mechanical steps: (1) **exchanges** -- the
   session's user/assistant text rows in transcript order, excluding meta and
   sidechain rows, tool-result user rows and compaction summaries (Claude
   Code's machine-written "this session is being continued" recaps, recognised
