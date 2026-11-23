@@ -561,6 +561,62 @@ def test_theme_cli_json_text_and_invalid_timezone(tmp_path, capsys):
     assert error.value.code == 2
 
 
+def test_key_past_the_old_4000_char_cut_reaches_review(tmp_path):
+    """#122: a key that sits after character 4,000 of a tool result survives the build."""
+    source = tmp_path / "transcripts"
+    source.mkdir()
+    transcript = source / "long-result.jsonl"
+    common = {"sessionId": "long-session", "cwd": "/synthetic/work"}
+    records = [
+        {
+            **common,
+            "type": "assistant",
+            "uuid": "a1",
+            "parentUuid": None,
+            "timestamp": "2026-03-01T10:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_long", "name": "Bash", "input": {"command": "cat"}}
+                ],
+            },
+        },
+        {
+            **common,
+            "type": "user",
+            "uuid": "u1",
+            "parentUuid": "a1",
+            "timestamp": "2026-03-01T10:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_long",
+                        "content": "x " * 3000 + "https://github.com/acme/widgets/issues/42",
+                    }
+                ],
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    database = tmp_path / "long.duckdb"
+    build([source], database)
+
+    connection = duckdb.connect(str(database), read_only=True)
+    stored = connection.execute(
+        "SELECT length(result_text), result_truncated FROM tool_calls WHERE tool_use_id = 'toolu_long'"
+    ).fetchone()
+    assert stored[0] > 4000
+    assert stored[1] is False
+    report = build_report(connection, tz=ZoneInfo("UTC"))
+    urls = [o["url"] for b in report["buckets"] for o in b["outputs"]]
+    assert urls == ["https://github.com/acme/widgets/issues/42"]
+    connection.close()
+
+
 def test_owner_filters_foreign_keys_into_references_and_gh_calls():
     connection = db_with_data(
         calls=[

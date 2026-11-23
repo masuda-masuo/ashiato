@@ -872,7 +872,7 @@ def _opencode_text_chunk_to_event(chunk: object) -> tuple[object, ...]:
     )
 
 
-def _opencode_tool_call_to_row(call: object) -> list[object]:
+def _opencode_tool_call_to_row(call: object, *, result_text_limit: int) -> list[object]:
     """Map an ``OpenCodeToolCall`` to a ``ToolCall``-shaped row for insertion.
 
     ``outcome`` goes through the shared :func:`classify_outcome` -- no second
@@ -919,8 +919,8 @@ def _opencode_tool_call_to_row(call: object) -> list[object]:
     result_text: str | None = None
     result_truncated = False
     if result_source is not None:
-        if len(result_source) > DEFAULT_RESULT_TEXT_LIMIT:
-            result_text = result_source[:DEFAULT_RESULT_TEXT_LIMIT]
+        if len(result_source) > result_text_limit:
+            result_text = result_source[:result_text_limit]
             result_truncated = True
         else:
             result_text = result_source
@@ -962,6 +962,7 @@ def _insert_opencode_parsed(
     content_hash: str,
     built_at: datetime,
     scratch: Path | None,
+    result_text_limit: int,
 ) -> None:
     """The opencode counterpart of :func:`_insert_parsed`.
 
@@ -988,7 +989,10 @@ def _insert_opencode_parsed(
     _insert_rows(
         connection,
         "tool_calls",
-        [_opencode_tool_call_to_row(call) for call in parsed.tool_calls],
+        [
+            _opencode_tool_call_to_row(call, result_text_limit=result_text_limit)
+            for call in parsed.tool_calls
+        ],
         scratch=scratch,
     )
     _insert_rows(
@@ -1755,7 +1759,7 @@ def _apply_cursor_chat_stores(
     result.n_store_sessions_paired = len(paired_ids)
 
 
-def _codex_tool_call_to_row(call: object) -> list[object]:
+def _codex_tool_call_to_row(call: object, *, result_text_limit: int) -> list[object]:
     """Map a ``CodexToolCall`` to a ``ToolCall``-shaped row for insertion.
 
     Mirrors the mapping that :func:`_insert_parsed` does for Claude tool calls
@@ -1814,8 +1818,8 @@ def _codex_tool_call_to_row(call: object) -> list[object]:
     result_text: str | None = None
     result_truncated = False
     if output is not None:
-        if len(output) > DEFAULT_RESULT_TEXT_LIMIT:
-            result_text = output[:DEFAULT_RESULT_TEXT_LIMIT]
+        if len(output) > result_text_limit:
+            result_text = output[:result_text_limit]
             result_truncated = True
         else:
             result_text = output
@@ -1926,6 +1930,7 @@ def _insert_codex_parsed(
     content_hash: str,
     built_at: datetime,
     scratch: Path | None,
+    result_text_limit: int,
 ) -> None:
     """The Codex counterpart of :func:`_insert_parsed`.
 
@@ -1964,7 +1969,10 @@ def _insert_codex_parsed(
     _insert_rows(
         connection,
         "tool_calls",
-        [_codex_tool_call_to_row(call) for call in parsed.tool_calls],
+        [
+            _codex_tool_call_to_row(call, result_text_limit=result_text_limit)
+            for call in parsed.tool_calls
+        ],
         scratch=scratch,
     )
     _insert_rows(
@@ -2241,6 +2249,7 @@ def build(
                         content_hash=content_hash,
                         built_at=built_at,
                         scratch=attempt,
+                        result_text_limit=result_text_limit,
                     ),
                     result=result,
                 )
@@ -2346,6 +2355,7 @@ def build(
                         content_hash=content_hash,
                         built_at=built_at,
                         scratch=attempt,
+                        result_text_limit=result_text_limit,
                     ),
                     result=result,
                 )

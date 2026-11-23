@@ -6734,3 +6734,32 @@ def test_opencode_walk_freshness_ignores_files_below_job_directories(tmp_path: P
         connection.close()
 
     assert gap == 1
+
+
+def test_explicit_result_text_limit_reaches_opencode_and_codex(tmp_path: Path):
+    """#123 review: build(result_text_limit=...) bounds opencode and Codex rows too."""
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    _write_codex_session(
+        codex_dir / "session.jsonl",
+        "codex-limit",
+        [{"type": "CommandExecution", "id": "exec-long", "command": ["cat"], "stdout": "y" * 50}],
+    )
+    db_path = tmp_path / "limit.duckdb"
+    build([], db_path, opencode_sources=[OPENCODE_FIXTURE], codex_sources=[codex_dir], result_text_limit=10)
+
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        codex_row = connection.execute(
+            "SELECT result_text, result_truncated FROM tool_calls WHERE tool_use_id = 'exec-long'"
+        ).fetchone()
+        opencode_rows = connection.execute(
+            "SELECT length(result_text), result_truncated FROM tool_calls "
+            "WHERE source = 'opencode' AND result_text IS NOT NULL"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert codex_row == ("y" * 10, True)
+    assert opencode_rows, "fixture must carry opencode results"
+    assert max(length for length, _ in opencode_rows) <= 10
+    assert any(truncated for _, truncated in opencode_rows), "fixture must have a result over 10 chars"
