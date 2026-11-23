@@ -12,7 +12,10 @@ dynamic = ["version"]
 dependencies = ["duckdb>=1.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+# ruff is pinned: an unpinned `ruff>=0.6` let 0.17.6 add a SIM102 finding on
+# untouched code and turn an unrelated PR red (#123). Bump it on purpose, in its
+# own change, and fix what the new version reports there.
+dev = ["pytest>=8", "ruff==0.17.6"]
 
 [project.scripts]
 ashiato = "ashiato.cli:main"
