@@ -33,8 +33,11 @@ DENIAL_PATTERNS: tuple[str, ...] = (
     "Permission for this action was denied by the Claude Code auto mode classifier",
 )
 
-#: Tool results can be megabytes; keep a readable prefix by default.
-DEFAULT_RESULT_TEXT_LIMIT = 4000
+#: Tool results can be megabytes; keep a bounded prefix by default.  The bound
+#: is large on purpose (#122): at 4,000 chars, 11.5% of the GitHub/Drive keys
+#: ``review`` reads sat only past the cut.  Measured 2026-11-23 on the four
+#: daily sources at 500,000: 9 calls still cut, database size unchanged.
+DEFAULT_RESULT_TEXT_LIMIT = 500_000
 
 #: The input field that says most about what a call asked for, per tool.  A
 #: tool that is not named here -- every MCP tool, and anything Claude Code

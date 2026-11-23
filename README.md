@@ -839,7 +839,7 @@ Denial patterns live in one constant, `ashiato.parser.DENIAL_PATTERNS`. They are
 of the strings somewhere (a read or diff of sources that quote them, a grep whose output
 matched them) is a success, not a denial. They are Claude Code strings and will drift between
 versions, so `parse_file(..., denial_patterns=(...))` takes a replacement, matched the same
-way. `result_text` is truncated to `result_text_limit` (default 4,000 chars) with
+way. `result_text` is truncated to `result_text_limit` (default 500,000 chars; 4,000 before #122) with
 `result_truncated` recording whether that happened; the denial verdict is made on the whole
 text, before truncation.
 
