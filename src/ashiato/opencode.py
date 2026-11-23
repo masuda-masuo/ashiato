@@ -313,13 +313,12 @@ def parse_file(path: str | Path) -> ParsedOpenCodeFile:
                 if text:
                     text_part.snapshot_text = text
             # Any other part type is not modelled; skipped, not an error.
-        elif event_type == _EVENT_PART_DELTA:
-            if properties.get("field") == "text":
-                session_id = _as_str(properties.get("sessionID"))
-                text_part = _touch(session_id, _as_str(properties.get("partID")), seq)
-                delta = _as_str(properties.get("delta"))
-                if delta:
-                    text_part.delta_text += delta
+        elif event_type == _EVENT_PART_DELTA and properties.get("field") == "text":
+            session_id = _as_str(properties.get("sessionID"))
+            text_part = _touch(session_id, _as_str(properties.get("partID")), seq)
+            delta = _as_str(properties.get("delta"))
+            if delta:
+                text_part.delta_text += delta
         # Any other event type -- job lifecycle events and the like -- is
         # not modelled; skipped, not an error.
 
